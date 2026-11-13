@@ -17,39 +17,55 @@
   // ═══════════════════════════════════════════════════════════════════════════
 
   const STATES = {
-    IDLE:            'IDLE',
-    AWAITING_ITEM:   'AWAITING_ITEM',
-    AWAITING_PARAM:  'AWAITING_PARAM',
-    COMBO:           'COMBO',          // NEW: accumulating qty scans
-    PROCESSING:      'PROCESSING',
-    SUCCESS:         'SUCCESS',
-    ERROR:           'ERROR',
+    IDLE:              'IDLE',
+    AWAITING_ITEM:     'AWAITING_ITEM',
+    AWAITING_PARAM:    'AWAITING_PARAM',
+    AWAITING_LOCATION: 'AWAITING_LOCATION',  // v3: SYS:LAST / CREATESTOCK location step
+    AWAITING_QTY:      'AWAITING_QTY',       // v3: CREATESTOCK quantity step
+    AWAITING_TOKEN:    'AWAITING_TOKEN',     // v3: CREATESTOCK token binding step
+    AWAITING_CONFIRM:  'AWAITING_CONFIRM',   // v3: DELETEPART/DELETESTOCK confirm
+    COMBO:             'COMBO',              // accumulating qty scans
+    PROCESSING:        'PROCESSING',
+    SUCCESS:           'SUCCESS',
+    ERROR:             'ERROR',
   };
 
   const ACTIONS = {
-    TRANSFER:  'TRANSFER',
-    INFO:      'INFO',
-    ADD:       'ADD',
-    REMOVE:    'REMOVE',
-    STOCKTAKE: 'STOCKTAKE',
+    TRANSFER:    'TRANSFER',
+    INFO:        'INFO',
+    ADD:         'ADD',
+    REMOVE:      'REMOVE',
+    STOCKTAKE:   'STOCKTAKE',
+    CREATEPART:  'CREATEPART',
+    CREATESTOCK: 'CREATESTOCK',
+    DELETEPART:  'DELETEPART',
+    DELETESTOCK: 'DELETESTOCK',
+    LAST:        'LAST',
   };
 
   // Map control-code strings to actions
   const CONTROL_CODES = {
-    'SYS:TRANSFER':  ACTIONS.TRANSFER,
-    'SYS:INFO':      ACTIONS.INFO,
-    'SYS:ADD':       ACTIONS.ADD,
-    'SYS:REMOVE':    ACTIONS.REMOVE,
-    'SYS:STOCKTAKE': ACTIONS.STOCKTAKE,
+    'SYS:TRANSFER':    ACTIONS.TRANSFER,
+    'SYS:INFO':        ACTIONS.INFO,
+    'SYS:ADD':         ACTIONS.ADD,
+    'SYS:REMOVE':      ACTIONS.REMOVE,
+    'SYS:STOCKTAKE':   ACTIONS.STOCKTAKE,
+    'SYS:CREATEPART':  ACTIONS.CREATEPART,
+    'SYS:CREATESTOCK': ACTIONS.CREATESTOCK,
+    'SYS:DELETEPART':  ACTIONS.DELETEPART,
+    'SYS:DELETESTOCK': ACTIONS.DELETESTOCK,
+    'SYS:LAST':        ACTIONS.LAST,
     // Aliases
-    'SYS:MOVE':      ACTIONS.TRANSFER,
-    'SYS:LOOKUP':    ACTIONS.INFO,
+    'SYS:MOVE':        ACTIONS.TRANSFER,
+    'SYS:LOOKUP':      ACTIONS.INFO,
   };
 
   const RESULT_DISPLAY_MS = 4000;
   const COMBO_TIMEOUT_MS  = 3000;   // Time to wait for additional qty scans
   const MAX_UNDO_HISTORY  = 20;
   const LOCALSTORAGE_KEY  = 'purescan_history';
+  const SYS_LAST_KEY      = 'purescan_last_location';
+  const TOKEN_RE          = /^(STOCK|LOC)_[A-Z0-9]{4}$/;
 
   // ═══════════════════════════════════════════════════════════════════════════
   //  State
@@ -69,12 +85,59 @@
   // Action history / undo stack
   let _actionLog  = [];    // { ts, description, payload, actionType, undone }
 
+  // CREATESTOCK pending state (v3)
+  let _pendingPartId      = null;
+  let _pendingPartName    = '';
+  let _pendingLocationId  = null;
+  let _pendingQty         = null;
+  let _pendingBatch       = '';
+  let _pendingBarcodeData = null;   // parsed distributor label fields
+
+  // DELETE pending state (v3)
+  let _pendingDeleteKind  = null;   // 'part' | 'stock'
+  let _pendingDeleteId    = null;
+  let _pendingDeleteDesc  = '';
+  let _pendingDeleteRaw   = null;   // first-scan raw payload for re-scan compare
+  let _pendingToken       = null;
+
   // ═══════════════════════════════════════════════════════════════════════════
   //  Barcode parsing helpers
   // ═══════════════════════════════════════════════════════════════════════════
 
   async function _parseInvenTreeBarcode(raw) {
     const trimmed = raw.trim();
+
+    // Format 0: SmartParts custom tokens  STOCK_XXXX / LOC_XXXX
+    if (TOKEN_RE.test(trimmed)) {
+      try {
+        const resp = await fetch('/plugin/smartparts/api/purescan/token/', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-CSRFToken': _getCSRF(),
+          },
+          body: JSON.stringify({ token: trimmed }),
+        });
+        if (resp.ok) {
+          const data = await resp.json();
+          if (data.type === 'free') {
+            return { type: 'free', token: trimmed };
+          }
+          if (data.type && data.id) {
+            return {
+              type: data.type,
+              id: parseInt(data.id, 10),
+              name: data.name || '',
+              partId: data.part_id || null,
+              token: trimmed,
+            };
+          }
+        }
+      } catch (e) {
+        console.warn('[PureScan] Token lookup failed:', e);
+      }
+      return { type: null, token: trimmed };
+    }
 
     // Format 1: JSON  {"stockitem": 722}
     if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
@@ -132,6 +195,18 @@
     return m ? parseFloat(m[1]) : null;
   }
 
+  // Action-aware prompt: what to scan next after entering AWAITING_ITEM
+  function _itemPrompt(action) {
+    switch (action) {
+      case ACTIONS.CREATEPART:  return 'Now scan a distributor DataMatrix label';
+      case ACTIONS.CREATESTOCK: return 'Now scan a distributor label, an existing STOCK_ token, or a part label';
+      case ACTIONS.DELETEPART:  return 'Now scan a distributor DataMatrix label';
+      case ACTIONS.DELETESTOCK: return 'Now scan a STOCK_XXXX token bound to a stock item';
+      case ACTIONS.LAST:        return 'Now scan a Location label';
+      default:                  return 'Now scan a Stock Item label';
+    }
+  }
+
   // ═══════════════════════════════════════════════════════════════════════════
   //  State transitions
   // ═══════════════════════════════════════════════════════════════════════════
@@ -157,6 +232,8 @@
     _stockItemId = null;
     _itemInfo    = null;
     _comboQty    = 0;
+    _clearPendingCreate();
+    _clearPendingDelete();
     clearTimeout(_resultTimer);
     clearTimeout(_comboTimer);
     _setState(STATES.IDLE, detail || 'Ready — Scan an Action Code');
@@ -203,8 +280,48 @@
     _saveLog();
   }
 
+  // Only quantity-affecting operations are undoable; create/delete entries
+  // stay in the history display but are skipped by SYS:UNDO.
+  const UNDOABLE_TYPES = new Set(['ADD', 'REMOVE', 'TRANSFER', 'STOCKTAKE']);
+
   function _getLastUndoable() {
-    return _actionLog.find(e => !e.undone);
+    return _actionLog.find(e => !e.undone && UNDOABLE_TYPES.has(e.actionType));
+  }
+
+  // ── SYS:LAST default location (per terminal, localStorage) ──
+  function _getLastLocation() {
+    try {
+      const raw = window.localStorage.getItem(SYS_LAST_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (parsed && parsed.id) return parsed;
+      }
+    } catch (e) { /* corrupt data — ignore */ }
+    return null;
+  }
+
+  function _setLastLocation(loc) {
+    try {
+      window.localStorage.setItem(SYS_LAST_KEY, JSON.stringify(loc));
+    } catch (e) { /* quota exceeded — ignore */ }
+  }
+
+  // ── Pending-state clear helpers ──
+  function _clearPendingCreate() {
+    _pendingPartId      = null;
+    _pendingPartName    = '';
+    _pendingLocationId  = null;
+    _pendingQty         = null;
+    _pendingBatch       = '';
+    _pendingBarcodeData = null;
+  }
+
+  function _clearPendingDelete() {
+    _pendingDeleteKind = null;
+    _pendingDeleteId   = null;
+    _pendingDeleteDesc = '';
+    _pendingDeleteRaw  = null;
+    _pendingToken      = null;
   }
 
   async function _executeUndo() {
@@ -291,7 +408,7 @@
     });
     if (!resp.ok) {
       const errData = await resp.json().catch(() => ({}));
-      throw new Error(errData.detail || errData.error || `HTTP ${resp.status}`);
+      throw new Error(errData.detail || errData.error || errData.message || `HTTP ${resp.status}`);
     }
     return resp.json().catch(() => ({}));
   }
@@ -428,6 +545,28 @@
     _resultTimer = setTimeout(() => _resetToIdle(), 20000);
   }
 
+  /** Execute: Part info (native InvenTree part label) */
+  async function _execPartInfo(partId) {
+    _setState(STATES.PROCESSING, 'Looking up part.');
+    try {
+      const resp = await fetch(`/api/part/${partId}/`, {
+        headers: { Accept: 'application/json' },
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      const data = await resp.json();
+      const lines = [
+        `Part: ${data.name || data.full_name || ('Part #' + data.pk)}`,
+        data.IPN ? `IPN: ${data.IPN}` : '',
+        data.description ? `Desc: ${String(data.description).slice(0, 80)}` : '',
+        data.category_detail ? `Category: ${data.category_detail.name}` : '',
+        `Stock items: ${data.in_stock ?? '?'}`,
+      ].filter(Boolean);
+      _showResult(STATES.SUCCESS, lines.join('\n'), 8000);
+    } catch (e) {
+      _showResult(STATES.ERROR, `Part lookup failed: ${e.message}`);
+    }
+  }
+
   /** Execute: Transfer stock item to a new location */
   async function _execTransfer(stockItemId, locationId) {
     const prevLocId   = _itemInfo?.location_id;
@@ -475,6 +614,240 @@
     } catch (e) {
       _showResult(STATES.ERROR, `Transfer failed: ${e.message}`);
     }
+  }
+
+  // ── v3: distributor label lookup (used by INFO / CREATESTOCK / DELETEPART) ──
+
+  async function _lookupDistributorBarcode(raw) {
+    try {
+      return await _apiPost('/plugin/smartparts/api/barcode/lookup/', { barcode: raw });
+    } catch (e) {
+      console.warn('[PureScan] Distributor lookup failed:', e);
+      return null;
+    }
+  }
+
+  function _formatDistributorInfo(lk) {
+    const d = lk.barcode_data || {};
+    const lines = [
+      `MPN: ${d.mpn || lk.mpn || '—'}`,
+    ];
+    if (d.supplier_sku) lines.push(`SKU: ${d.supplier_sku}`);
+    if (d.quantity != null) lines.push(`Qty: ${d.quantity}`);
+    if (d.batch) lines.push(`Batch: ${d.batch}`);
+    if (lk.found) {
+      lines.push(`Part in DB: YES — ${lk.part_name || ''}${lk.part_ipn ? ' (' + lk.part_ipn + ')' : ''}`);
+    } else {
+      lines.push('Part in DB: NO');
+    }
+    return lines.join('\n');
+  }
+
+  function _showDistributorInfo(lk) {
+    const label = lk.found ? '📦 Distributor label' : '📦 Distributor label (not in DB)';
+    _setState(STATES.SUCCESS, `${label}\n${_formatDistributorInfo(lk)}`);
+    clearTimeout(_resultTimer);
+    _resultTimer = setTimeout(() => _resetToIdle(), 12000);
+  }
+
+  // ── v3: SYS:LAST / CREATESTOCK helpers ──
+
+  function _locationPrompt(contextText) {
+    const last = _getLastLocation();
+    if (last && last.id) {
+      return `${contextText}\n📍 Location: ${last.name} (SYS:LAST)\n→ Scan a Location label to override, or SYS:QTY:nnn to keep`;
+    }
+    return `${contextText}\n📍 No default location — scan a Location label`;
+  }
+
+  function _enterCreateStockQty() {
+    if (_pendingQty != null && _pendingQty > 0) {
+      _setState(STATES.AWAITING_QTY,
+        `Quantity: ${_pendingQty}\n→ SYS:QTY:nnn to change, or scan a FREE STOCK_ token to accept`);
+    } else {
+      _setState(STATES.AWAITING_QTY, '→ Scan a Quantity Code (SYS:QTY:nnn)');
+    }
+  }
+
+  // ── v3: CREATEPART ──
+
+  async function _execCreatePart(raw) {
+    _setState(STATES.PROCESSING, 'Searching distributors… (this can take a few seconds)');
+    try {
+      const resp = await _apiPost('/plugin/smartparts/api/purescan/createpart/', { barcode: raw });
+      if (resp.already_exists) {
+        _showResult(STATES.SUCCESS,
+          `⚠ Part already exists: ${resp.part_name || ''}${resp.part_ipn ? ' (' + resp.part_ipn + ')' : ''}\nNothing was created`, 6000);
+        return;
+      }
+      if (resp.success) {
+        _showResult(STATES.SUCCESS,
+          `✓ Part created: ${resp.part_name || '#' + resp.part_id}\n(no stock yet — use SYS:CREATESTOCK)`, 6000);
+      } else {
+        _showResult(STATES.ERROR, `✗ ${resp.message || resp.error || 'Part creation failed'}`, 8000);
+      }
+    } catch (e) {
+      _showResult(STATES.ERROR, `Create part failed: ${e.message}`, 6000);
+    }
+  }
+
+  // ── v3: CREATESTOCK ──
+
+  async function _execCreateStockStart(raw) {
+    const bc = await _parseInvenTreeBarcode(raw);
+
+    // Mode B: existing stock item token → part inferred (token is read-only)
+    if (bc.type === 'stockitem' && bc.id) {
+      _setState(STATES.PROCESSING, 'Looking up part from stock item…');
+      const info = await _fetchStockItemInfo(bc.id);
+      if (!info) {
+        _showResult(STATES.ERROR, `Stock item #${bc.id} not found`);
+        return;
+      }
+      _pendingPartId = info.part_id;
+      _pendingPartName = info.part_name;
+      _pendingQty = null;
+      _pendingBatch = '';
+      _pendingBarcodeData = null;
+      _setState(STATES.AWAITING_LOCATION, _locationPrompt(`Create stock for "${info.part_name}"`));
+      return;
+    }
+
+    // Alternative: InvenTree part label
+    if (bc.type === 'part' && bc.id) {
+      _pendingPartId = bc.id;
+      _pendingPartName = bc.name || `Part #${bc.id}`;
+      _pendingQty = null;
+      _pendingBatch = '';
+      _pendingBarcodeData = null;
+      _setState(STATES.AWAITING_LOCATION, _locationPrompt(`Create stock for "${_pendingPartName}"`));
+      return;
+    }
+
+    // Mode A: distributor DataMatrix
+    if (!bc.type) {
+      _setState(STATES.PROCESSING, 'Looking up part…');
+      const lk = await _lookupDistributorBarcode(raw);
+      if (!lk || (!lk.found && !lk.mpn)) {
+        _showResult(STATES.ERROR, 'Unknown part — run SYS:CREATEPART first', 6000);
+        return;
+      }
+      if (!lk.found) {
+        _showResult(STATES.ERROR, `Part not in DB (MPN ${lk.mpn || '?'}) — run SYS:CREATEPART first`, 6000);
+        return;
+      }
+      const d = lk.barcode_data || {};
+      _pendingPartId = lk.part_id;
+      _pendingPartName = lk.part_name || '';
+      // Mode A: qty from the label's Q field, default 1 (spec: "default quantity = 1")
+      _pendingQty = d.quantity != null ? parseFloat(d.quantity) : 1;
+      _pendingBatch = d.batch || '';
+      _pendingBarcodeData = d;
+      _setState(STATES.AWAITING_LOCATION,
+        _locationPrompt(`Create stock for "${_pendingPartName}"${_pendingQty ? ' (reel qty ' + _pendingQty + ')' : ''}`));
+      return;
+    }
+
+    _setState(STATES.AWAITING_ITEM,
+      '⚠ Scan a distributor label, an existing STOCK_ token, or a part label.\nAction: CREATESTOCK');
+  }
+
+  async function _execCreateStockCommit(token) {
+    _setState(STATES.PROCESSING, 'Creating stock item…');
+    try {
+      await _apiPost('/plugin/smartparts/api/purescan/createstock/', {
+        part_id: _pendingPartId,
+        location_id: _pendingLocationId,
+        quantity: _pendingQty,
+        batch: _pendingBatch || '',
+        new_token: token,
+      });
+      const desc = `Created stock "${_pendingPartName}" qty ${_pendingQty}` +
+        (_pendingBatch ? ` batch ${_pendingBatch}` : '') + ` → ${token}`;
+      _pushLog({
+        ts: new Date(), description: desc, actionType: 'CREATESTOCK', undone: false,
+        payload: null,
+      });
+      _showResult(STATES.SUCCESS, `✓ ${desc}\nStick the label on the container`, 8000);
+      _clearPendingCreate();
+    } catch (e) {
+      _showResult(STATES.ERROR, `Create stock failed: ${e.message}`, 8000);
+    }
+  }
+
+  // ── v3: DELETEPART ──
+
+  async function _execDeletePartStart(raw) {
+    _setState(STATES.PROCESSING, 'Looking up part…');
+    const lk = await _lookupDistributorBarcode(raw);
+    if (!lk || !lk.found || !lk.part_id) {
+      _showResult(STATES.ERROR, 'Part not found in DB — nothing to delete', 5000);
+      return;
+    }
+    _pendingDeleteKind = 'part';
+    _pendingDeleteId = lk.part_id;
+    _pendingDeleteDesc = `${lk.part_name}${lk.part_ipn ? ' (' + lk.part_ipn + ')' : ''}`;
+    _pendingDeleteRaw = raw;
+    _setState(STATES.AWAITING_CONFIRM,
+      `⛔ DELETE PART: "${_pendingDeleteDesc}"\nAll its data (params, supplier links) will be removed.\n→ Scan the SAME label again to confirm, or SYS:CANCEL`);
+  }
+
+  async function _execDeletePartCommit() {
+    _setState(STATES.PROCESSING, 'Deleting part…');
+    try {
+      const resp = await _apiPost('/plugin/smartparts/api/purescan/deletepart/', {
+        part_id: _pendingDeleteId,
+        confirm: true,
+      });
+      _showResult(STATES.SUCCESS, `✓ ${resp.message || 'Part deleted'}`, 6000);
+      _pushLog({
+        ts: new Date(), description: `Deleted part "${_pendingDeleteDesc}"`,
+        actionType: 'DELETEPART', undone: false, payload: null,
+      });
+    } catch (e) {
+      _showResult(STATES.ERROR, `Delete failed: ${e.message}`, 6000);
+    }
+    _clearPendingDelete();
+  }
+
+  // ── v3: DELETESTOCK ──
+
+  async function _execDeleteStockStart(raw) {
+    const bc = await _parseInvenTreeBarcode(raw);
+    if (bc.type !== 'stockitem' || !bc.id) {
+      _setState(STATES.AWAITING_ITEM,
+        '⚠ Scan a STOCK_XXXX token bound to a stock item.\nAction: DELETESTOCK');
+      return;
+    }
+    const info = await _fetchStockItemInfo(bc.id);
+    if (!info) {
+      _showResult(STATES.ERROR, `Stock item #${bc.id} not found`);
+      return;
+    }
+    _pendingDeleteKind = 'stock';
+    _pendingDeleteId = bc.id;
+    _pendingToken = bc.token || null;
+    _pendingDeleteDesc = `${info.part_name} (${info.quantity}× @ ${info.location})`;
+    _setState(STATES.AWAITING_CONFIRM,
+      `⛔ DELETE STOCK: "${_pendingDeleteDesc}"\nThe token will be freed for reuse.\n→ Scan the SAME token again to confirm, or SYS:CANCEL`);
+  }
+
+  async function _execDeleteStockCommit(token) {
+    _setState(STATES.PROCESSING, 'Deleting stock item…');
+    try {
+      const resp = await _apiPost('/plugin/smartparts/api/purescan/deletestock/', {
+        token: token,
+        confirm: true,
+      });
+      _showResult(STATES.SUCCESS, `✓ ${resp.message || 'Stock item deleted'}`, 6000);
+      _pushLog({
+        ts: new Date(), description: `Deleted stock "${_pendingDeleteDesc}" (${token || 'token'} freed)`,
+        actionType: 'DELETESTOCK', undone: false, payload: null,
+      });
+    } catch (e) {
+      _showResult(STATES.ERROR, `Delete failed: ${e.message}`, 6000);
+    }
+    _clearPendingDelete();
   }
 
   // ── Combo-timer execution ─────────────────────────────────────────────────
@@ -587,6 +960,17 @@
       return;
     }
 
+    // ── Global: SYS:LAST sets the terminal default location ─────────────
+    if (raw.toUpperCase() === 'SYS:LAST') {
+      _clearPendingCreate();
+      _clearPendingDelete();
+      _action = ACTIONS.LAST;
+      const last = _getLastLocation();
+      _setState(STATES.AWAITING_LOCATION,
+        `📍 Current default location: ${last ? last.name : 'none'}\n→ Scan a Location label to set it`);
+      return;
+    }
+
     // ── Global: SYS:UNDO ─────────────────────────────────────────────────
     const ctrlCode = _parseControlCode(raw);
     if (ctrlCode === '__UNDO__') {
@@ -605,7 +989,7 @@
         _stockItemId = null;
         _itemInfo = null;
         _setState(STATES.AWAITING_ITEM,
-          `Action: ${ctrlCode} — Now scan a Stock Item label`);
+          `Action: ${ctrlCode} — ${_itemPrompt(ctrlCode)}`);
         return;
       }
 
@@ -643,7 +1027,7 @@
         _stockItemId = null;
         _itemInfo = null;
         _setState(STATES.AWAITING_ITEM,
-          `Action: ${ctrlCode} — Now scan a Stock Item label`);
+          `Action: ${ctrlCode} — ${_itemPrompt(ctrlCode)}`);
         return;
       }
 
@@ -670,6 +1054,29 @@
         return;
       }
 
+      // Quick-scan shortcut: part label in IDLE → Part Info
+      if (bc.type === 'part' && bc.id) {
+        _action = ACTIONS.INFO;
+        await _execPartInfo(bc.id);
+        return;
+      }
+
+      // Quick-scan shortcut: free token in IDLE → token info
+      if (bc.type === 'free') {
+        _showResult(STATES.SUCCESS,
+          `🏷 Free token ${bc.token}\nUsable in SYS:CREATESTOCK to bind a new instance`, 6000);
+        return;
+      }
+
+      // Quick-scan shortcut: distributor DataMatrix in IDLE → part lookup
+      if (!bc.type) {
+        const lk = await _lookupDistributorBarcode(raw);
+        if (lk && (lk.found || (lk.barcode_data && lk.barcode_data.mpn))) {
+          _showDistributorInfo(lk);
+          return;
+        }
+      }
+
       _showResult(STATES.ERROR,
         `Unknown scan: "${raw.slice(0, 40)}"\nScan an Action Code to begin`, 3000);
       return;
@@ -682,7 +1089,25 @@
         _stockItemId = null;
         _itemInfo = null;
         _setState(STATES.AWAITING_ITEM,
-          `Action: ${ctrlCode} — Now scan a Stock Item label`);
+          `Action: ${ctrlCode} — ${_itemPrompt(ctrlCode)}`);
+        return;
+      }
+
+      // v3: slow-workflow actions route to their dedicated handlers
+      if (_action === ACTIONS.CREATEPART) {
+        await _execCreatePart(raw);
+        return;
+      }
+      if (_action === ACTIONS.DELETEPART) {
+        await _execDeletePartStart(raw);
+        return;
+      }
+      if (_action === ACTIONS.DELETESTOCK) {
+        await _execDeleteStockStart(raw);
+        return;
+      }
+      if (_action === ACTIONS.CREATESTOCK) {
+        await _execCreateStockStart(raw);
         return;
       }
 
@@ -692,6 +1117,21 @@
       if (_action === ACTIONS.INFO && bc.type === 'stocklocation' && bc.id) {
         await _execLocationInfo(bc.id);
         return;
+      }
+
+      // INFO mode also accepts part labels
+      if (_action === ACTIONS.INFO && bc.type === 'part' && bc.id) {
+        await _execPartInfo(bc.id);
+        return;
+      }
+
+      // INFO mode also accepts distributor DataMatrix labels
+      if (_action === ACTIONS.INFO && !bc.type) {
+        const lk = await _lookupDistributorBarcode(raw);
+        if (lk && (lk.found || (lk.barcode_data && lk.barcode_data.mpn))) {
+          _showDistributorInfo(lk);
+          return;
+        }
       }
 
       if (bc.type !== 'stockitem' || !bc.id) {
@@ -739,7 +1179,7 @@
         _stockItemId = null;
         _itemInfo = null;
         _setState(STATES.AWAITING_ITEM,
-          `Action: ${ctrlCode} — Now scan a Stock Item label`);
+          `Action: ${ctrlCode} — ${_itemPrompt(ctrlCode)}`);
         return;
       }
 
@@ -777,6 +1217,183 @@
           `⚠ Invalid quantity! Scan a QTY code (SYS:QTY:nnn) or scan item for +1\n${_action}: "${_itemInfo?.part_name}"`);
         return;
       }
+    }
+
+    // ── STATE: AWAITING_LOCATION ─────────────────────────────────────────
+    if (_state === STATES.AWAITING_LOCATION) {
+      if (ctrlCode) {
+        if (ctrlCode === ACTIONS.LAST) {
+          if (_action === ACTIONS.LAST) {
+            const last = _getLastLocation();
+            _setState(STATES.AWAITING_LOCATION,
+              `📍 Current default: ${last ? last.name : 'none'}\n→ Scan a Location label to set`);
+            return;
+          }
+          // CREATESTOCK: accept the stored default location
+          const last = _getLastLocation();
+          if (last && last.id) {
+            _pendingLocationId = last.id;
+            _enterCreateStockQty();
+            return;
+          }
+          _setState(STATES.AWAITING_LOCATION,
+            '⚠ No default location stored — scan a Location label');
+          return;
+        }
+        _action = ctrlCode;
+        _clearPendingCreate();
+        _setState(STATES.AWAITING_ITEM,
+          `Action: ${ctrlCode} — ${_itemPrompt(ctrlCode)}`);
+        return;
+      }
+
+      const bc = await _parseInvenTreeBarcode(raw);
+
+      if (bc.type === 'stocklocation' && bc.id) {
+        if (_action === ACTIONS.LAST) {
+          let name = bc.name || `Location #${bc.id}`;
+          if (!bc.name) {
+            const li = await _fetchLocationInfo(bc.id);
+            if (li) name = li.name;
+          }
+          _setLastLocation({ id: bc.id, name: name });
+          _showResult(STATES.SUCCESS, `✓ Default location set: ${name}`, 4000);
+          return;
+        }
+        // CREATESTOCK: location override
+        _pendingLocationId = bc.id;
+        _enterCreateStockQty();
+        return;
+      }
+
+      // CREATESTOCK: SYS:QTY:nnn = keep the SYS:LAST location and set qty
+      if (_action === ACTIONS.CREATESTOCK) {
+        const qty = _parseQuantityCode(raw);
+        if (qty !== null && qty > 0) {
+          const last = _getLastLocation();
+          if (last && last.id) {
+            _pendingLocationId = last.id;
+            _pendingQty = qty;
+            _setState(STATES.AWAITING_TOKEN,
+              `Quantity: ${_pendingQty}\n Scan a FREE STOCK_XXXX token to bind the new instance`);
+            return;
+          }
+          _setState(STATES.AWAITING_LOCATION,
+            '? No default location stored - scan a Location label');
+          return;
+        }
+      }
+
+      _setState(STATES.AWAITING_LOCATION,
+        `⚠ Not a Location label!\n${_action === ACTIONS.LAST
+          ? '→ Scan a Location label to set the default'
+          : _locationPrompt('Create stock')}`);
+      return;
+    }
+
+    // ── STATE: AWAITING_QTY ──────────────────────────────────────────────
+    if (_state === STATES.AWAITING_QTY) {
+      if (ctrlCode) {
+        _action = ctrlCode;
+        _clearPendingCreate();
+        _setState(STATES.AWAITING_ITEM,
+          `Action: ${ctrlCode} — ${_itemPrompt(ctrlCode)}`);
+        return;
+      }
+
+      const qty = _parseQuantityCode(raw);
+      if (qty !== null && qty > 0) {
+        _pendingQty = qty;
+        _setState(STATES.AWAITING_TOKEN,
+          `Quantity: ${_pendingQty}\n→ Scan a FREE STOCK_XXXX token to bind the new instance`);
+        return;
+      }
+
+      const bc = await _parseInvenTreeBarcode(raw);
+
+      // Scanning the free token here accepts the current (default) quantity
+      if (bc.type === 'free') {
+        if (_pendingQty == null || _pendingQty <= 0) {
+          _setState(STATES.AWAITING_QTY,
+            '⚠ Quantity required — scan SYS:QTY:nnn first');
+          return;
+        }
+        await _execCreateStockCommit(bc.token);
+        return;
+      }
+
+      _setState(STATES.AWAITING_QTY,
+        '⚠ Scan a Quantity Code (SYS:QTY:nnn) or a FREE STOCK_ token');
+      return;
+    }
+
+    // ── STATE: AWAITING_TOKEN ────────────────────────────────────────────
+    if (_state === STATES.AWAITING_TOKEN) {
+      if (ctrlCode) {
+        _action = ctrlCode;
+        _clearPendingCreate();
+        _setState(STATES.AWAITING_ITEM,
+          `Action: ${ctrlCode} — ${_itemPrompt(ctrlCode)}`);
+        return;
+      }
+
+      const bc = await _parseInvenTreeBarcode(raw);
+
+      if (bc.type === 'free') {
+        await _execCreateStockCommit(bc.token);
+        return;
+      }
+      if (bc.type === 'stockitem') {
+        _setState(STATES.AWAITING_TOKEN,
+          `⚠ ${bc.token || 'Token'} already bound to: ${bc.name || 'a stock item'}\n→ Scan a FREE STOCK_XXXX token`);
+        return;
+      }
+      if (bc.type === 'stocklocation' || bc.type === 'part') {
+        _setState(STATES.AWAITING_TOKEN,
+          `⚠ That is a ${bc.type} label, not a free STOCK_ token\n→ Scan a FREE STOCK_XXXX token`);
+        return;
+      }
+      _setState(STATES.AWAITING_TOKEN,
+        '⚠ Scan a FREE STOCK_XXXX token label');
+      return;
+    }
+
+    // ── STATE: AWAITING_CONFIRM (double-scan delete gate) ────────────────
+    if (_state === STATES.AWAITING_CONFIRM) {
+      if (ctrlCode) {
+        _clearPendingDelete();
+        _action = ctrlCode;
+        _stockItemId = null;
+        _itemInfo = null;
+        _setState(STATES.AWAITING_ITEM,
+          `Action: ${ctrlCode} — ${_itemPrompt(ctrlCode)}`);
+        return;
+      }
+
+      if (_pendingDeleteKind === 'part') {
+        const lk = await _lookupDistributorBarcode(raw);
+        if (lk && lk.found && lk.part_id === _pendingDeleteId) {
+          await _execDeletePartCommit();
+        } else {
+          _setState(STATES.AWAITING_CONFIRM,
+            `⚠ Different label — scan the SAME label again to confirm\n⛔ DELETE PART: "${_pendingDeleteDesc}"`);
+        }
+        return;
+      }
+
+      if (_pendingDeleteKind === 'stock') {
+        const bc = await _parseInvenTreeBarcode(raw);
+        if (bc.type === 'stockitem' && bc.id === _pendingDeleteId) {
+          await _execDeleteStockCommit(bc.token || _pendingToken);
+        } else {
+          _setState(STATES.AWAITING_CONFIRM,
+            `⚠ Different label — scan the SAME token again to confirm\n⛔ DELETE STOCK: "${_pendingDeleteDesc}"`);
+        }
+        return;
+      }
+
+      _resetToIdle();
+      return;
     }
   }
 

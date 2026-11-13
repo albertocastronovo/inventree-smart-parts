@@ -41,6 +41,19 @@
   background: linear-gradient(160deg, #78350f 0%, #d97706 40%, #f59e0b 100%);
   color: #fffbeb;
 }
+.ps-terminal[data-state="AWAITING_LOCATION"],
+.ps-terminal[data-state="AWAITING_QTY"] {
+  background: linear-gradient(160deg, #1e3a5f 0%, #0369a1 40%, #0284c7 100%);
+  color: #e0f2fe;
+}
+.ps-terminal[data-state="AWAITING_TOKEN"] {
+  background: linear-gradient(160deg, #3b0764 0%, #6b21a8 40%, #7e22ce 100%);
+  color: #f3e8ff;
+}
+.ps-terminal[data-state="AWAITING_CONFIRM"] {
+  background: linear-gradient(160deg, #7c2d12 0%, #c2410c 40%, #ea580c 100%);
+  color: #ffedd5;
+}
 .ps-terminal[data-state="PROCESSING"] {
   background: linear-gradient(160deg, #1e3a5f 0%, #1e40af 40%, #3b82f6 100%);
   color: #dbeafe;
@@ -412,7 +425,7 @@
 </div>
 
 <!-- ═══ Scripts ══════════════════════════════════════════════════════════ -->
-<script src="/static/plugins/smartparts/inventree_smart_parts/ui/purescan.js?v=4"></script>
+<script src="/static/plugins/smartparts/inventree_smart_parts/ui/purescan.js?v=5"></script>
 <script>
 (function() {
   'use strict';
@@ -434,21 +447,30 @@
 
   // ── State icons ────────────────────────────────────────────────────────
   const actionIcons = {
-    TRANSFER:  'fas fa-exchange-alt',
-    INFO:      'fas fa-info-circle',
-    ADD:       'fas fa-plus-circle',
-    REMOVE:    'fas fa-minus-circle',
-    STOCKTAKE: 'fas fa-clipboard-check',
+    TRANSFER:    'fas fa-exchange-alt',
+    INFO:        'fas fa-info-circle',
+    ADD:         'fas fa-plus-circle',
+    REMOVE:      'fas fa-minus-circle',
+    STOCKTAKE:   'fas fa-clipboard-check',
+    CREATEPART:  'fas fa-tag',
+    CREATESTOCK: 'fas fa-box',
+    DELETEPART:  'fas fa-trash-alt',
+    DELETESTOCK: 'fas fa-trash',
+    LAST:        'fas fa-map-marker-alt',
   };
 
   const stateIcons = {
-    IDLE:           'fas fa-barcode',
-    AWAITING_ITEM:  'fas fa-box-open',
-    AWAITING_PARAM: 'fas fa-map-marker-alt',
-    COMBO:          'fas fa-layer-group',
-    PROCESSING:     '',
-    SUCCESS:        'fas fa-check-circle',
-    ERROR:          'fas fa-exclamation-triangle',
+    IDLE:              'fas fa-barcode',
+    AWAITING_ITEM:     'fas fa-box-open',
+    AWAITING_PARAM:    'fas fa-map-marker-alt',
+    AWAITING_LOCATION: 'fas fa-map-marker-alt',
+    AWAITING_QTY:      'fas fa-hashtag',
+    AWAITING_TOKEN:    'fas fa-tags',
+    AWAITING_CONFIRM:  'fas fa-exclamation-circle',
+    COMBO:             'fas fa-layer-group',
+    PROCESSING:        '',
+    SUCCESS:           'fas fa-check-circle',
+    ERROR:             'fas fa-exclamation-triangle',
   };
 
   // ── IDLE hint cards ────────────────────────────────────────────────────
@@ -459,6 +481,11 @@
     { icon: 'fas fa-minus-circle', name: 'Remove',   code: 'SYS:REMOVE',    color: '#ef4444' },
     { icon: 'fas fa-clipboard-check', name: 'Count',  code: 'SYS:STOCKTAKE', color: '#8b5cf6' },
     { icon: 'fas fa-undo-alt',     name: 'Undo Last', code: 'SYS:UNDO',     color: '#64748b' },
+    { icon: 'fas fa-tag',          name: 'New Part', code: 'SYS:CREATEPART', color: '#38bdf8' },
+    { icon: 'fas fa-box',          name: 'New Stock', code: 'SYS:CREATESTOCK', color: '#a78bfa' },
+    { icon: 'fas fa-map-marker-alt', name: 'Set Loc', code: 'SYS:LAST',     color: '#34d399' },
+    { icon: 'fas fa-trash-alt',    name: 'Del Part', code: 'SYS:DELETEPART', color: '#f87171' },
+    { icon: 'fas fa-trash',        name: 'Del Stock', code: 'SYS:DELETESTOCK', color: '#fb923c' },
   ];
 
   function renderIdleHints() {

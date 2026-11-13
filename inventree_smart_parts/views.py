@@ -192,6 +192,41 @@ _COMMAND_SHEET_CODES = [
         "group": "action",
     },
     {
+        "code": "SYS:LAST",
+        "label": "Set Default Location",
+        "icon": "📍",
+        "color": "#0ea5e9",
+        "group": "action",
+    },
+    {
+        "code": "SYS:CREATEPART",
+        "label": "Create Part",
+        "icon": "🆕",
+        "color": "#14b8a6",
+        "group": "action",
+    },
+    {
+        "code": "SYS:CREATESTOCK",
+        "label": "Create Stock",
+        "icon": "📦",
+        "color": "#22c55e",
+        "group": "action",
+    },
+    {
+        "code": "SYS:DELETEPART",
+        "label": "Delete Part",
+        "icon": "🗑️",
+        "color": "#dc2626",
+        "group": "action",
+    },
+    {
+        "code": "SYS:DELETESTOCK",
+        "label": "Delete Stock",
+        "icon": "🧹",
+        "color": "#b91c1c",
+        "group": "action",
+    },
+    {
         "code": "SYS:QTY:1",
         "label": "Qty: 1",
         "icon": "#",
@@ -1641,6 +1676,29 @@ def purescan_resolve_barcode(request):
     if not raw:
         return JsonResponse({"error": "barcode parameter required"}, status=400)
 
+    # Custom SmartParts tokens (STOCK_XXXX / LOC_XXXX)
+    from .services import token_manager
+
+    if token_manager.is_valid_token(raw):
+        kind, obj = token_manager.resolve_token(raw)
+        if kind in ("stockitem", "stocklocation", "part") and obj is not None:
+            result = {
+                "type": kind,
+                "id": obj.pk,
+                "name": token_manager.describe_object(kind, obj),
+            }
+            if kind == "stockitem":
+                try:
+                    result["quantity"] = float(obj.quantity)
+                    result["location"] = (
+                        str(obj.location) if obj.location else "No location"
+                    )
+                except Exception:
+                    pass
+            return JsonResponse(result)
+        # valid token, not bound to anything
+        return JsonResponse({"type": "free", "id": None, "name": raw, "token": raw})
+
     # Try JSON parse
     import json as _json
 
@@ -1745,6 +1803,492 @@ def purescan_print_label(request):
     )
     status_code = 200 if result["success"] else 500
     return JsonResponse(result, status=status_code)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  PureScan – Slow Workflow (custom token labels)
+# ═══════════════════════════════════════════════════════════════════
+
+
+def _lookup_part_by_mpn_sku(mpn: str, sku: str):
+    """Find an existing InvenTree Part by MPN or supplier SKU (exact match)."""
+    if not mpn and not sku:
+        return None
+    try:
+        from part.models import Part
+        from company.models import ManufacturerPart, SupplierPart
+    except Exception as e:
+        logger.warning(f"SmartParts: part lookup models unavailable: {e}")
+        return None
+
+    if mpn:
+        mfg = (
+            ManufacturerPart.objects.filter(MPN__iexact=mpn)
+            .select_related("part")
+            .first()
+        )
+        if mfg and mfg.part:
+            return mfg.part
+        part = (
+            Part.objects.filter(IPN__iexact=mpn).first()
+            or Part.objects.filter(name__iexact=mpn).first()
+        )
+        if part:
+            return part
+        sup = SupplierPart.objects.filter(SKU__iexact=mpn).select_related("part").first()
+        if sup and sup.part:
+            return sup.part
+
+    if sku:
+        sup = SupplierPart.objects.filter(SKU__iexact=sku).select_related("part").first()
+        if sup and sup.part:
+            return sup.part
+
+    return None
+
+
+@csrf_exempt
+def purescan_token(request):
+    """
+    POST: Resolve a custom token label (STOCK_XXXX / LOC_XXXX).
+    Body: { token }
+    Returns: { type: 'free'|'stockitem'|'stocklocation'|'part', id, name, ... }
+    """
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+
+    denied = _check_perm(request, "stock.view_stockitem")
+    if denied:
+        return denied
+
+    try:
+        body = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    token = str(body.get("token", "")).strip()
+
+    from .services import token_manager
+
+    if not token_manager.is_valid_token(token):
+        return JsonResponse(
+            {"type": None, "error": "Invalid token format", "token": token},
+            status=400,
+        )
+
+    kind, obj = token_manager.resolve_token(token)
+
+    if kind in ("stockitem", "stocklocation", "part") and obj is not None:
+        resp = {
+            "type": kind,
+            "id": obj.pk,
+            "name": token_manager.describe_object(kind, obj),
+            "token": token,
+        }
+        if kind == "stockitem":
+            part = getattr(obj, "part", None)
+            resp["part_id"] = part.pk if part else None
+            try:
+                resp["quantity"] = float(obj.quantity)
+            except Exception:
+                pass
+            try:
+                resp["location"] = (
+                    str(obj.location) if obj.location else "No location"
+                )
+            except Exception:
+                pass
+        return JsonResponse(resp)
+
+    return JsonResponse({"type": "free", "id": None, "name": token, "token": token})
+
+
+@csrf_exempt
+def purescan_createpart(request):
+    """
+    POST: Create a part from a scanned distributor DataMatrix barcode.
+    Body: { barcode }
+    Quantity information is discarded (parts carry no stock).
+    Part identity is discriminated by MPN/SKU only — batch codes are ignored.
+    Gracefully reports "already exists" instead of failing hard.
+    """
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+
+    denied = _check_perm(request, "part.add_part")
+    if denied:
+        return denied
+
+    try:
+        body = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    barcode = str(body.get("barcode", "")).strip()
+    if not barcode:
+        return JsonResponse({"error": "barcode is required"}, status=400)
+
+    from .services.barcode_decoder import parse_barcode
+
+    parsed = parse_barcode(barcode)
+    mpn = (parsed.mpn or "").strip()
+    sku = (parsed.supplier_sku or "").strip()
+
+    if not mpn and not sku:
+        return JsonResponse(
+            {
+                "success": False,
+                "already_exists": False,
+                "message": "Barcode does not contain an MPN or SKU",
+            },
+            status=400,
+        )
+
+    existing = _lookup_part_by_mpn_sku(mpn, sku)
+    if existing is not None:
+        return JsonResponse(
+            {
+                "success": False,
+                "already_exists": True,
+                "part_id": existing.pk,
+                "part_name": existing.name,
+                "part_ipn": getattr(existing, "IPN", "") or "",
+                "message": f"Part already exists: {existing.name}",
+            }
+        )
+
+    if not mpn:
+        return JsonResponse(
+            {
+                "success": False,
+                "already_exists": False,
+                "message": "No MPN in barcode — distributor lookup impossible",
+            },
+            status=400,
+        )
+
+    plugin = _get_plugin()
+    if not plugin:
+        return JsonResponse({"error": "Plugin not loaded"}, status=500)
+
+    _log_activity("INFO", f"[PureScan] CREATEPART: searching distributors for MPN {mpn}")
+
+    api_results, _results_dict = _run_all_api_searches(plugin, mpn)
+    if not api_results:
+        return JsonResponse(
+            {
+                "success": False,
+                "already_exists": False,
+                "mpn": mpn,
+                "message": (
+                    "Part not found in any enabled distributor — "
+                    "create it manually via the dashboard"
+                ),
+            }
+        )
+
+    from .services.data_merger import merge_part_data
+    from .services.duplicate_checker import check_duplicate
+
+    priority_str = (
+        plugin.get_setting("API_PRIORITY") or "mouser,digikey,element14,tme,lcsc"
+    )
+    priority_order = [p.strip() for p in priority_str.split(",") if p.strip()]
+    merged = merge_part_data(api_results, priority_order)
+    if not merged:
+        return JsonResponse(
+            {
+                "success": False,
+                "already_exists": False,
+                "message": "Could not merge distributor data",
+            },
+            status=500,
+        )
+
+    dup = check_duplicate(merged.mpn, merged.manufacturer)
+    if dup.is_duplicate and dup.existing_part_id:
+        return JsonResponse(
+            {
+                "success": False,
+                "already_exists": True,
+                "part_id": dup.existing_part_id,
+                "part_name": dup.existing_part_name,
+                "message": f"Part already exists: {dup.existing_part_name}",
+            }
+        )
+
+    category_id = None
+    if merged.category:
+        try:
+            from .services.category_mapper import fuzzy_match_category
+
+            threshold = plugin.get_setting("FUZZY_THRESHOLD") or 45
+            default_cat = plugin.get_setting("DEFAULT_CATEGORY") or ""
+            user_synonyms = plugin.get_setting("CATEGORY_SYNONYMS") or "{}"
+            learned = plugin.get_setting("LEARNED_CATEGORY_MAPPINGS") or "{}"
+            category_id, _path, _score = fuzzy_match_category(
+                merged.category,
+                threshold,
+                default_cat,
+                user_synonyms_json=user_synonyms,
+                learned_mappings_json=learned,
+            )
+        except Exception as e:
+            logger.warning(f"[PureScan] CREATEPART category mapping failed: {e}")
+
+    from .services.part_creator import create_part_from_data
+
+    creation = create_part_from_data(
+        part_data=merged,
+        category_id=category_id,
+        update_existing=False,
+        existing_part_id=None,
+        auto_create_companies=bool(plugin.get_setting("AUTO_CREATE_MANUFACTURERS")),
+    )
+
+    _log_activity(
+        "INFO" if creation.success else "ERROR",
+        f"[PureScan] CREATEPART {creation.action}: {creation.part_name or mpn}",
+        creation.message,
+    )
+
+    return JsonResponse(
+        {
+            "success": creation.success,
+            "already_exists": False,
+            "part_id": creation.part_id,
+            "part_name": creation.part_name,
+            "message": creation.message,
+            "errors": creation.errors,
+        },
+        status=200 if creation.success else 500,
+    )
+
+
+@csrf_exempt
+def purescan_createstock(request):
+    """
+    POST: Create a new StockItem and bind a custom token label to it.
+    Body: { part_id, location_id?, quantity, batch?, new_token }
+    The whole operation is atomic: if token binding fails, the stock item
+    creation is rolled back.
+    """
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+
+    denied = _check_perm(request, "stock.add_stockitem")
+    if denied:
+        return denied
+
+    try:
+        body = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    part_id = body.get("part_id")
+    new_token = str(body.get("new_token", "")).strip()
+    location_id = body.get("location_id") or None
+    batch = str(body.get("batch", "") or "")
+
+    if not part_id:
+        return JsonResponse({"error": "part_id is required"}, status=400)
+
+    try:
+        quantity = float(body.get("quantity"))
+    except (TypeError, ValueError):
+        return JsonResponse({"error": "quantity must be a number"}, status=400)
+    if quantity <= 0:
+        return JsonResponse({"error": "quantity must be > 0"}, status=400)
+
+    if location_id:
+        from stock.models import StockLocation
+
+        if not StockLocation.objects.filter(pk=int(location_id)).exists():
+            return JsonResponse(
+                {"error": f"Location {location_id} not found"}, status=400
+            )
+
+    from .services import token_manager
+    from .services.token_manager import bind_token, resolve_token
+
+    if not token_manager.is_valid_token(new_token):
+        return JsonResponse(
+            {"error": "new_token must match STOCK_XXXX"}, status=400
+        )
+
+    kind, bound = resolve_token(new_token)
+    if bound is not None and kind is not None:
+        return JsonResponse(
+            {
+                "error": (
+                    f"Token {new_token} is already bound to a {kind}: "
+                    f"{token_manager.describe_object(kind, bound)}"
+                )
+            },
+            status=409,
+        )
+
+    from django.db import transaction
+    from stock.models import StockItem
+    from .services.stock_manager import create_stock_item
+
+    stock_item = None
+    try:
+        with transaction.atomic():
+            result = create_stock_item(
+                part_id=int(part_id),
+                quantity=quantity,
+                location_id=location_id,
+                batch=batch,
+                delete_on_deplete=bool(body.get("delete_on_deplete", True)),
+                user=request.user,
+            )
+            if not result.get("success"):
+                raise RuntimeError(result.get("message") or "stock creation failed")
+            stock_item = StockItem.objects.get(pk=result["stock_id"])
+            bind_result = bind_token(new_token, stock_item)
+            if not bind_result.get("success"):
+                raise RuntimeError(bind_result.get("error") or "token binding failed")
+    except Exception as e:
+        return JsonResponse(
+            {"error": f"Stock creation aborted: {e}"}, status=500
+        )
+
+    return JsonResponse(
+        {
+            "success": True,
+            "stock_id": stock_item.pk,
+            "token": new_token,
+            "message": (
+                f"Stock item #{stock_item.pk} created "
+                f"(qty {quantity}) and bound to {new_token}"
+            ),
+        }
+    )
+
+
+@csrf_exempt
+def purescan_deletepart(request):
+    """
+    POST: Delete a Part.  Refused while stock items exist.
+    Body: { part_id, confirm }  (confirm must be true — double-scan gate)
+    """
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+
+    denied = _check_perm(request, "part.delete_part")
+    if denied:
+        return denied
+
+    try:
+        body = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    part_id = body.get("part_id")
+    confirm = body.get("confirm") is True
+
+    if not part_id:
+        return JsonResponse({"error": "part_id is required"}, status=400)
+    if not confirm:
+        return JsonResponse(
+            {"error": "confirm must be true (scan the label again)"}, status=400
+        )
+
+    from part.models import Part
+    from stock.models import StockItem
+
+    part = Part.objects.filter(pk=int(part_id)).first()
+    if not part:
+        return JsonResponse({"error": f"Part {part_id} not found"}, status=404)
+
+    stock_count = StockItem.objects.filter(part=part).count()
+    if stock_count > 0:
+        return JsonResponse(
+            {
+                "error": (
+                    f"Cannot delete '{part.name}' — {stock_count} stock item(s) "
+                    "still exist. Delete the instances first (SYS:DELETESTOCK)."
+                )
+            },
+            status=409,
+        )
+
+    name = part.name
+    try:
+        part.delete()
+    except Exception as e:
+        return JsonResponse({"error": f"Part deletion failed: {e}"}, status=500)
+
+    _log_activity("INFO", f"[PureScan] DELETEPART: deleted part '{name}' (#{part_id})")
+    return JsonResponse({"success": True, "message": f"Part '{name}' deleted"})
+
+
+@csrf_exempt
+def purescan_deletestock(request):
+    """
+    POST: Delete a StockItem identified by its custom token label.
+    Body: { token, confirm }
+    Deleting the item automatically frees the token for reuse.
+    """
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+
+    denied = _check_perm(request, "stock.delete_stockitem")
+    if denied:
+        return denied
+
+    try:
+        body = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    token = str(body.get("token", "")).strip()
+    confirm = body.get("confirm") is True
+
+    if not confirm:
+        return JsonResponse(
+            {"error": "confirm must be true (scan the label again)"}, status=400
+        )
+
+    from .services import token_manager
+
+    if not token_manager.is_valid_token(token):
+        return JsonResponse({"error": "Not a valid token label"}, status=400)
+
+    kind, obj = token_manager.resolve_token(token)
+    if kind != "stockitem" or obj is None:
+        target = token_manager.describe_object(kind, obj)
+        return JsonResponse(
+            {
+                "error": (
+                    f"Token {token} is not bound to a stock item "
+                    f"(bound to: {target})"
+                )
+            },
+            status=404,
+        )
+
+    info = token_manager.describe_object(kind, obj)
+    try:
+        obj.delete()
+    except Exception as e:
+        return JsonResponse(
+            {"error": f"Stock item deletion failed: {e}"}, status=500
+        )
+
+    _log_activity(
+        "INFO",
+        f"[PureScan] DELETESTOCK: deleted stock item '{info}' ({token}); token freed",
+    )
+    return JsonResponse(
+        {
+            "success": True,
+            "message": (
+                f"Stock item '{info}' deleted — token {token} is free again"
+            ),
+        }
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════

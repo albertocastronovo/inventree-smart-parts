@@ -455,6 +455,32 @@ class SmartPartsPlugin(
             path(
                 "api/purescan/print/", views.purescan_print_label, name="purescan-print"
             ),
+            # PureScan – slow workflow (custom token labels)
+            path(
+                "api/purescan/token/",
+                views.purescan_token,
+                name="purescan-token",
+            ),
+            path(
+                "api/purescan/createpart/",
+                views.purescan_createpart,
+                name="purescan-createpart",
+            ),
+            path(
+                "api/purescan/createstock/",
+                views.purescan_createstock,
+                name="purescan-createstock",
+            ),
+            path(
+                "api/purescan/deletepart/",
+                views.purescan_deletepart,
+                name="purescan-deletepart",
+            ),
+            path(
+                "api/purescan/deletestock/",
+                views.purescan_deletestock,
+                name="purescan-deletestock",
+            ),
             # ── External REST API – v1 ──────────────────────────────
             # Authenticate via: Authorization: Token <inventree-api-token>
             # or active InvenTree session.
