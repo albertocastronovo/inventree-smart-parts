@@ -2,6 +2,11 @@
 
 All notable changes to SmartParts are documented in this file.
 
+## [1.2.2] — 2026-11-14
+
+### Fixed
+- Version bump only (no code changes): forces pip to actually reinstall the package — the 1.2.1 template fix (Fast Add hint card) was skipped by `pip install -U` because the version was unchanged.
+
 ## [1.2.1] — 2026-11-14
 
 ### Added
