@@ -6,6 +6,7 @@ All notable changes to SmartParts are documented in this file.
 
 ### Added
 - **SYS:FASTADD (Fast Add / Receive)**: one-command receive flow for distributor reels.
+  - Added to the IDLE hint cards in the PureScan terminal.
   - Scan a distributor DataMatrix or an instance (STOCK_) label after SYS:FASTADD.
   - Instance label → falls back to the SYS:ADD combo flow (qty accumulation).
   - DataMatrix → resolves the part (auto-creates it via SYS:CREATEPART if not in DB), then asks for a location (SYS:LAST default), a quantity (label's Q field default), and a free STOCK_ token.
