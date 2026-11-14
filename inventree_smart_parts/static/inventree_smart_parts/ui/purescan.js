@@ -38,6 +38,7 @@
     STOCKTAKE:   'STOCKTAKE',
     CREATEPART:  'CREATEPART',
     CREATESTOCK: 'CREATESTOCK',
+    FASTADD:     'FASTADD',
     DELETEPART:  'DELETEPART',
     DELETESTOCK: 'DELETESTOCK',
     LAST:        'LAST',
@@ -52,6 +53,7 @@
     'SYS:STOCKTAKE':   ACTIONS.STOCKTAKE,
     'SYS:CREATEPART':  ACTIONS.CREATEPART,
     'SYS:CREATESTOCK': ACTIONS.CREATESTOCK,
+    'SYS:FASTADD':     ACTIONS.FASTADD,
     'SYS:DELETEPART':  ACTIONS.DELETEPART,
     'SYS:DELETESTOCK': ACTIONS.DELETESTOCK,
     'SYS:LAST':        ACTIONS.LAST,
@@ -129,6 +131,7 @@
               id: parseInt(data.id, 10),
               name: data.name || '',
               partId: data.part_id || null,
+              locationId: data.location_id || null,
               token: trimmed,
             };
           }
@@ -200,6 +203,7 @@
     switch (action) {
       case ACTIONS.CREATEPART:  return 'Now scan a distributor DataMatrix label';
       case ACTIONS.CREATESTOCK: return 'Now scan a distributor label, an existing STOCK_ token, or a part label';
+      case ACTIONS.FASTADD:     return 'Now scan a distributor DataMatrix or an instance (STOCK_) label';
       case ACTIONS.DELETEPART:  return 'Now scan a distributor DataMatrix label';
       case ACTIONS.DELETESTOCK: return 'Now scan a STOCK_XXXX token bound to a stock item';
       case ACTIONS.LAST:        return 'Now scan a Location label';
@@ -775,6 +779,96 @@
     }
   }
 
+  // ── v3: FASTADD ──
+
+  async function _execFastAddStart(raw) {
+    const bc = await _parseInvenTreeBarcode(raw);
+
+    // Instance label → SYS:ADD combo flow
+    if (bc.type === 'stockitem' && bc.id) {
+      _action = ACTIONS.ADD;
+      _stockItemId = bc.id;
+      _setState(STATES.PROCESSING, 'Looking up stock item…');
+      const info = await _fetchStockItemInfo(bc.id);
+      if (!info) {
+        _showResult(STATES.ERROR, `Stock Item #${bc.id} not found`);
+        return;
+      }
+      _itemInfo = info;
+      _setState(STATES.AWAITING_PARAM,
+        `${_action}: "${info.part_name}" (current: ${info.quantity}×)\n▶ Scan a Quantity Code (SYS:QTY:nnn) or scan item again for +1`);
+      return;
+    }
+
+    // Location / part labels → error, stay in AWAITING_ITEM
+    if (bc.type === 'stocklocation' || bc.type === 'part') {
+      _setState(STATES.AWAITING_ITEM,
+        `⚠ That is a ${bc.type} label.\n▶ Scan a distributor DataMatrix or an instance (STOCK_) label.\nAction: FASTADD`);
+      return;
+    }
+
+    // Distributor DataMatrix → resolve part (auto-create if not in DB)
+    if (!bc.type) {
+      _setState(STATES.PROCESSING, 'Looking up part… (this can take a few seconds)');
+      const lk = await _lookupDistributorBarcode(raw);
+      if (!lk || (!lk.found && !lk.mpn)) {
+        _showResult(STATES.ERROR, 'Unknown part — run SYS:CREATEPART first', 6000);
+        return;
+      }
+      if (!lk.found) {
+        // Part not in DB → create it (like SYS:CREATEPART)
+        try {
+          const resp = await _apiPost('/plugin/smartparts/api/purescan/createpart/', { barcode: raw });
+          if (resp.success) {
+            _pendingPartId = resp.part_id;
+            _pendingPartName = resp.part_name || '';
+          } else if (resp.already_exists) {
+            _pendingPartId = resp.part_id;
+            _pendingPartName = resp.part_name || '';
+          } else {
+            _showResult(STATES.ERROR, `⛔ ${resp.message || resp.error || 'Part creation failed'}`, 8000);
+            return;
+          }
+        } catch (e) {
+          _showResult(STATES.ERROR, `Part creation failed: ${e.message}`, 6000);
+          return;
+        }
+      } else {
+        _pendingPartId = lk.part_id;
+        _pendingPartName = lk.part_name || '';
+      }
+      const d = lk.barcode_data || {};
+      _pendingQty = d.quantity != null ? parseFloat(d.quantity) : 1;
+      _pendingBatch = d.batch || '';
+      _pendingBarcodeData = d;
+      _setState(STATES.AWAITING_LOCATION,
+        _locationPrompt(`Create stock for "${_pendingPartName}"${_pendingQty ? ' (reel qty ' + _pendingQty + ')' : ''}`));
+      return;
+    }
+
+    _setState(STATES.AWAITING_ITEM,
+      '⚠ Scan a distributor DataMatrix or an instance (STOCK_) label.\nAction: FASTADD');
+  }
+
+  async function _execFastAddMerge(bc) {
+    _setState(STATES.PROCESSING, `Adding ${_pendingQty}× to "${_pendingPartName}"…`);
+    try {
+      await _apiPost('/api/stock/add/', {
+        items: [{ pk: bc.id, quantity: _pendingQty }],
+        notes: `PureScan FASTADD: merge ${_pendingQty}×`,
+      });
+      const desc = `Added ${_pendingQty}× "${_pendingPartName}" to existing instance ${bc.token || '#' + bc.id}`;
+      _pushLog({
+        ts: new Date(), description: desc, actionType: 'ADD', undone: false,
+        payload: { stockItemId: bc.id, quantity: _pendingQty, partName: _pendingPartName, previousQty: null },
+      });
+      _showResult(STATES.SUCCESS, `✅ ${desc}\nMerged into existing instance`, 8000);
+      _clearPendingCreate();
+    } catch (e) {
+      _showResult(STATES.ERROR, `Merge failed: ${e.message}`, 8000);
+    }
+  }
+
   // ── v3: DELETEPART ──
 
   async function _execDeletePartStart(raw) {
@@ -836,7 +930,8 @@
     _setState(STATES.PROCESSING, 'Deleting stock item…');
     try {
       const resp = await _apiPost('/plugin/smartparts/api/purescan/deletestock/', {
-        token: token,
+        token: token || null,
+        stock_id: _pendingDeleteId,
         confirm: true,
       });
       _showResult(STATES.SUCCESS, `✓ ${resp.message || 'Stock item deleted'}`, 6000);
@@ -894,11 +989,22 @@
       }
 
     } else if (action === ACTIONS.REMOVE) {
-      // ── Depletion safeguard: block removal that would zero-out the item ──
+      // ── Depletion handling: removing to zero deletes the stock item ──
       const currentQty = info?.quantity || 0;
-      if (qty >= currentQty) {
+      if (qty > currentQty) {
         _showResult(STATES.ERROR,
-          `⛔ Cannot remove ${qty}× — only ${currentQty}× available.\n"${info?.part_name}" would be depleted/deleted.\nUse manual correction for full depletion.`, 6000);
+          `⛔ Cannot remove ${qty}× — only ${currentQty}× available.\n"${info?.part_name}" has less stock than requested.`, 6000);
+        return;
+      }
+      if (qty === currentQty) {
+        // Full depletion → the stock item is deleted (label/token freed).
+        // Reuse the double-scan confirm gate (DELETESTOCK machinery).
+        _pendingDeleteKind = 'stock';
+        _pendingDeleteId = itemId;
+        _pendingToken = null;
+        _pendingDeleteDesc = `Depleting ${info?.part_name} (${qty}× @ ${info?.location})`;
+        _setState(STATES.AWAITING_CONFIRM,
+          `⚠ DEPLETING: "${info?.part_name}" — removing ${qty}× leaves 0\nThe stock item will be DELETED (label freed for reuse).\n▶ Scan the SAME label again to confirm, or SYS:CANCEL`);
         return;
       }
 
@@ -1110,6 +1216,10 @@
         await _execCreateStockStart(raw);
         return;
       }
+      if (_action === ACTIONS.FASTADD) {
+        await _execFastAddStart(raw);
+        return;
+      }
 
       const bc = await _parseInvenTreeBarcode(raw);
 
@@ -1229,7 +1339,7 @@
               `📍 Current default: ${last ? last.name : 'none'}\n→ Scan a Location label to set`);
             return;
           }
-          // CREATESTOCK: accept the stored default location
+          // CREATESTOCK/FASTADD: accept the stored default location
           const last = _getLastLocation();
           if (last && last.id) {
             _pendingLocationId = last.id;
@@ -1266,8 +1376,8 @@
         return;
       }
 
-      // CREATESTOCK: SYS:QTY:nnn = keep the SYS:LAST location and set qty
-      if (_action === ACTIONS.CREATESTOCK) {
+      // CREATESTOCK/FASTADD: SYS:QTY:nnn = keep the SYS:LAST location and set qty
+      if (_action === ACTIONS.CREATESTOCK || _action === ACTIONS.FASTADD) {
         const qty = _parseQuantityCode(raw);
         if (qty !== null && qty > 0) {
           const last = _getLastLocation();
@@ -1344,6 +1454,25 @@
         return;
       }
       if (bc.type === 'stockitem') {
+        if (_action === ACTIONS.FASTADD) {
+          // Merge: same part + same location → add the reel qty to the existing instance
+          let bcPartId = bc.partId;
+          let bcLocId = bc.locationId;
+          if (bcPartId == null || bcLocId == null) {
+            const bi = await _fetchStockItemInfo(bc.id);
+            if (bi) {
+              bcPartId = bi.part_id;
+              bcLocId = bi.location_id;
+            }
+          }
+          if (bcPartId === _pendingPartId && bcLocId === _pendingLocationId) {
+            await _execFastAddMerge(bc);
+            return;
+          }
+          _setState(STATES.AWAITING_TOKEN,
+            `⚠ ${bc.token || 'Token'} belongs to a different part or location.\n→ Scan a FREE STOCK_XXXX token for a new instance`);
+          return;
+        }
         _setState(STATES.AWAITING_TOKEN,
           `⚠ ${bc.token || 'Token'} already bound to: ${bc.name || 'a stock item'}\n→ Scan a FREE STOCK_XXXX token`);
         return;

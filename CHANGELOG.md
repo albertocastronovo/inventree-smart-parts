@@ -2,6 +2,21 @@
 
 All notable changes to SmartParts are documented in this file.
 
+## [1.2.1] — 2026-11-14
+
+### Added
+- **SYS:FASTADD (Fast Add / Receive)**: one-command receive flow for distributor reels.
+  - Scan a distributor DataMatrix or an instance (STOCK_) label after SYS:FASTADD.
+  - Instance label → falls back to the SYS:ADD combo flow (qty accumulation).
+  - DataMatrix → resolves the part (auto-creates it via SYS:CREATEPART if not in DB), then asks for a location (SYS:LAST default), a quantity (label's Q field default), and a free STOCK_ token.
+  - Scanning a bound token in the token step: if it belongs to the same part AND same location → merges the reel quantity into the existing instance (refill); otherwise errors and asks to scan another label.
+  - SYS:QTY:nnn shortcut accepted in the location step to keep the SYS:LAST location and set qty in one scan.
+
+### Fixed
+- **Depletion handling**: removing exactly the remaining quantity no longer blocks the operation — it now warns and routes through the double-scan confirm gate, deleting the stock item (label freed for reuse) on confirmation. Over-removals (more than available) are still blocked.
+- `purescan_deletestock` API now accepts `stock_id` as an alternative to `token` (needed for depletion confirm on JSON-label scans).
+- `purescan_token` API now returns `location_id` for bound stock items (needed for the FASTADD merge check).
+
 ## [1.2.0] — 2026-09-09
 
 ### Added

@@ -213,6 +213,13 @@ _COMMAND_SHEET_CODES = [
         "group": "action",
     },
     {
+        "code": "SYS:FASTADD",
+        "label": "Fast Add / Receive",
+        "icon": "⚡",
+        "color": "#eab308",
+        "group": "action",
+    },
+    {
         "code": "SYS:DELETEPART",
         "label": "Delete Part",
         "icon": "🗑️",
@@ -1892,6 +1899,7 @@ def purescan_token(request):
                 resp["quantity"] = float(obj.quantity)
             except Exception:
                 pass
+            resp["location_id"] = obj.location.pk if obj.location else None
             try:
                 resp["location"] = (
                     str(obj.location) if obj.location else "No location"
@@ -2228,7 +2236,7 @@ def purescan_deletepart(request):
 def purescan_deletestock(request):
     """
     POST: Delete a StockItem identified by its custom token label.
-    Body: { token, confirm }
+    Body: { token, confirm }  or  { stock_id, confirm }
     Deleting the item automatically frees the token for reuse.
     """
     if request.method != "POST":
@@ -2253,23 +2261,41 @@ def purescan_deletestock(request):
 
     from .services import token_manager
 
-    if not token_manager.is_valid_token(token):
-        return JsonResponse({"error": "Not a valid token label"}, status=400)
+    if token:
+        if not token_manager.is_valid_token(token):
+            return JsonResponse({"error": "Not a valid token label"}, status=400)
 
-    kind, obj = token_manager.resolve_token(token)
-    if kind != "stockitem" or obj is None:
-        target = token_manager.describe_object(kind, obj)
-        return JsonResponse(
-            {
-                "error": (
-                    f"Token {token} is not bound to a stock item "
-                    f"(bound to: {target})"
-                )
-            },
-            status=404,
-        )
+        kind, obj = token_manager.resolve_token(token)
+        if kind != "stockitem" or obj is None:
+            target = token_manager.describe_object(kind, obj)
+            return JsonResponse(
+                {
+                    "error": (
+                        f"Token {token} is not bound to a stock item "
+                        f"(bound to: {target})"
+                    )
+                },
+                status=404,
+            )
+    elif body.get("stock_id") is not None:
+        try:
+            stock_id = int(body["stock_id"])
+        except (TypeError, ValueError):
+            return JsonResponse({"error": "Invalid stock_id"}, status=400)
 
-    info = token_manager.describe_object(kind, obj)
+        from stock.models import StockItem
+
+        try:
+            obj = StockItem.objects.get(pk=stock_id)
+        except StockItem.DoesNotExist:
+            return JsonResponse(
+                {"error": f"Stock item #{stock_id} not found"}, status=404
+            )
+        token = token or "-"
+    else:
+        return JsonResponse({"error": "token or stock_id required"}, status=400)
+
+    info = token_manager.describe_object("stockitem", obj)
     try:
         obj.delete()
     except Exception as e:
@@ -2277,15 +2303,18 @@ def purescan_deletestock(request):
             {"error": f"Stock item deletion failed: {e}"}, status=500
         )
 
+    label_note = (
+        f"token {token} is free again" if token != "-" else "label freed"
+    )
     _log_activity(
         "INFO",
-        f"[PureScan] DELETESTOCK: deleted stock item '{info}' ({token}); token freed",
+        f"[PureScan] DELETESTOCK: deleted stock item '{info}' ({label_note})",
     )
     return JsonResponse(
         {
             "success": True,
             "message": (
-                f"Stock item '{info}' deleted — token {token} is free again"
+                f"Stock item '{info}' deleted — {label_note}"
             ),
         }
     )
