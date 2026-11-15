@@ -501,8 +501,8 @@ def api_search(request):
     from .services.data_merger import merge_part_data
     from .services.duplicate_checker import check_duplicate
     from .services.category_mapper import (
-        fuzzy_match_category,
         get_all_categories_for_ui,
+        resolve_category_with_autocreate,
     )
 
     api_results, results = _run_all_api_searches(plugin, mpn)
@@ -526,12 +526,15 @@ def api_search(request):
         default_cat = plugin.get_setting("DEFAULT_CATEGORY") or ""
         user_synonyms = plugin.get_setting("CATEGORY_SYNONYMS") or "{}"
         learned_mappings = plugin.get_setting("LEARNED_CATEGORY_MAPPINGS") or "{}"
-        cat_id, cat_path, score = fuzzy_match_category(
+        auto_create = plugin.get_setting("AUTO_CREATE_CATEGORIES")
+        cat_id, cat_path, score, _cat_created = resolve_category_with_autocreate(
             merged.category,
             threshold,
             default_cat,
             user_synonyms_json=user_synonyms,
             learned_mappings_json=learned_mappings,
+            plugin=plugin,
+            auto_create=auto_create,
         )
         category_match = {
             "id": cat_id,
@@ -2026,20 +2029,29 @@ def purescan_createpart(request):
         )
 
     category_id = None
+    category_path = ""
+    category_created = False
     if merged.category:
         try:
-            from .services.category_mapper import fuzzy_match_category
+            from .services.category_mapper import resolve_category_with_autocreate
 
             threshold = plugin.get_setting("FUZZY_THRESHOLD") or 45
             default_cat = plugin.get_setting("DEFAULT_CATEGORY") or ""
             user_synonyms = plugin.get_setting("CATEGORY_SYNONYMS") or "{}"
             learned = plugin.get_setting("LEARNED_CATEGORY_MAPPINGS") or "{}"
-            category_id, _path, _score = fuzzy_match_category(
+            (
+                category_id,
+                category_path,
+                _score,
+                category_created,
+            ) = resolve_category_with_autocreate(
                 merged.category,
                 threshold,
                 default_cat,
                 user_synonyms_json=user_synonyms,
                 learned_mappings_json=learned,
+                plugin=plugin,
+                auto_create=plugin.get_setting("AUTO_CREATE_CATEGORIES"),
             )
         except Exception as e:
             logger.warning(f"[PureScan] CREATEPART category mapping failed: {e}")
@@ -2068,6 +2080,8 @@ def purescan_createpart(request):
             "part_name": creation.part_name,
             "message": creation.message,
             "errors": creation.errors,
+            "category_path": category_path,
+            "category_created": category_created,
         },
         status=200 if creation.success else 500,
     )
@@ -2425,21 +2439,23 @@ def api_v1_import(request):
     priority_order = [p.strip() for p in priority_str.split(",") if p.strip()]
     merged = merge_part_data(api_results, priority_order)
 
-    # ── Category mapping ────────────────────────────────────────────
+    # Category mapping ------------------------------------------------------
     category_match = None
     if merged and merged.category:
-        from .services.category_mapper import fuzzy_match_category
+        from .services.category_mapper import resolve_category_with_autocreate
 
         threshold = plugin.get_setting("FUZZY_THRESHOLD") or 65
         default_cat = plugin.get_setting("DEFAULT_CATEGORY") or ""
         user_synonyms = plugin.get_setting("CATEGORY_SYNONYMS") or "{}"
         learned_mappings = plugin.get_setting("LEARNED_CATEGORY_MAPPINGS") or "{}"
-        cat_id, cat_path, score = fuzzy_match_category(
+        cat_id, cat_path, score, _cat_created = resolve_category_with_autocreate(
             merged.category,
             threshold,
             default_cat,
             user_synonyms_json=user_synonyms,
             learned_mappings_json=learned_mappings,
+            plugin=plugin,
+            auto_create=plugin.get_setting("AUTO_CREATE_CATEGORIES"),
         )
         category_match = {
             "id": cat_id,

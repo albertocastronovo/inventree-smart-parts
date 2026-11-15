@@ -1381,6 +1381,135 @@ def learn_category_mapping(
 
 
 # -----------------------------------------------------------------------------
+#  Category auto-creation  (v1.2.3)
+# -----------------------------------------------------------------------------
+
+# Generic distributor roots that carry no category information and are
+# stripped before auto-creating a chain (e.g. DigiKey's "Products").
+_GENERIC_ROOT_NAMES = {"products", "product", "categories", "category"}
+
+
+def create_category_chain(distributor_category: str) -> Tuple[Optional[int], str, bool]:
+    """
+    Find-or-create a chain of PartCategory objects from a distributor
+    category path string (e.g. "Products > Kits > Integrated Circuits (IC) Kits").
+
+    Generic distributor roots ("Products") are stripped.  Each segment is
+    matched case-insensitively by (name, parent); missing segments are
+    created.  The category cache is cleared if anything was created.
+
+    Returns:
+        (leaf_category_id, leaf_path, created_any)
+        (None, "", False) if the category string is empty or creation failed.
+    """
+    if not distributor_category:
+        return (None, "", False)
+
+    try:
+        from part.models import PartCategory
+    except Exception as e:
+        logger.error(f"create_category_chain: cannot import PartCategory: {e}")
+        return (None, "", False)
+
+    parts_raw = [
+        p.strip() for p in re.split(r"[>/|]", distributor_category) if p.strip()
+    ]
+    # Strip generic distributor roots (e.g. "Products")
+    while parts_raw and parts_raw[0].lower() in _GENERIC_ROOT_NAMES:
+        parts_raw.pop(0)
+    if not parts_raw:
+        return (None, "", False)
+
+    parent = None
+    leaf_id = None
+    leaf_path = ""
+    created_any = False
+
+    try:
+        for name in parts_raw:
+            obj = PartCategory.objects.filter(name=name, parent=parent).first()
+            if obj is None:
+                obj = PartCategory.objects.create(name=name, parent=parent)
+                created_any = True
+                logger.info(
+                    f"create_category_chain: created category '{name}' "
+                    f"(parent: {parent.name if parent else 'root'})"
+                )
+            leaf_id = obj.pk
+            leaf_path = f"{leaf_path} > {name}" if leaf_path else name
+            parent = obj
+    except Exception as e:
+        logger.error(
+            f"create_category_chain: failed building chain '{distributor_category}': {e}",
+            exc_info=True,
+        )
+        return (None, "", False)
+
+    if created_any:
+        clear_cache()
+
+    return (leaf_id, leaf_path, created_any)
+
+
+def resolve_category_with_autocreate(
+    distributor_category: str,
+    threshold: int = 60,
+    default_category_name: str = "",
+    user_synonyms_json: str = "",
+    learned_mappings_json: str = "",
+    plugin=None,
+    auto_create: bool = True,
+) -> Tuple[Optional[int], str, int, bool]:
+    """
+    Resolve a distributor category string to an InvenTree category,
+    auto-creating a new category chain when no match exists.
+
+    Resolution order (preserves all existing behaviour):
+      1. Learned mapping hit -> return immediately.
+      2. Fuzzy match >= threshold -> return (existing behaviour unchanged).
+      3. Auto-create enabled -> create the chain from the distributor path,
+         record it as a learned mapping so future scans skip the fuzzy pass.
+      4. Fallback -> default category (current behaviour).
+
+    Returns:
+        (category_id, category_path, confidence_score, created)
+        `created` is True only when a new chain was auto-created.
+    """
+    if not distributor_category:
+        cat_id, cat_path, score = _get_default_category(default_category_name)
+        return (cat_id, cat_path, score, False)
+
+    # 1+2. Learned / fuzzy matching (no default fallback inside — handled below)
+    cat_id, cat_path, score = fuzzy_match_category(
+        distributor_category,
+        threshold,
+        default_category_name="",
+        user_synonyms_json=user_synonyms,
+        learned_mappings_json=learned_mappings_json,
+    )
+    if cat_id is not None:
+        return (cat_id, cat_path, score, False)
+
+    # 3. Auto-create the chain from the distributor path
+    if auto_create and plugin is not None:
+        chain_id, chain_path, created_any = create_category_chain(
+            distributor_category
+        )
+        if chain_id is not None:
+            # Record the mapping so future scans skip the fuzzy pass entirely
+            learn_category_mapping(distributor_category, chain_path, plugin)
+            logger.info(
+                f"Category: auto-created/used chain '{chain_path}' for "
+                f"'{distributor_category}' (created: {created_any})"
+            )
+            return (chain_id, chain_path, 100, created_any)
+
+    # 4. Default fallback
+    cat_id, cat_path, score = _get_default_category(default_category_name)
+    return (cat_id, cat_path, score, False)
+
+
+# -----------------------------------------------------------------------------
 #  Debug helper (call from a shell to tune thresholds)
 # -----------------------------------------------------------------------------
 

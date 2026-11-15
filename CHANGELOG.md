@@ -2,6 +2,16 @@
 
 All notable changes to SmartParts are documented in this file.
 
+## [1.2.3] — 2026-11-14
+
+### Added
+- **Category auto-creation** (DigiKey/distributor categories):
+  - `fuzzy_match_category` now walks the full ParentCategory chain (previously truncated at 2 levels, e.g. 'Products > Kits > Integrated Circuits (IC) Kits').
+  - New `resolve_category_with_autocreate` wrapper: learned mapping / fuzzy match first; if no match and no default category, auto-creates the category chain (find-or-create top-down, generic roots like 'Products' stripped) and records it as a learned mapping.
+  - Applies to all part-creation flows: PureScan CREATEPART/FASTADD, dashboard import, v1 import, and batch import.
+  - New plugin setting **AUTO_CREATE_CATEGORIES** (default ON) as a kill-switch.
+  - `createpart` response now includes `category_path` + `category_created`; the terminal shows the category on success.
+
 ## [1.2.2] — 2026-11-14
 
 ### Fixed

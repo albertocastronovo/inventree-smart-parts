@@ -90,6 +90,7 @@
   // CREATESTOCK pending state (v3)
   let _pendingPartId      = null;
   let _pendingPartName    = '';
+  let _pendingCategoryNote = '';    // v1.2.3: category path shown in prompts
   let _pendingLocationId  = null;
   let _pendingQty         = null;
   let _pendingBatch       = '';
@@ -314,6 +315,7 @@
   function _clearPendingCreate() {
     _pendingPartId      = null;
     _pendingPartName    = '';
+    _pendingCategoryNote = '';
     _pendingLocationId  = null;
     _pendingQty         = null;
     _pendingBatch       = '';
@@ -685,8 +687,11 @@
         return;
       }
       if (resp.success) {
+        const catNote = resp.category_path
+          ? `\n→ Category: ${resp.category_path}${resp.category_created ? ' (auto-created)' : ''}`
+          : '';
         _showResult(STATES.SUCCESS,
-          `✓ Part created: ${resp.part_name || '#' + resp.part_id}\n(no stock yet — use SYS:CREATESTOCK)`, 6000);
+          `✓ Part created: ${resp.part_name || '#' + resp.part_id}${catNote}\n(no stock yet — use SYS:CREATESTOCK)`, 6000);
       } else {
         _showResult(STATES.ERROR, `✗ ${resp.message || resp.error || 'Part creation failed'}`, 8000);
       }
@@ -822,6 +827,9 @@
           if (resp.success) {
             _pendingPartId = resp.part_id;
             _pendingPartName = resp.part_name || '';
+            _pendingCategoryNote = resp.category_path
+              ? `${resp.category_path}${resp.category_created ? ' (auto-created)' : ''}`
+              : '';
           } else if (resp.already_exists) {
             _pendingPartId = resp.part_id;
             _pendingPartName = resp.part_name || '';
@@ -842,7 +850,7 @@
       _pendingBatch = d.batch || '';
       _pendingBarcodeData = d;
       _setState(STATES.AWAITING_LOCATION,
-        _locationPrompt(`Create stock for "${_pendingPartName}"${_pendingQty ? ' (reel qty ' + _pendingQty + ')' : ''}`));
+        _locationPrompt(`Create stock for "${_pendingPartName}"${_pendingCategoryNote ? ' — ' + _pendingCategoryNote : ''}${_pendingQty ? ' (reel qty ' + _pendingQty + ')' : ''}`));
       return;
     }
 

@@ -203,19 +203,19 @@ class DigiKeyClient(BaseApiClient):
             except (ValueError, TypeError):
                 pass
 
-        # Category
+        # Category - walk the full ParentCategory chain (DigiKey nests
+        # arbitrarily deep, e.g. "Products > Kits > Integrated Circuits (IC) Kits").
         category_parts = []
         cat = raw.get("Category", {})
         if isinstance(cat, dict):
-            cat_name = cat.get("Name", "")
-            if cat_name:
-                category_parts.append(cat_name)
-            # Check for parent category
-            parent = cat.get("ParentCategory", {})
-            if isinstance(parent, dict):
-                parent_name = parent.get("Name", "")
-                if parent_name:
-                    category_parts.insert(0, parent_name)
+            current = cat
+            seen = set()  # guard against circular parent references
+            while isinstance(current, dict):
+                node_name = current.get("Name", "")
+                if node_name and node_name not in seen:
+                    category_parts.insert(0, node_name)
+                    seen.add(node_name)
+                current = current.get("ParentCategory", {})
         elif isinstance(cat, str):
             category_parts.append(cat)
 

@@ -449,7 +449,6 @@ def _process_single_row(
     from ..api_clients import MouserClient, DigiKeyClient, LCSCClient
     from ..services.data_merger import merge_part_data
     from ..services.duplicate_checker import check_duplicate
-    from ..services.category_mapper import fuzzy_match_category
     from ..services.part_creator import create_part_from_data
 
     mpn = row.get("mpn", "").strip()
@@ -541,12 +540,16 @@ def _process_single_row(
         learned_mappings = (
             plugin_instance.get_setting("LEARNED_CATEGORY_MAPPINGS") or "{}"
         )
-        cat_id, cat_path, score = fuzzy_match_category(
+        from ..services.category_mapper import resolve_category_with_autocreate
+
+        cat_id, cat_path, score, _cat_created = resolve_category_with_autocreate(
             cat_source,
             threshold,
             default_cat,
             user_synonyms_json=user_synonyms,
             learned_mappings_json=learned_mappings,
+            plugin=plugin_instance,
+            auto_create=plugin_instance.get_setting("AUTO_CREATE_CATEGORIES"),
         )
         category_id = cat_id
 

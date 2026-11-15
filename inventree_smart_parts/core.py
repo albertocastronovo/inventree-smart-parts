@@ -39,7 +39,7 @@ class SmartPartsPlugin(
         "Fetches data from Mouser, DigiKey, LCSC, element14/Farnell, and TME. "
         "Maps categories, detects duplicates, and supports batch Excel import."
     )
-    VERSION = "1.2.2"
+    VERSION = "1.2.3"
     AUTHOR = "StarkStrom Engineering"
 
     # ── Plugin Settings (Admin-configurable) ─────────────────────────
@@ -166,6 +166,16 @@ class SmartPartsPlugin(
                 "Leave empty to require manual selection."
             ),
             "default": "Uncategorized",
+        },
+        "AUTO_CREATE_CATEGORIES": {
+            "name": "Auto-Create Categories",
+            "description": (
+                "When no fuzzy match exists, auto-create the category chain from "
+                "the distributor category path (e.g. 'Kits > Integrated Circuits (IC) Kits'). "
+                "Disable to fall back to the Default Category instead."
+            ),
+            "default": True,
+            "validator": bool,
         },
         "CATEGORY_SYNONYMS": {
             "name": "Category Synonym Map (JSON)",
