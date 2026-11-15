@@ -231,6 +231,10 @@ function renderEditor(data, existing) {
   loadStockLocations();
   loadLabelTemplates();
 
+  // DigiKey click-time category: KeywordSearch responses lack the Category
+  // field, so fetch the exact category from ProductDetails in the background.
+  fetchDigiKeyCategory(data);
+
   // If LIMIT_PARAMETERS_TO_CATEGORY is active: gate parameters immediately
   // based on whatever category was auto-resolved (or show the prompt if none).
   if (window._limitParamsToCategory) {
@@ -534,4 +538,75 @@ function loadLabelTemplates() {
       console.warn('SmartParts: could not load label templates:', err);
       sel.innerHTML = '<option value="">(Could not load – check console)</option>';
     });
+}
+
+
+/* DigiKey click-time category fetch ─────────────────────────────── */
+/* DigiKey's KeywordSearch responses carry no Category field; the
+   editor calls api/search/details/ after the user clicks a best match
+   to resolve the exact category from ProductDetails. Failures are
+   silent: the editor keeps whatever search-time category it has. */
+function fetchDigiKeyCategory(data) {
+  const dk = (data.sources || {}).digikey;
+  if (!dk || dk.error) return;
+  const sku = dk.supplier_sku || dk.mpn || '';
+  if (!sku) return;
+
+  fetch('api/search/details/', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
+    body: JSON.stringify({ source: 'digikey', sku }),
+  })
+  .then(r => (r.ok ? r.json() : {}))
+  .then(resp => {
+    if (!resp || !resp.category_id || !resp.category_path) return;
+    if (!document.getElementById('categorySelect')) return;  // editor closed
+    applyDigiKeyCategory(resp);
+  })
+  .catch(() => {});
+}
+
+function applyDigiKeyCategory(resp) {
+  const catId = parseInt(resp.category_id);
+  const sel = document.getElementById('categorySelect');
+  if (!sel || !catId) return;
+
+  // If the category is unchanged, nothing to do
+  if (parseInt(sel.value) === catId) {
+    window._editorDistributorCategory = resp.distributor_category || '';
+    return;
+  }
+
+  // Ensure the option exists (auto-created categories may not be in the
+  // search-time categories list fetched before the click-time fetch)
+  let opt = sel.querySelector(`option[value="${catId}"]`);
+  if (!opt) {
+    const name = (resp.category_path || '').split(' > ').pop();
+    const o = document.createElement('option');
+    o.value = String(catId);
+    o.textContent = name;
+    sel.appendChild(o);
+    opt = o;
+  }
+  sel.value = String(catId);
+
+  // Update learning variables so on-save learning uses the DigiKey chain
+  window._editorDistributorCategory = resp.distributor_category || '';
+  window._editorSuggestedCategoryId = catId;
+
+  // Update the badge (search-time badge text, or insert if none existed)
+  const badgeHtml = `<span id="catAutoBadge" class="sp-badge sp-badge-info" style="margin-bottom:.3rem;display:inline-block">
+         Auto: ${escHtml(resp.category_path)} (${resp.category_score || 100}%)
+       </span><br>`;
+  const badge = document.getElementById('catAutoBadge');
+  if (badge) {
+    badge.outerHTML = badgeHtml;
+  } else {
+    sel.insertAdjacentHTML('beforebegin', badgeHtml);
+  }
+
+  // Re-gate parameters if backend filtering is active (category changed)
+  if (window._limitParamsToCategory) {
+    loadCategoryParameters(catId);
+  }
 }

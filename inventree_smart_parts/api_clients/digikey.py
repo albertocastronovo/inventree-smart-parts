@@ -28,6 +28,7 @@ class DigiKeyClient(BaseApiClient):
     BASE_URL = "https://api.digikey.com"
     TOKEN_URL = "https://api.digikey.com/v1/oauth2/token"
     SEARCH_URL = "https://api.digikey.com/products/v4/search/keyword"
+    DETAILS_URL = "https://api.digikey.com/products/v4/product-details/{digiKeyPartNumber}"
 
     def __init__(self, client_id: str, client_secret: str, **kwargs):
         super().__init__(**kwargs)
@@ -115,6 +116,38 @@ class DigiKeyClient(BaseApiClient):
             best = products[0]
 
         return self._parse_part(best, mpn)
+
+    def get_product_details(self, dkpn: str) -> Optional[PartData]:
+        """
+        Fetch full product details for a DigiKey part number.
+
+        Unlike KeywordSearch responses, ProductDetails responses include
+        the Category field (full ParentCategory chain) and Parameters.
+        """
+        if not self.client_id or not self.client_secret:
+            raise ApiError("DigiKey credentials are not configured")
+
+        dkpn = (dkpn or "").strip()
+        if not dkpn:
+            raise ApiError("DigiKey part number is required")
+
+        headers = self._get_auth_headers()
+
+        # DigiKey part numbers are case-insensitive with separator characters
+        # (e.g. "xc7a35t-1cpg236c" vs "XC7A35T-1CPG236C"); the API expects
+        # them URL-encoded as-is.
+        from urllib.parse import quote
+        url = self.DETAILS_URL.format(digiKeyPartNumber=quote(dkpn, safe=""))
+
+        logger.info(f"[DigiKey] Fetching product details for: {dkpn}")
+        data = self._request("GET", url, headers=headers)
+
+        product = data.get("Product")
+        if not product:
+            logger.info(f"[DigiKey] No details found for: {dkpn}")
+            return None
+
+        return self._parse_part(product, dkpn)
 
     def _find_best_match(self, products: List[Dict], mpn: str) -> Optional[Dict]:
         """Find product with closest MPN match."""
@@ -210,12 +243,12 @@ class DigiKeyClient(BaseApiClient):
         if isinstance(cat, dict):
             current = cat
             seen = set()  # guard against circular parent references
-            while isinstance(current, dict):
+            while isinstance(current, dict) and current:
                 node_name = current.get("Name", "")
                 if node_name and node_name not in seen:
                     category_parts.insert(0, node_name)
                     seen.add(node_name)
-                current = current.get("ParentCategory", {})
+                current = current.get("ParentCategory")
         elif isinstance(cat, str):
             category_parts.append(cat)
 

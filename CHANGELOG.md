@@ -2,6 +2,20 @@
 
 All notable changes to SmartParts are documented in this file.
 
+## [1.2.4] - 2026-11-16
+
+### Fixed
+- **MPN search hang (critical)**: DigiKey category parsing walked the full ParentCategory chain but an empty/absent Category produced an infinite loop (`while isinstance(current, dict)` spins on `{}`). Every MPN search hung indefinitely on "Search in progress". Fixed with `and current` termination + `current.get("ParentCategory")` (no default) so the loop ends on any non-dict.
+
+### Added
+- **DigiKey category at click time**: DigiKey's KeywordSearch responses do not carry the Category field (only ProductDetails does), so the MPN search editor now fetches it in the background after the user clicks a best match:
+  - New `get_product_details(dkpn)` in the DigiKey client (ProductDetails v4 endpoint, URL-encoded DigiKey part number).
+  - New `api/search/details/` endpoint (source + sku, generic for later expansion; DigiKey-only for now). Runs the returned category through the same learned/fuzzy/auto-create pipeline. Failure paths are silent (empty response).
+  - Editor (`editor_main.js`) fires the background fetch after render; on response it updates the category select (adding the option if the category was auto-created), the Auto badge, and the on-save learning variables. Parameters are re-gated only if the category actually changed.
+
+### Housekeeping
+- editor_main.js now has a cache-buster (`?v=10`) in dashboard.html (previously unversioned, risking stale JS).
+
 ## [1.2.3] — 2026-11-14
 
 ### Added

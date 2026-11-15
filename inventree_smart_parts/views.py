@@ -639,6 +639,84 @@ def api_search(request):
 
     return JsonResponse(response)
 
+@csrf_exempt
+def api_search_details(request):
+    """
+    AJAX endpoint: fetch full product details from a single source at
+    click time.
+
+    DigiKey's KeywordSearch responses do not carry the Category field
+    (only ProductDetails does), so the editor calls this after the user
+    clicks a best match to resolve the category for the chosen part.
+    Failure paths are silent: the editor keeps whatever search-time
+    category it already has.
+    """
+    if request.method != "POST":
+        return JsonResponse({"error": "POST required"}, status=405)
+
+    try:
+        body = json.loads(request.body)
+    except json.JSONDecodeError:
+        return JsonResponse({"error": "Invalid JSON"}, status=400)
+
+    source = (body.get("source") or "").strip().lower()
+    sku = (body.get("sku") or "").strip()
+    if not source or not sku:
+        return JsonResponse({"error": "source and sku are required"}, status=400)
+
+    plugin = _get_plugin()
+    if not plugin:
+        return JsonResponse({"error": "Plugin not loaded"}, status=500)
+
+    if source != "digikey":
+        return JsonResponse({})
+
+    if not plugin.get_setting("DIGIKEY_ENABLED"):
+        return JsonResponse({})
+
+    try:
+        from .api_clients.digikey import DigiKeyClient
+
+        client = DigiKeyClient(
+            client_id=plugin.get_setting("DIGIKEY_CLIENT_ID"),
+            client_secret=plugin.get_setting("DIGIKEY_CLIENT_SECRET"),
+        )
+        details = client.get_product_details(sku)
+    except Exception as e:
+        logger.warning(f"DigiKey details fetch failed for {sku}: {e}")
+        return JsonResponse({})
+
+    if not details:
+        return JsonResponse({})
+
+    response = {"source": "digikey"}
+
+    if details.category:
+        from .services.category_mapper import resolve_category_with_autocreate
+
+        threshold = plugin.get_setting("FUZZY_THRESHOLD") or 65
+        default_cat = plugin.get_setting("DEFAULT_CATEGORY") or ""
+        user_synonyms = plugin.get_setting("CATEGORY_SYNONYMS") or "{}"
+        learned_mappings = plugin.get_setting("LEARNED_CATEGORY_MAPPINGS") or "{}"
+        auto_create = plugin.get_setting("AUTO_CREATE_CATEGORIES")
+        cat_id, cat_path, score, cat_created = resolve_category_with_autocreate(
+            details.category,
+            threshold,
+            default_cat,
+            user_synonyms_json=user_synonyms,
+            learned_mappings_json=learned_mappings,
+            plugin=plugin,
+            auto_create=auto_create,
+        )
+        response["category_path"] = cat_path or details.category
+        response["category_id"] = cat_id
+        response["category_score"] = score
+        response["category_created"] = cat_created
+        response["distributor_category"] = details.category
+
+    return JsonResponse(response)
+
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  Part Creation

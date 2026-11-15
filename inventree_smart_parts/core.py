@@ -39,7 +39,7 @@ class SmartPartsPlugin(
         "Fetches data from Mouser, DigiKey, LCSC, element14/Farnell, and TME. "
         "Maps categories, detects duplicates, and supports batch Excel import."
     )
-    VERSION = "1.2.3"
+    VERSION = "1.2.4"
     AUTHOR = "StarkStrom Engineering"
 
     # ── Plugin Settings (Admin-configurable) ─────────────────────────
@@ -398,6 +398,7 @@ class SmartPartsPlugin(
             # Single MPN Search
             path("search/", views.search, name="search"),
             path("api/search/", views.api_search, name="api-search"),
+            path("api/search/details/", views.api_search_details, name="api-search-details"),
             # Part Creation
             path("create/", views.create_part, name="create-part"),
             # Part data fetch (for Live-Editor comparison)
