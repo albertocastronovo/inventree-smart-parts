@@ -2,6 +2,11 @@
 
 All notable changes to SmartParts are documented in this file.
 
+## [1.2.5] - 2026-11-16
+
+### Fixed
+- **Search 500 (critical)**: `resolve_category_with_autocreate` passed an undefined `user_synonyms` variable to `fuzzy_match_category` (NameError). Every search whose merged result carried a category crashed with a 500 before the hang fix was even relevant. Fixed to pass the `user_synonyms_json` parameter.
+
 ## [1.2.4] - 2026-11-16
 
 ### Fixed

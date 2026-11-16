@@ -1484,7 +1484,7 @@ def resolve_category_with_autocreate(
         distributor_category,
         threshold,
         default_category_name="",
-        user_synonyms_json=user_synonyms,
+        user_synonyms_json=user_synonyms_json,
         learned_mappings_json=learned_mappings_json,
     )
     if cat_id is not None:
