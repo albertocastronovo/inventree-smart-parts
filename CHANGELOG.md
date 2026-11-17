@@ -2,6 +2,18 @@
 
 All notable changes to SmartParts are documented in this file.
 
+## [1.2.6] - 2026-11-16
+
+### Added
+- **FASTADD burst mode**: after a FASTADD commit, the terminal stays armed for 15s. The steady-state loop becomes 2 scans per reel (`DataMatrix → free token` for new instances, `DataMatrix → STOCK_ label` for merges into an existing instance) with no action-code re-scan. Any control code, other action, or expiry cleanly disarms the burst.
+
+### Changed
+- **FASTADD free-token fallback**: in the location step, scanning a free `STOCK_XXXX` token now commits immediately with the stored `SYS:LAST` location (qty pre-filled from the DataMatrix `Q` field). `SYS:FASTADD → DataMatrix → free token` = 3 scans. If no default location is stored, the flow degrades safely (error prompt, state preserved). CREATESTOCK keeps its explicit location step.
+- **FASTADD merge shortcut**: in the location step, scanning a bound `STOCK_XXXX` token of the same part now merges directly into that instance (2-scan merge loop).
+
+### Housekeeping
+- purescan.js cache-buster `?v=9` → `?v=10`.
+
 ## [1.2.5] - 2026-11-16
 
 ### Fixed

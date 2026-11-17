@@ -64,6 +64,7 @@
 
   const RESULT_DISPLAY_MS = 4000;
   const COMBO_TIMEOUT_MS  = 3000;   // Time to wait for additional qty scans
+  const BURST_TIMEOUT_MS  = 15000;  // v1.2.6: burst window after a FASTADD commit
   const MAX_UNDO_HISTORY  = 20;
   const LOCALSTORAGE_KEY  = 'purescan_history';
   const SYS_LAST_KEY      = 'purescan_last_location';
@@ -83,6 +84,9 @@
   // Combo-timer state
   let _comboQty     = 0;
   let _comboTimer   = null;
+
+  // v1.2.6: FASTADD burst window
+  let _burstTimer   = null;
 
   // Action history / undo stack
   let _actionLog  = [];    // { ts, description, payload, actionType, undone }
@@ -241,6 +245,8 @@
     _clearPendingDelete();
     clearTimeout(_resultTimer);
     clearTimeout(_comboTimer);
+    clearTimeout(_burstTimer);
+    _burstTimer = null;
     _setState(STATES.IDLE, detail || 'Ready — Scan an Action Code');
   }
 
@@ -248,6 +254,13 @@
     _setState(state, detail);
     clearTimeout(_resultTimer);
     _resultTimer = setTimeout(() => _resetToIdle(), autoResetMs || RESULT_DISPLAY_MS);
+  }
+
+  // v1.2.6: FASTADD burst — keep the terminal armed for the next reel
+  function _startBurst(successMsg) {
+    _setState(STATES.SUCCESS, successMsg + '\n⚡ Burst: scan next DataMatrix within 15s');
+    clearTimeout(_burstTimer);
+    _burstTimer = setTimeout(() => _resetToIdle('Burst ended — scan an Action Code'), BURST_TIMEOUT_MS);
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -777,7 +790,12 @@
         ts: new Date(), description: desc, actionType: 'CREATESTOCK', undone: false,
         payload: null,
       });
-      _showResult(STATES.SUCCESS, `✓ ${desc}\nStick the label on the container`, 8000);
+      const msg = `✓ ${desc}\nStick the label on the container`;
+      if (_action === ACTIONS.FASTADD) {
+        _startBurst(msg);
+      } else {
+        _showResult(STATES.SUCCESS, msg, 8000);
+      }
       _clearPendingCreate();
     } catch (e) {
       _showResult(STATES.ERROR, `Create stock failed: ${e.message}`, 8000);
@@ -870,7 +888,12 @@
         ts: new Date(), description: desc, actionType: 'ADD', undone: false,
         payload: { stockItemId: bc.id, quantity: _pendingQty, partName: _pendingPartName, previousQty: null },
       });
-      _showResult(STATES.SUCCESS, `✅ ${desc}\nMerged into existing instance`, 8000);
+      const msg = `✅ ${desc}\nMerged into existing instance`;
+      if (_action === ACTIONS.FASTADD) {
+        _startBurst(msg);
+      } else {
+        _showResult(STATES.SUCCESS, msg, 8000);
+      }
       _clearPendingCreate();
     } catch (e) {
       _showResult(STATES.ERROR, `Merge failed: ${e.message}`, 8000);
@@ -1134,7 +1157,16 @@
 
     // ── STATE: IDLE / SUCCESS / ERROR ────────────────────────────────────
     if (_state === STATES.IDLE || _state === STATES.SUCCESS || _state === STATES.ERROR) {
+      const burstActive = _burstTimer != null && _action === ACTIONS.FASTADD;
       clearTimeout(_resultTimer);
+      clearTimeout(_burstTimer);
+      _burstTimer = null;
+
+      // v1.2.6 Burst: during the window, route scans straight into FASTADD
+      if (burstActive && _state === STATES.SUCCESS && !ctrlCode) {
+        await _execFastAddStart(raw);
+        return;
+      }
 
       if (ctrlCode) {
         _action = ctrlCode;
@@ -1381,6 +1413,40 @@
         // CREATESTOCK: location override
         _pendingLocationId = bc.id;
         _enterCreateStockQty();
+        return;
+      }
+
+      // v1.2.6 FASTADD: free token in the location step → commit with SYS:LAST
+      if (_action === ACTIONS.FASTADD && bc.type === 'free') {
+        const last = _getLastLocation();
+        if (last && last.id) {
+          _pendingLocationId = last.id;
+          await _execCreateStockCommit(bc.token);
+          return;
+        }
+        _setState(STATES.AWAITING_LOCATION,
+          '⚠ No default location stored — scan a Location label first');
+        return;
+      }
+
+      // v1.2.6 FASTADD: bound stock item in the location step → merge if same part
+      if (_action === ACTIONS.FASTADD && bc.type === 'stockitem') {
+        let bcPartId = bc.partId;
+        let bcLocId = bc.locationId;
+        if (bcPartId == null || bcLocId == null) {
+          const bi = await _fetchStockItemInfo(bc.id);
+          if (bi) {
+            bcPartId = bi.part_id;
+            bcLocId = bi.location_id;
+          }
+        }
+        if (bcPartId === _pendingPartId &&
+            (_pendingLocationId == null || bcLocId === _pendingLocationId)) {
+          await _execFastAddMerge(bc);
+          return;
+        }
+        _setState(STATES.AWAITING_LOCATION,
+          `⚠ ${bc.token || 'Token'} belongs to a different part.\n→ Scan a Location label or a FREE STOCK_XXXX token`);
         return;
       }
 
