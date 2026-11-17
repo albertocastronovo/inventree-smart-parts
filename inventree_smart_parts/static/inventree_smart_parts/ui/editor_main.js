@@ -169,6 +169,11 @@ function renderEditor(data, existing) {
         <p class="sp-section-title">Description</p>
         ${buildField('edit-name', 'Name',        m.mpn,          ex?.name,        'input')}
         ${buildField('edit-desc', 'Description', m.description, ex?.description, 'textarea')}
+        ${m.detailed_description ? `
+        <div class="sp-field">
+          <label>Detailed Description <span class="sp-ref-note">(distributor, read-only)</span></label>
+          <div style="padding:.5rem .75rem;background:#f9fafb;border:1px solid var(--sp-border);border-radius:6px;font-size:.85rem;line-height:1.4;color:var(--sp-text-muted)">${escHtml(m.detailed_description)}</div>
+        </div>` : ''}
       </div>
 
       <!-- Links -->

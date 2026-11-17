@@ -153,6 +153,22 @@ class MouserClient(BaseApiClient):
         mpn_result = raw.get("ManufacturerPartNumber", search_mpn)
         manufacturer = raw.get("Manufacturer", "")
         description = raw.get("Description", "")
+        package = ""
+
+        # v1.3.0: extended metadata. Mouser's search API carries no separate
+        # detailed description; Series / Package / Supplier Device Package
+        # arrive inside ProductAttributes — promote them to dedicated fields.
+        lead_time = raw.get("LeadTime", "")
+        series = ""
+        supplier_device_package = ""
+        for param in parameters:
+            pname = param.name.lower().strip()
+            if pname == "series" and not series:
+                series = param.value
+            elif pname == "supplier device package" and not supplier_device_package:
+                supplier_device_package = param.value
+            elif pname == "package / case" and not package:
+                package = param.value
 
         # Category from Mouser
         category = raw.get("Category", "")
@@ -199,22 +215,27 @@ class MouserClient(BaseApiClient):
         if mpn_result.lower().strip() != search_mpn.lower().strip():
             confidence = 0.8
 
+        # v1.3.0: bare MPN as part name (see digikey.py note)
         return PartData(
             mpn=mpn_result,
             manufacturer=manufacturer,
             description=description,
-            name=f"{manufacturer} {mpn_result}" if manufacturer else mpn_result,
+            name=mpn_result,
             category=category,
             supplier_name="Mouser",
             supplier_sku=mouser_pn,
             supplier_url=product_url,
             datasheet_url=datasheet_url,
             image_url=image_url,
+            package=package,
             parameters=parameters,
             price_breaks=price_breaks,
             stock_available=stock,
             minimum_order_qty=min_qty,
             order_multiple=mult,
+            lead_time=lead_time,
+            series=series,
+            supplier_device_package=supplier_device_package,
             source="mouser",
             raw_data=raw,
             confidence=confidence,

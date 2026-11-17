@@ -447,16 +447,31 @@ class TMEClient(BaseApiClient):
             f"https://www.tme.eu/en/details/{symbol_name}/" if symbol_name else ""
         )
 
+        # ── v1.3.0: extended metadata ──
+        # TME's API carries no separate detailed description and no lead
+        # time; promote Series / Supplier Device Package from the parameter
+        # list where present.
+        lead_time = ""
+        series = ""
+        supplier_device_package = ""
+        for param in parameters:
+            pname = param.name.lower().strip()
+            if pname == "series" and not series:
+                series = param.value
+            elif pname == "supplier device package" and not supplier_device_package:
+                supplier_device_package = param.value
+
         # ── Confidence ──
         confidence = 1.0
         if mpn_result.lower().strip() != mpn.lower().strip():
             confidence = 0.85
 
+        # v1.3.0: bare MPN as part name (see digikey.py note)
         return PartData(
             mpn=mpn_result,
             manufacturer=manufacturer,
             description=description,
-            name=f"{manufacturer} {mpn_result}" if manufacturer else mpn_result,
+            name=mpn_result,
             category=category,
             supplier_name="TME",
             supplier_sku=symbol_name,
@@ -469,6 +484,9 @@ class TMEClient(BaseApiClient):
             stock_available=stock,
             minimum_order_qty=min_qty,
             order_multiple=order_mult,
+            lead_time=lead_time,
+            series=series,
+            supplier_device_package=supplier_device_package,
             source="tme",
             raw_data=symbol,
             confidence=confidence,

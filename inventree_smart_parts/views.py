@@ -1433,6 +1433,11 @@ def _part_data_to_dict(pd) -> dict:
         "datasheet_url": datasheet_url,
         "image_url": pd.image_url,
         "package": pd.package,
+        # v1.3.0: extended distributor metadata (editor shows detailed desc)
+        "detailed_description": pd.detailed_description,
+        "lead_time": pd.lead_time,
+        "series": pd.series,
+        "supplier_device_package": pd.supplier_device_package,
         "parameters": [
             {"name": p.name, "value": p.value, "unit": p.unit} for p in pd.parameters
         ],

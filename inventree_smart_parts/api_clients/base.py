@@ -81,6 +81,14 @@ class PartData:
     package: str = ""  # e.g., 'SOIC-8', 'TO-220'
     parameters: List[PartParameter] = field(default_factory=list)
 
+    # ── v1.3.0: Extended distributor metadata ──
+    # Stored as Part Parameters via _create_core_parameters().
+    # Each client maps these where its API provides them; unsupported = "".
+    detailed_description: str = ""  # e.g. DigiKey Description.DetailedDescription
+    lead_time: str = ""  # e.g. '14 Weeks'
+    series: str = ""  # e.g. 'STM32WL'
+    supplier_device_package: str = ""  # e.g. '48-UFQFN Exposed Pad'
+
     # ── Pricing & Stock ──
     price_breaks: List[PriceBreak] = field(default_factory=list)
     stock_available: Optional[int] = None

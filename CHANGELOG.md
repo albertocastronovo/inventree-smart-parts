@@ -2,6 +2,26 @@
 
 All notable changes to SmartParts are documented in this file.
 
+## [1.3.0] - 2026-11-16
+
+### Fixed
+- **DigiKey descriptions lost (critical)**: DigiKey v4 nests descriptions under a `Description` object, but the client read top-level `ProductDescription`/`DetailedDescription` — so fetched parts were created with the fallback `"Manufacturer MPN"` description. Fixed by unwrapping the nested object; the brief description now lands in `Part.description` and the detailed text is preserved separately.
+
+### Added
+- **Uniform distributor metadata** (Part Parameters, always written regardless of `LIMIT_PARAMETERS_TO_CATEGORY`):
+  - `Detailed Description`, `Manufacturer Std Lead Time`, `Series`, `Package / Case`, `Supplier Device Package`.
+  - New `_create_core_parameters()` in part_creator: find-or-create global ParameterTemplates, same non-destructive update_or_create pattern; de-duplicated against the spec parameter list.
+  - DigiKey: lead time from `ManufacturerStandardLeadTime`, Series/Package/SupplierDevicePackage promoted from Parameters.
+  - Mouser: lead time from `LeadTime`, Series/Package/SupplierDevicePackage promoted from ProductAttributes.
+  - element14/TME/LCSC: promoted where their APIs provide them; unsupported fields stay empty.
+- **Editor UI**: the part editor now shows the distributor's detailed description as a read-only block under the Description field (lead time deliberately not shown).
+
+### Changed
+- **Part naming — bare MPN**: `Part.name` is now the bare MPN (`STM32WL55CCU6`) instead of `"STMicroelectronics STM32WL55CCU6"`. The manufacturer remains on the ManufacturerPart. Cross-supplier MPN is the natural key; bare naming avoids duplicate parts per distributor. Existing parts keep their names (update path never touches `part.name`).
+
+### Housekeeping
+- `editor_helpers.js` now has a cache-buster (`?v=1`) in dashboard.html (previously unversioned); `editor_main.js` bumped to `?v=11`.
+
 ## [1.2.6] - 2026-11-16
 
 ### Added

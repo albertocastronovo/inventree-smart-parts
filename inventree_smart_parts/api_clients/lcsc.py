@@ -142,6 +142,19 @@ class LCSCClient(BaseApiClient):
         description = raw.get("productDescEn", "") or raw.get("productDesc", "")
         package = raw.get("encapStandard", "") or raw.get("packageName", "")
 
+        # v1.3.0: extended metadata. LCSC's API carries no separate detailed
+        # description and no lead time; promote Series / Supplier Device
+        # Package from the parameter list where present.
+        lead_time = ""
+        series = ""
+        supplier_device_package = ""
+        for param in parameters:
+            pname = param.name.lower().strip()
+            if pname == "series" and not series:
+                series = param.value
+            elif pname == "supplier device package" and not supplier_device_package:
+                supplier_device_package = param.value
+
         # URLs
         lcsc_code = raw.get("productCode", "")
         product_url = (
@@ -172,11 +185,12 @@ class LCSCClient(BaseApiClient):
         if mpn_result.lower().strip() != search_mpn.lower().strip():
             confidence = 0.7  # LCSC unofficial API – slightly lower base confidence
 
+        # v1.3.0: bare MPN as part name (see digikey.py note)
         return PartData(
             mpn=mpn_result,
             manufacturer=manufacturer,
             description=description,
-            name=f"{manufacturer} {mpn_result}" if manufacturer else mpn_result,
+            name=mpn_result,
             category=category,
             supplier_name="LCSC",
             supplier_sku=lcsc_code,
@@ -188,6 +202,9 @@ class LCSCClient(BaseApiClient):
             price_breaks=price_breaks,
             stock_available=stock,
             minimum_order_qty=min_qty,
+            lead_time=lead_time,
+            series=series,
+            supplier_device_package=supplier_device_package,
             source="lcsc",
             raw_data=raw,
             confidence=confidence,

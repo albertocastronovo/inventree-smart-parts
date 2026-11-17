@@ -290,9 +290,33 @@ class DigiKeyClient(BaseApiClient):
         elif isinstance(manufacturer_info, str):
             manufacturer = manufacturer_info
 
-        description = raw.get("ProductDescription", "") or raw.get(
-            "DetailedDescription", ""
+        # v1.3.0: DigiKey v4 nests descriptions under a "Description" object
+        # (ProductDescription = brief, DetailedDescription = full text).
+        # Fall back to top-level keys for older/flat response shapes.
+        desc_obj = raw.get("Description", {})
+        if isinstance(desc_obj, dict):
+            description = desc_obj.get("ProductDescription", "") or desc_obj.get(
+                "DetailedDescription", ""
+            )
+            detailed_description = desc_obj.get("DetailedDescription", "")
+        else:
+            description = str(desc_obj) if desc_obj else raw.get(
+                "ProductDescription", ""
+            )
+            detailed_description = raw.get("DetailedDescription", "")
+
+        # v1.3.0: promote guaranteed core parameters from the Parameters list
+        lead_time = raw.get("ManufacturerStandardLeadTime", "") or raw.get(
+            "StandardLeadTime", ""
         )
+        series = ""
+        supplier_device_package = ""
+        for param in parameters:
+            pname = param.name.lower().strip()
+            if pname == "series" and not series:
+                series = param.value
+            elif pname == "supplier device package" and not supplier_device_package:
+                supplier_device_package = param.value
 
         # Packaging
         package = ""
@@ -342,11 +366,14 @@ class DigiKeyClient(BaseApiClient):
         if mpn_result.lower().strip() != search_mpn.lower().strip():
             confidence = 0.8
 
+        # v1.3.0: bare MPN as part name (manufacturer prefix removed —
+        # MPN is the cross-supplier natural key; duplicates come from
+        # distributor-local part numbers, not from MPN collisions).
         return PartData(
             mpn=mpn_result,
             manufacturer=manufacturer,
             description=description,
-            name=f"{manufacturer} {mpn_result}" if manufacturer else mpn_result,
+            name=mpn_result,
             category=category,
             supplier_name="DigiKey",
             supplier_sku=dk_pn,
@@ -358,6 +385,10 @@ class DigiKeyClient(BaseApiClient):
             price_breaks=price_breaks,
             stock_available=stock,
             minimum_order_qty=min_qty,
+            detailed_description=detailed_description,
+            lead_time=lead_time,
+            series=series,
+            supplier_device_package=supplier_device_package,
             source="digikey",
             raw_data=raw,
             confidence=confidence,

@@ -199,11 +199,22 @@ def create_part_from_data(
                         f"Supplier link failed ({entry.get('name', '?')}): {e}"
                     )
 
-            # ── Step 4: Add Parameters ──
-            if part_data.parameters:
+            # ── Step 4: Core parameters (v1.3.0) ──
+            _create_core_parameters(part, part_data)
+
+            # ── Step 4b: Distributor spec parameters ──
+            # De-duplicate: parameters promoted to dedicated core templates
+            # would otherwise create duplicate rows for the same template.
+            core_names = {name.lower() for name, _ in CORE_PARAMETER_TEMPLATES}
+            spec_params = [
+                p
+                for p in part_data.parameters
+                if p.name.strip().lower() not in core_names
+            ]
+            if spec_params:
                 dropped = _create_parameters(
                     part,
-                    part_data.parameters,
+                    spec_params,
                     category_id=category_id,
                 )
                 result.dropped_parameters = dropped
@@ -669,6 +680,51 @@ def _get_or_create_company(
         f"Created company: {name} (manufacturer={is_manufacturer}, supplier={is_supplier})"
     )
     return company
+
+
+# v1.3.0: guaranteed core parameter templates. Values come from dedicated
+# PartData fields (not the spec Parameters list) and are stored as Part
+# Parameters regardless of the LIMIT_PARAMETERS_TO_CATEGORY filter.
+CORE_PARAMETER_TEMPLATES = [
+    ("Detailed Description", "detailed_description"),
+    ("Manufacturer Std Lead Time", "lead_time"),
+    ("Series", "series"),
+    ("Package / Case", "package"),
+    ("Supplier Device Package", "supplier_device_package"),
+]
+
+
+def _create_core_parameters(part, data: "PartData") -> None:
+    """Store the guaranteed core distributor metadata as Part Parameters.
+
+    Uses find-or-create global ParameterTemplates and the same
+    non-destructive update_or_create pattern as _create_parameters().
+    Exempt from the LIMIT_PARAMETERS_TO_CATEGORY filter so these fields
+    are always written, even for categories without matching templates.
+    """
+    from common.models import Parameter, ParameterTemplate
+    from django.contrib.contenttypes.models import ContentType
+
+    part_type = ContentType.objects.get_for_model(part)
+
+    for template_name, attr in CORE_PARAMETER_TEMPLATES:
+        value = str(getattr(data, attr, "") or "").strip()
+        if not value or is_useless_value(value):
+            continue
+        try:
+            template, _ = ParameterTemplate.objects.get_or_create(
+                name=template_name,
+                defaults={"units": ""},
+            )
+            Parameter.objects.update_or_create(
+                model_type=part_type,
+                model_id=part.pk,
+                template=template,
+                defaults={"data": value[:2000]},
+            )
+            logger.debug(f"Core parameter {template_name}={value} for Part {part.pk}")
+        except Exception as e:
+            logger.warning(f"Failed to write core parameter {template_name}: {e}")
 
 
 def _create_parameters(

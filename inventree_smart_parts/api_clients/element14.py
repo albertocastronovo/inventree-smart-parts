@@ -368,6 +368,20 @@ class Element14Client(BaseApiClient):
         except (ValueError, TypeError):
             pass
 
+        # ── v1.3.0: extended metadata ──
+        # element14's catalogue API carries no separate detailed description
+        # and no lead time; promote Series / Supplier Device Package from the
+        # attribute list where the store provides them.
+        lead_time = ""
+        series = ""
+        supplier_device_package = ""
+        for attr in parameters:
+            aname = attr.name.lower().strip()
+            if aname == "series" and not series:
+                series = attr.value
+            elif aname == "supplier device package" and not supplier_device_package:
+                supplier_device_package = attr.value
+
         # ── Order multiple ──
         order_mult = 1
         try:
@@ -380,11 +394,12 @@ class Element14Client(BaseApiClient):
         if mpn_result.lower().strip() != search_mpn.lower().strip():
             confidence = 0.85  # element14 uses official Farnell catalogue
 
+        # v1.3.0: bare MPN as part name (see digikey.py note)
         return PartData(
             mpn=mpn_result,
             manufacturer=manufacturer,
             description=description,
-            name=f"{manufacturer} {mpn_result}" if manufacturer else mpn_result,
+            name=mpn_result,
             category=category,
             supplier_name="Farnell / element14",
             supplier_sku=sku,
@@ -397,6 +412,9 @@ class Element14Client(BaseApiClient):
             stock_available=stock,
             minimum_order_qty=min_qty,
             order_multiple=order_mult,
+            lead_time=lead_time,
+            series=series,
+            supplier_device_package=supplier_device_package,
             source="element14",
             raw_data=raw,
             confidence=confidence,

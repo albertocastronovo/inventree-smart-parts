@@ -22,6 +22,11 @@ MERGEABLE_FIELDS = [
     "datasheet_url",
     "image_url",
     "package",
+    # v1.3.0: extended distributor metadata
+    "detailed_description",
+    "lead_time",
+    "series",
+    "supplier_device_package",
 ]
 
 
