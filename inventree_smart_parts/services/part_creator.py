@@ -286,9 +286,9 @@ def _create_new_part(data: PartData, category_id: Optional[int]) -> "Part":
         except PartCategory.DoesNotExist:
             logger.warning(f"Category ID {category_id} not found")
 
-    name = data.mpn
-    if not name:
-        name = "Unknown"
+    # Explicit name (e.g. edited in the GUI editor) wins; API flows set
+    # name == mpn, so for them this is still the MPN.
+    name = (data.name or data.mpn or "").strip() or "Unknown"
 
     # Truncate name if too long
     if len(name) > 100:

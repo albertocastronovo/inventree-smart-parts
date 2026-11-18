@@ -111,9 +111,14 @@ function renderEditor(data, existing) {
   ['mouser','digikey','lcsc','element14','tme'].forEach(s => {
     const src = data.sources[s];
     if (!src) return;
-    srcBadges += src.error
-      ? `<span class="sp-badge sp-badge-error">${s}: ✗</span> `
-      : `<span class="sp-badge sp-badge-new">${s}: ✓</span> `;
+    if (src.error) {
+      srcBadges += `<span class="sp-badge sp-badge-error">${s}: ✗</span> `;
+    } else if (src.mpn_mismatch) {
+      // Different MPN = different part → not merged into this one
+      srcBadges += `<span class="sp-badge sp-badge-error" title="${escHtml(src.mpn || '')}">${s}: ≠MPN</span> `;
+    } else {
+      srcBadges += `<span class="sp-badge sp-badge-new">${s}: ✓</span> `;
+    }
   });
 
   /* ── Image preview ────────────────────────────────────────── */

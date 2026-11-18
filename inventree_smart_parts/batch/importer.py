@@ -516,10 +516,12 @@ def _process_single_row(
         return result
 
     # ── Step 3: Merge data ──
-    merged = merge_part_data(api_results, priority_order)
+    # Strict MPN identity: a distributor hit with a different MPN is a
+    # different part and must not be imported under this row.
+    merged = merge_part_data(api_results, priority_order, search_term=mpn, strict=True)
     if not merged:
         result.status = "error"
-        result.error = "Data merge produced no result"
+        result.error = f"No distributor returned exact MPN '{mpn}'"
         return result
 
     # Override with CSV data if present

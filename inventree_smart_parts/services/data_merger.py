@@ -30,17 +30,68 @@ MERGEABLE_FIELDS = [
 ]
 
 
+def _norm_mpn(value: str) -> str:
+    """Normalise an MPN for identity comparison (strip + case-fold).
+
+    Case is ignored because InvenTree's own Part uniqueness check on
+    name/IPN/revision is case-insensitive.
+    """
+    return (value or "").strip().upper()
+
+
+def resolve_identity_mpn(
+    results: List[PartData],
+    search_term: str = "",
+    strict: bool = False,
+) -> str:
+    """Decide which MPN a set of distributor results represents.
+
+    Parts are keyed by MPN: any MPN difference means a different part.
+
+      a) the search term, if any result's MPN equals it;
+      b) else the MPN of a result whose supplier SKU equals the search term
+         (a scanned/typed distributor part number, e.g. a DigiKey PN);
+      c) else — only when not ``strict`` — the first result's MPN
+         (results are expected in priority order).
+
+    Returns the normalised identity MPN, or "" if none could be established.
+    """
+    term = _norm_mpn(search_term)
+    if term:
+        for r in results:
+            if _norm_mpn(r.mpn) == term:
+                return term
+        for r in results:
+            if _norm_mpn(r.supplier_sku) == term and _norm_mpn(r.mpn):
+                return _norm_mpn(r.mpn)
+    if strict:
+        return ""
+    for r in results:
+        if _norm_mpn(r.mpn):
+            return _norm_mpn(r.mpn)
+    return ""
+
+
 def merge_part_data(
     results: List[PartData],
     priority_order: Optional[List[str]] = None,
+    search_term: str = "",
+    strict: bool = False,
 ) -> Optional[PartData]:
     """
     Merge multiple PartData results into a single unified PartData.
+
+    Only results sharing the same MPN are merged (MPN is the part identity);
+    results with any other MPN are dropped and listed in
+    ``raw_data['dropped_sources']``.
 
     Args:
         results: List of PartData from different API sources
         priority_order: List of source names in priority order
                        e.g. ['mouser', 'digikey', 'lcsc']
+        search_term: The string that was searched (MPN or distributor PN)
+        strict: Require the search term to match a result's MPN or SKU
+                exactly; otherwise return None. Use for unattended flows.
 
     Returns:
         Merged PartData or None if no results
@@ -65,6 +116,26 @@ def merge_part_data(
             return len(priority_order)
 
     sorted_results = sorted(results, key=sort_key)
+
+    # ── MPN identity: keep only results describing the same MPN ──
+    identity = resolve_identity_mpn(sorted_results, search_term, strict)
+    if not identity:
+        logger.info(
+            f"Merge: no exact MPN match for '{search_term}' "
+            f"(strict={strict}) – nothing merged"
+        )
+        return None
+
+    dropped_sources = [
+        {"source": r.source, "mpn": r.mpn}
+        for r in sorted_results
+        if _norm_mpn(r.mpn) != identity
+    ]
+    sorted_results = [r for r in sorted_results if _norm_mpn(r.mpn) == identity]
+    for d in dropped_sources:
+        logger.info(f"Merge: dropped {d['source']} – MPN '{d['mpn']}' != '{identity}'")
+    if not sorted_results:
+        return None
 
     logger.info(
         f"Merging {len(sorted_results)} results. "
@@ -94,6 +165,7 @@ def merge_part_data(
     # Collect all supplier info for later use
     merged.raw_data = {
         "merged_sources": [r.source for r in sorted_results],
+        "dropped_sources": dropped_sources,
         "supplier_data": [
             {
                 "source": r.source,

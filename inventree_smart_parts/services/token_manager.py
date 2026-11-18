@@ -164,9 +164,7 @@ def bind_token(token: str, obj) -> dict:
         if "barcode_hash" in {f.name for f in type(obj)._meta.get_fields()}:
             update_fields.append("barcode_hash")
     except Exception as e:
-        logger.warning(
-            f"bind_token: could not update barcode_hash for {t}: {e}"
-        )
+        logger.warning(f"bind_token: could not update barcode_hash for {t}: {e}")
 
     try:
         obj.save(update_fields=update_fields)

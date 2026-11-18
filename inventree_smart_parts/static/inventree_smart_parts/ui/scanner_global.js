@@ -145,7 +145,20 @@
   const ANSI_HEADER_RE = /(?:\x05\x06)?\[\)?>(?:\x1e)?(?:05|06)(?:\x1d)?/;
   const HAS_GS_RE = /\x1d|\{GS\}|\[GS\]|\u241d/;
 
+  // 1P (MPN) always wins over a generic P: DigiKey labels put P<DigiKey PN>
+  // *before* 1P<MPN>. P falls back to MPN (no 1P) or SKU (no 30P).
+  function _resolveGenericP(result, genericP) {
+    const p = (genericP || '').trim();
+    if (!p) return;
+    if (!result.mpn) {
+      result.mpn = p;
+    } else if (!result.supplierSku && p.toLowerCase() !== result.mpn.toLowerCase()) {
+      result.supplierSku = p;
+    }
+  }
+
   function _extractFields(fields, result) {
+    let genericP = '';
     for (const f of fields) {
       const t = f.trim();
       if (!t) continue;
@@ -160,11 +173,7 @@
         continue;
       }
       if (t.length > 1 && t.startsWith('P') && !t.startsWith('PO')) {
-        if (!result.mpn) {
-          result.mpn = t.slice(1).trim();
-        } else {
-          result.supplierSku = result.supplierSku || t.slice(1).trim();
-        }
+        genericP = genericP || t.slice(1).trim();
         continue;
       }
       if (t.length > 1 && t.startsWith('Q') && /^[0-9]/.test(t.slice(1))) {
@@ -182,6 +191,7 @@
         continue;
       }
     }
+    _resolveGenericP(result, genericP);
   }
 
   function _tryAnsiParse(raw, result) {

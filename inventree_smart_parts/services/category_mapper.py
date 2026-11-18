@@ -1389,10 +1389,64 @@ def learn_category_mapping(
 _GENERIC_ROOT_NAMES = {"products", "product", "categories", "category"}
 
 
+def _split_category_path(distributor_category: str) -> List[str]:
+    """Split a distributor category path into segments.
+
+    Only '>' separates levels: category names themselves may contain '/'
+    or '|' (e.g. DigiKey's "Interface - I/O Expanders"). Generic
+    distributor roots ("Products") are stripped.
+    """
+    parts = [p.strip() for p in (distributor_category or "").split(">") if p.strip()]
+    while parts and parts[0].lower() in _GENERIC_ROOT_NAMES:
+        parts.pop(0)
+    return parts
+
+
+def _category_names(cat) -> List[str]:
+    """Root→leaf list of names for a PartCategory."""
+    names: List[str] = []
+    depth = 0
+    while cat is not None and depth < 50:
+        names.insert(0, cat.name)
+        cat = cat.parent
+        depth += 1
+    return names
+
+
+def _walk_chain(segments: List[str], parent=None, create: bool = False):
+    """Find (and optionally create) ``segments`` below ``parent``.
+
+    Matching is case-insensitive by (name, parent).
+
+    Returns (leaf, leaf_path_names, created_any, missing_segments).
+    With ``create=False`` nothing is written; ``missing_segments`` lists the
+    segments that would have to be created.
+    """
+    from part.models import PartCategory
+
+    leaf = parent
+    names: List[str] = _category_names(parent) if parent is not None else []
+    created_any = False
+    for i, name in enumerate(segments):
+        obj = PartCategory.objects.filter(name__iexact=name, parent=leaf).first()
+        if obj is None:
+            if not create:
+                return (leaf, names, False, segments[i:])
+            obj = PartCategory.objects.create(name=name, parent=leaf)
+            created_any = True
+            logger.info(
+                f"create_category_chain: created category '{name}' "
+                f"(parent: {leaf.name if leaf else 'root'})"
+            )
+        leaf = obj
+        names.append(obj.name)
+    return (leaf, names, created_any, [])
+
+
 def create_category_chain(distributor_category: str) -> Tuple[Optional[int], str, bool]:
     """
     Find-or-create a chain of PartCategory objects from a distributor
-    category path string (e.g. "Products > Kits > Integrated Circuits (IC) Kits").
+    category path string (e.g. "Capacitors > Aluminum Electrolytic Capacitors").
 
     Generic distributor roots ("Products") are stripped.  Each segment is
     matched case-insensitively by (name, parent); missing segments are
@@ -1402,45 +1456,16 @@ def create_category_chain(distributor_category: str) -> Tuple[Optional[int], str
         (leaf_category_id, leaf_path, created_any)
         (None, "", False) if the category string is empty or creation failed.
     """
-    if not distributor_category:
+    segments = _split_category_path(distributor_category)
+    if not segments:
         return (None, "", False)
 
     try:
-        from part.models import PartCategory
-    except Exception as e:
-        logger.error(f"create_category_chain: cannot import PartCategory: {e}")
-        return (None, "", False)
-
-    parts_raw = [
-        p.strip() for p in re.split(r"[>/|]", distributor_category) if p.strip()
-    ]
-    # Strip generic distributor roots (e.g. "Products")
-    while parts_raw and parts_raw[0].lower() in _GENERIC_ROOT_NAMES:
-        parts_raw.pop(0)
-    if not parts_raw:
-        return (None, "", False)
-
-    parent = None
-    leaf_id = None
-    leaf_path = ""
-    created_any = False
-
-    try:
-        for name in parts_raw:
-            obj = PartCategory.objects.filter(name=name, parent=parent).first()
-            if obj is None:
-                obj = PartCategory.objects.create(name=name, parent=parent)
-                created_any = True
-                logger.info(
-                    f"create_category_chain: created category '{name}' "
-                    f"(parent: {parent.name if parent else 'root'})"
-                )
-            leaf_id = obj.pk
-            leaf_path = f"{leaf_path} > {name}" if leaf_path else name
-            parent = obj
+        leaf, names, created_any, _missing = _walk_chain(segments, create=True)
     except Exception as e:
         logger.error(
-            f"create_category_chain: failed building chain '{distributor_category}': {e}",
+            f"create_category_chain: failed building chain "
+            f"'{distributor_category}': {e}",
             exc_info=True,
         )
         return (None, "", False)
@@ -1448,7 +1473,49 @@ def create_category_chain(distributor_category: str) -> Tuple[Optional[int], str
     if created_any:
         clear_cache()
 
-    return (leaf_id, leaf_path, created_any)
+    return (leaf.pk if leaf else None, " > ".join(names), created_any)
+
+
+def plan_category_chain(
+    distributor_category: str,
+) -> Tuple[Optional[int], str, List[str]]:
+    """Read-only counterpart of :func:`create_category_chain`.
+
+    Returns:
+        (existing_leaf_id, full_path, segments_to_create)
+        ``existing_leaf_id`` is the leaf id when the whole chain already
+        exists, else None. ``segments_to_create`` lists what would be created.
+    """
+    segments = _split_category_path(distributor_category)
+    if not segments:
+        return (None, "", [])
+    leaf, names, _created, missing = _walk_chain(segments, create=False)
+    full_path = " > ".join(names + missing)
+    if missing:
+        return (None, full_path, missing)
+    return (leaf.pk if leaf else None, full_path, [])
+
+
+def ancestor_remainder(cat_id: int, distributor_category: str):
+    """If category ``cat_id`` is a strict ancestor of the distributor chain
+    (its root→leaf names are an exact case-insensitive prefix of the
+    distributor segments), return (category, remaining_segments); else None.
+    """
+    segments = _split_category_path(distributor_category)
+    try:
+        from part.models import PartCategory
+
+        cat = PartCategory.objects.filter(pk=cat_id).first()
+    except Exception:
+        return None
+    if cat is None:
+        return None
+    names = [n.lower() for n in _category_names(cat)]
+    if len(names) >= len(segments):
+        return None
+    if [s.lower() for s in segments[: len(names)]] != names:
+        return None
+    return (cat, segments[len(names) :])
 
 
 def resolve_category_with_autocreate(
@@ -1464,16 +1531,19 @@ def resolve_category_with_autocreate(
     Resolve a distributor category string to an InvenTree category,
     auto-creating a new category chain when no match exists.
 
-    Resolution order (preserves all existing behaviour):
+    Resolution order:
       1. Learned mapping hit -> return immediately.
-      2. Fuzzy match >= threshold -> return (existing behaviour unchanged).
+      2. Fuzzy match >= threshold -> return, EXCEPT when auto-create is on
+         and the match is a strict ancestor of the distributor chain
+         (e.g. "Capacitors" for "Capacitors > Aluminum Electrolytic
+         Capacitors"): then the rest of the chain is found/created under it.
       3. Auto-create enabled -> create the chain from the distributor path,
          record it as a learned mapping so future scans skip the fuzzy pass.
-      4. Fallback -> default category (current behaviour).
+      4. Fallback -> default category.
 
     Returns:
         (category_id, category_path, confidence_score, created)
-        `created` is True only when a new chain was auto-created.
+        `created` is True only when a new category was auto-created.
     """
     if not distributor_category:
         cat_id, cat_path, score = _get_default_category(default_category_name)
@@ -1488,13 +1558,32 @@ def resolve_category_with_autocreate(
         learned_mappings_json=learned_mappings_json,
     )
     if cat_id is not None:
+        # Learned mappings return score 100 and are respected as-is.
+        if auto_create and plugin is not None and score < 100:
+            ext = ancestor_remainder(cat_id, distributor_category)
+            if ext is not None:
+                parent, remaining = ext
+                try:
+                    leaf, names, created_any, _m = _walk_chain(
+                        remaining, parent=parent, create=True
+                    )
+                except Exception as e:
+                    logger.error(f"Category: extending '{cat_path}' failed: {e}")
+                    return (cat_id, cat_path, score, False)
+                if created_any:
+                    clear_cache()
+                chain_path = " > ".join(names)
+                learn_category_mapping(distributor_category, chain_path, plugin)
+                logger.info(
+                    f"Category: extended ancestor '{cat_path}' to '{chain_path}' "
+                    f"for '{distributor_category}' (created: {created_any})"
+                )
+                return (leaf.pk, chain_path, 100, created_any)
         return (cat_id, cat_path, score, False)
 
     # 3. Auto-create the chain from the distributor path
     if auto_create and plugin is not None:
-        chain_id, chain_path, created_any = create_category_chain(
-            distributor_category
-        )
+        chain_id, chain_path, created_any = create_category_chain(distributor_category)
         if chain_id is not None:
             # Record the mapping so future scans skip the fuzzy pass entirely
             learn_category_mapping(distributor_category, chain_path, plugin)
