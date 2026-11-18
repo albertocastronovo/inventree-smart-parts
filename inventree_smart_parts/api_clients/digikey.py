@@ -28,7 +28,9 @@ class DigiKeyClient(BaseApiClient):
     BASE_URL = "https://api.digikey.com"
     TOKEN_URL = "https://api.digikey.com/v1/oauth2/token"
     SEARCH_URL = "https://api.digikey.com/products/v4/search/keyword"
-    DETAILS_URL = "https://api.digikey.com/products/v4/product-details/{digiKeyPartNumber}"
+    DETAILS_URL = (
+        "https://api.digikey.com/products/v4/product-details/{digiKeyPartNumber}"
+    )
 
     def __init__(self, client_id: str, client_secret: str, **kwargs):
         super().__init__(**kwargs)
@@ -93,11 +95,11 @@ class DigiKeyClient(BaseApiClient):
 
         headers = self._get_auth_headers()
 
+        # v4 KeywordRequest uses Limit/Offset (v3 used RecordCount/...)
         payload = {
             "Keywords": mpn,
-            "RecordCount": 10,
-            "RecordStartPosition": 0,
-            "ExcludeMarketPlaceProducts": True,
+            "Limit": 10,
+            "Offset": 0,
         }
 
         logger.info(f"[DigiKey] Searching for MPN: {mpn}")
@@ -105,15 +107,18 @@ class DigiKeyClient(BaseApiClient):
             "POST", self.SEARCH_URL, headers=headers, json_data=payload
         )
 
-        products = data.get("Products", [])
-        if not products:
+        # v4 returns ExactMatches alongside Products; check exact ones first
+        candidates = list(data.get("ExactMatches") or []) + list(
+            data.get("Products") or []
+        )
+        if not candidates:
             logger.info(f"[DigiKey] No results found for MPN: {mpn}")
             return None
 
         # Find best match
-        best = self._find_best_match(products, mpn)
+        best = self._find_best_match(candidates, mpn)
         if best is None:
-            best = products[0]
+            best = candidates[0]
 
         return self._parse_part(best, mpn)
 
@@ -137,6 +142,7 @@ class DigiKeyClient(BaseApiClient):
         # (e.g. "xc7a35t-1cpg236c" vs "XC7A35T-1CPG236C"); the API expects
         # them URL-encoded as-is.
         from urllib.parse import quote
+
         url = self.DETAILS_URL.format(digiKeyPartNumber=quote(dkpn, safe=""))
 
         logger.info(f"[DigiKey] Fetching product details for: {dkpn}")
@@ -149,33 +155,135 @@ class DigiKeyClient(BaseApiClient):
 
         return self._parse_part(product, dkpn)
 
+    @staticmethod
+    def _mfr_pn(product: Dict[str, Any]) -> str:
+        """Manufacturer part number: v4 'ManufacturerProductNumber', v3 fallback."""
+        return str(
+            product.get("ManufacturerProductNumber")
+            or product.get("ManufacturerPartNumber")
+            or ""
+        ).strip()
+
+    @staticmethod
+    def _variations(product: Dict[str, Any]) -> List[Dict[str, Any]]:
+        return [
+            v for v in (product.get("ProductVariations") or []) if isinstance(v, dict)
+        ]
+
+    @classmethod
+    def _dk_pns(cls, product: Dict[str, Any]) -> set:
+        """Lower-cased set of all DigiKey part numbers of a product."""
+        pns = set()
+        for key in ("DigiKeyPartNumber", "DigiKeyProductNumber"):
+            val = str(product.get(key) or "").strip().lower()
+            if val:
+                pns.add(val)
+        for var in cls._variations(product):
+            val = str(
+                var.get("DigiKeyProductNumber") or var.get("DigiKeyPartNumber") or ""
+            ).strip()
+            if val:
+                pns.add(val.lower())
+        return pns
+
+    @classmethod
+    def _select_variation(
+        cls, product: Dict[str, Any], search_term: str
+    ) -> Optional[Dict[str, Any]]:
+        """Variation whose DigiKey PN equals the search term, else the first one."""
+        variations = cls._variations(product)
+        term = (search_term or "").strip().lower()
+        if term:
+            for var in variations:
+                pn = str(
+                    var.get("DigiKeyProductNumber")
+                    or var.get("DigiKeyPartNumber")
+                    or ""
+                ).strip()
+                if pn.lower() == term:
+                    return var
+        return variations[0] if variations else None
+
     def _find_best_match(self, products: List[Dict], mpn: str) -> Optional[Dict]:
-        """Find product with closest MPN match."""
+        """Find product with closest MPN match.
+
+        Order: exact MPN → search term is one of the product's DigiKey PNs
+        (e.g. a scanned DigiKey label) → MPN substring.
+        """
         mpn_lower = mpn.lower().strip()
 
         for product in products:
-            mfr_pn = product.get("ManufacturerPartNumber", "").lower().strip()
-            if mfr_pn == mpn_lower:
+            if self._mfr_pn(product).lower() == mpn_lower:
                 return product
 
         for product in products:
-            mfr_pn = product.get("ManufacturerPartNumber", "").lower().strip()
-            if mpn_lower in mfr_pn:
+            if mpn_lower in self._dk_pns(product):
+                return product
+
+        for product in products:
+            mfr_pn = self._mfr_pn(product).lower()
+            if mfr_pn and mpn_lower in mfr_pn:
                 return product
 
         return None
 
+    @staticmethod
+    def _category_path(cat: Any) -> List[str]:
+        """Category path root→leaf.
+
+        v4 nests root→leaf via ChildCategories; v3 nested leaf→root via
+        ParentCategory. Both shapes are supported.
+        """
+        if isinstance(cat, str):
+            return [cat] if cat.strip() else []
+        if not isinstance(cat, dict) or not cat:
+            return []
+
+        parts: List[str] = []
+        if cat.get("ChildCategories") or "ParentCategory" not in cat:
+            # v4: walk down the (single-branch) child chain
+            current = cat
+            seen_ids = set()
+            depth = 0
+            while isinstance(current, dict) and current and depth < 12:
+                cid = current.get("CategoryId")
+                if cid is not None:
+                    if cid in seen_ids:
+                        break
+                    seen_ids.add(cid)
+                name = str(current.get("Name") or "").strip()
+                if name:
+                    parts.append(name)
+                children = current.get("ChildCategories") or []
+                current = children[0] if children else None
+                depth += 1
+        else:
+            # v3: walk up the parent chain
+            current = cat
+            depth = 0
+            while isinstance(current, dict) and current and depth < 12:
+                name = str(current.get("Name") or "").strip()
+                if name:
+                    parts.insert(0, name)
+                current = current.get("ParentCategory")
+                depth += 1
+        return parts
+
     def _parse_part(self, raw: Dict[str, Any], search_mpn: str) -> PartData:
         """Convert DigiKey product data to PartData."""
+        variation = self._select_variation(raw, search_mpn)
+
         # Price breaks — handle both v3 (StandardPricing at root) and
-        # v4 (StandardPricing nested inside ProductVariations).
+        # v4 (StandardPricing nested inside ProductVariations; taken from the
+        # selected variation so SKU and pricing match).
         price_breaks = []
         pricing_list = raw.get("StandardPricing", [])
 
-        # Fallback: v4 nests pricing inside ProductVariations
+        if not pricing_list and variation:
+            pricing_list = variation.get("StandardPricing") or []
         if not pricing_list:
-            for variation in raw.get("ProductVariations", []):
-                pricing_list = variation.get("StandardPricing", [])
+            for var in self._variations(raw):
+                pricing_list = var.get("StandardPricing") or []
                 if pricing_list:
                     break
 
@@ -236,22 +344,8 @@ class DigiKeyClient(BaseApiClient):
             except (ValueError, TypeError):
                 pass
 
-        # Category - walk the full ParentCategory chain (DigiKey nests
-        # arbitrarily deep, e.g. "Products > Kits > Integrated Circuits (IC) Kits").
-        category_parts = []
-        cat = raw.get("Category", {})
-        if isinstance(cat, dict):
-            current = cat
-            seen = set()  # guard against circular parent references
-            while isinstance(current, dict) and current:
-                node_name = current.get("Name", "")
-                if node_name and node_name not in seen:
-                    category_parts.insert(0, node_name)
-                    seen.add(node_name)
-                current = current.get("ParentCategory")
-        elif isinstance(cat, str):
-            category_parts.append(cat)
-
+        # Category — full root→leaf path (v4 ChildCategories, v3 ParentCategory)
+        category_parts = self._category_path(raw.get("Category", {}))
         category = " > ".join(category_parts) if category_parts else ""
 
         # Datasheet — DigiKey v4 field name changed across API versions;
@@ -277,12 +371,14 @@ class DigiKeyClient(BaseApiClient):
             datasheet_url = f"https://www.digikey.com{datasheet_url}"
 
         # Image
-        image_url = ""
-        primary_photo = raw.get("PrimaryPhoto", "")
-        if primary_photo:
-            image_url = primary_photo
+        # Image — v4 'PhotoUrl', v3 'PrimaryPhoto'
+        image_url = str(raw.get("PhotoUrl") or raw.get("PrimaryPhoto") or "")
+        if image_url.startswith("//"):
+            image_url = f"https:{image_url}"
 
-        mpn_result = raw.get("ManufacturerPartNumber", search_mpn)
+        # MPN — v4 'ManufacturerProductNumber' (v3 'ManufacturerPartNumber').
+        # Only fall back to the search term if DigiKey returned neither.
+        mpn_result = self._mfr_pn(raw) or (search_mpn or "").strip()
         manufacturer_info = raw.get("Manufacturer", {})
         manufacturer = ""
         if isinstance(manufacturer_info, dict):
@@ -300,16 +396,33 @@ class DigiKeyClient(BaseApiClient):
             )
             detailed_description = desc_obj.get("DetailedDescription", "")
         else:
-            description = str(desc_obj) if desc_obj else raw.get(
-                "ProductDescription", ""
+            description = (
+                str(desc_obj) if desc_obj else raw.get("ProductDescription", "")
             )
             detailed_description = raw.get("DetailedDescription", "")
 
-        # v1.3.0: promote guaranteed core parameters from the Parameters list
-        lead_time = raw.get("ManufacturerStandardLeadTime", "") or raw.get(
-            "StandardLeadTime", ""
-        )
+        # Lead time — v4 'ManufacturerLeadWeeks' (string of weeks), v3 fallbacks
+        lead_time = ""
+        lead_weeks = str(raw.get("ManufacturerLeadWeeks") or "").strip()
+        if lead_weeks:
+            lead_time = f"{lead_weeks} Weeks" if lead_weeks.isdigit() else lead_weeks
+        if not lead_time:
+            lead_time = str(
+                raw.get("ManufacturerStandardLeadTime")
+                or raw.get("StandardLeadTime")
+                or ""
+            )
+
+        # Series — v4 top-level {"Id", "Name"}; fall back to the Parameters list
         series = ""
+        series_obj = raw.get("Series")
+        if isinstance(series_obj, dict):
+            series = str(series_obj.get("Name") or "").strip()
+        elif isinstance(series_obj, str):
+            series = series_obj.strip()
+
+        # Package / Case and Supplier Device Package from the Parameters list
+        package = ""
         supplier_device_package = ""
         for param in parameters:
             pname = param.name.lower().strip()
@@ -317,33 +430,24 @@ class DigiKeyClient(BaseApiClient):
                 series = param.value
             elif pname == "supplier device package" and not supplier_device_package:
                 supplier_device_package = param.value
+            elif pname == "package / case" and not package:
+                package = param.value
 
-        # Packaging
-        package = ""
-        packaging_info = raw.get("Packaging", {})
-        if isinstance(packaging_info, dict):
-            package = packaging_info.get("Name", "")
-
-        # DigiKey part number as SKU — fallback chain for edge-case MPNs
-        # where the primary field is empty.
-        dk_pn = raw.get("DigiKeyPartNumber", "").strip()
-
-        # Fallback 1: Check ExactDigiKeyPartNumber (v4 alternate field)
+        # DigiKey part number as SKU — prefer the variation matching the
+        # search term (a scanned/typed DigiKey PN), then legacy fields.
+        dk_pn = ""
+        if variation:
+            dk_pn = str(
+                variation.get("DigiKeyProductNumber")
+                or variation.get("DigiKeyPartNumber")
+                or ""
+            ).strip()
         if not dk_pn:
-            dk_pn = raw.get("ExactDigiKeyPartNumber", "").strip()
-
-        # Fallback 2: Packaging/ordering variations may carry a part number
+            dk_pn = str(raw.get("DigiKeyPartNumber") or "").strip()
         if not dk_pn:
-            for variation in raw.get("ProductVariations", []):
-                pn = (
-                    variation.get("DigiKeyProductNumber", "")
-                    or variation.get("DigiKeyPartNumber", "")
-                ).strip()
-                if pn:
-                    dk_pn = pn
-                    break
+            dk_pn = str(raw.get("ExactDigiKeyPartNumber") or "").strip()
 
-        # Fallback 3: Synthesise from MPN (last resort — data confirmed by API)
+        # Last resort: synthesise from MPN (data confirmed by API)
         if not dk_pn and mpn_result:
             dk_pn = mpn_result
 
@@ -352,9 +456,11 @@ class DigiKeyClient(BaseApiClient):
         if product_url and not product_url.startswith("http"):
             product_url = f"https://www.digikey.com{product_url}"
 
-        # Min order
+        # Min order — v4 lives in ProductVariations, v3 at top level
         min_qty = 1
-        min_val = raw.get("MinimumOrderQuantity", None)
+        min_val = (variation or {}).get("MinimumOrderQuantity") or raw.get(
+            "MinimumOrderQuantity", None
+        )
         if min_val:
             try:
                 min_qty = int(min_val)
@@ -363,7 +469,7 @@ class DigiKeyClient(BaseApiClient):
 
         # Confidence
         confidence = 1.0
-        if mpn_result.lower().strip() != search_mpn.lower().strip():
+        if mpn_result.lower().strip() != (search_mpn or "").lower().strip():
             confidence = 0.8
 
         # v1.3.0: bare MPN as part name (manufacturer prefix removed —

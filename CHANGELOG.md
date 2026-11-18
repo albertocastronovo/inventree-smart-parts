@@ -2,6 +2,28 @@
 
 All notable changes to SmartParts are documented in this file.
 
+## [1.4.0] - 2026-11-18
+
+### Fixed
+- **Parts named with the DigiKey part number (critical)**: PureScan CREATEPART/FASTADD and the dashboard editor created parts whose `Part.name` and `ManufacturerPart.MPN` were the DigiKey PN (e.g. `296-1234-1-ND`). Two causes:
+  - The DigiKey client read the v3 field `ManufacturerPartNumber`; v4 calls it `ManufacturerProductNumber`, so the MPN fell back to the search string. Best-match selection read the same key and never matched.
+  - All barcode parsers (`barcode_decoder.py`, `scanner.js`, `scanner_global.js`) let a generic `P` field claim the MPN slot. DigiKey labels put `P<DigiKey PN>` before `1P<MPN>`, so the DigiKey PN was searched. `1P` now always wins; `P` falls back to MPN (no 1P) or SKU (no 30P).
+- **DigiKey v4 fields**: image from `PhotoUrl`, full category path from `Category.ChildCategories` (v4 nests root→leaf; previously only the root was seen), Series from top-level `Series.Name`, lead time from `ManufacturerLeadWeeks`, MOQ/SKU/pricing from the `ProductVariations` entry matching the searched DigiKey PN, `Package / Case` from Parameters (no longer from packaging). Keyword search uses v4 `Limit`/`Offset` and prefers `ExactMatches`.
+- **Category chains**: auto-created chains split only on `>` (names like `Interface - I/O Expanders` are no longer split on `/`); segment lookup is case-insensitive. When a fuzzy match is an exact ancestor of the distributor chain, the rest of the chain is found/created beneath it instead of stopping at the broad parent.
+- **Editor Name field** is now honoured (it was ignored; the MPN field was always used).
+
+### Changed
+- **MPN is the part identity**: only distributor results with the same MPN (case-insensitive) are merged; others are dropped and flagged `≠MPN` in the editor. PureScan CREATEPART, batch import and API v1 import are strict (no exact MPN/SKU hit → nothing created). Duplicate detection is exact MPN only — the suffix-stripping fuzzy match was removed, so a slightly different MPN creates a new part.
+
+### Added
+- Maintenance scripts (dry-run by default, run from the InvenTree Django shell):
+  - `inventree_smart_parts.maintenance.rename_digikey_parts.run()` — renames parts created with a DigiKey PN and fixes their ManufacturerPart MPN; conflicts are reported, never merged.
+  - `inventree_smart_parts.maintenance.recategorize_digikey_parts.run()` — moves auto-placed DigiKey parts into their full DigiKey category chain.
+- Offline unit tests (`tests/`, stdlib `unittest`).
+
+### Housekeeping
+- Cache-busters: `scanner.js?v=6`, `editor_main.js?v=12`. `scanner_global.js` is unversioned — hard-refresh browsers once.
+
 ## [1.3.0] - 2026-11-16
 
 ### Fixed

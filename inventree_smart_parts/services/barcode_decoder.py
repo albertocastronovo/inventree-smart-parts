@@ -64,7 +64,7 @@ DI_TABLE = [
     ("RV", None, False),
     ("K", "poNumber", False),
     ("Q", "quantity", False),
-    ("P", "mpn", False),
+    ("P", "genericP", False),  # resolved after parsing; 1P always wins
     ("V", None, False),
     ("S", None, False),
 ]
@@ -91,8 +91,26 @@ class BarcodeData:
         return asdict(self)
 
 
+def _resolve_generic_p(result: BarcodeData, generic_p: str):
+    """Apply the generic 'P' value after all fields were read.
+
+    '1P' (manufacturer PN) always wins over a plain 'P'. DigiKey labels encode
+    'P<DigiKey PN / customer PN>' *before* '1P<MPN>', so P must never claim
+    the MPN slot when a 1P exists. P falls back to MPN when no 1P is present,
+    otherwise to the supplier SKU when no 30P is present.
+    """
+    generic_p = (generic_p or "").strip()
+    if not generic_p:
+        return
+    if not result.mpn:
+        result.mpn = generic_p
+    elif not result.supplier_sku and generic_p.lower() != result.mpn.lower():
+        result.supplier_sku = generic_p
+
+
 def _extract_fields(fields: List[str], result: BarcodeData):
     """Populate BarcodeData according to ANSI MH10.8.2 DI assignments."""
+    generic_p = ""
     for f in fields:
         t = f.strip()
         if not t:
@@ -113,13 +131,10 @@ def _extract_fields(fields: List[str], result: BarcodeData):
                 result.supplier_sku = t[3:].strip()
             continue
 
-        # P -> Generic MPN / SKU
+        # P -> Generic part number (resolved after the loop; 1P wins)
         if len(t) > 1 and t.startswith("P") and not t.startswith("PO"):
-            val = t[1:].strip()
-            if not result.mpn:
-                result.mpn = val
-            elif not result.supplier_sku:
-                result.supplier_sku = val
+            if not generic_p:
+                generic_p = t[1:].strip()
             continue
 
         # Q -> Quantity
@@ -143,6 +158,8 @@ def _extract_fields(fields: List[str], result: BarcodeData):
             if not result.po_number:
                 result.po_number = t[1:].strip()
             continue
+
+    _resolve_generic_p(result, generic_p)
 
 
 def _try_ansi_parse(raw: str, result: BarcodeData) -> bool:
@@ -260,6 +277,7 @@ def _try_heuristic_parse(raw: str, result: BarcodeData) -> bool:
         result.supplier_sku = fields["supplierSku"]
     if "poNumber" in fields:
         result.po_number = fields["poNumber"]
+    _resolve_generic_p(result, fields.get("genericP", ""))
 
     found = bool(result.mpn or result.quantity is not None or result.batch)
     if found and match_count >= 2:

@@ -70,7 +70,23 @@
    * Given an array of already-split field strings (data identifiers + values),
    * populate a result object according to ANSI MH10.8.2 DI assignments.
    */
+  /**
+   * Apply a generic 'P' value after all fields were read. '1P' (MPN) always
+   * wins: DigiKey labels put P<DigiKey PN> *before* 1P<MPN>. P falls back to
+   * the MPN when no 1P exists, otherwise to the SKU when no 30P exists.
+   */
+  function _resolveGenericP(result, genericP) {
+    const p = (genericP || '').trim();
+    if (!p) return;
+    if (!result.mpn) {
+      result.mpn = p;
+    } else if (!result.supplierSku && p.toLowerCase() !== result.mpn.toLowerCase()) {
+      result.supplierSku = p;
+    }
+  }
+
   function _extractFields(fields, result) {
+    let genericP = '';
     for (const f of fields) {
       const t = f.trim();
       if (!t) continue;
@@ -89,12 +105,9 @@
         continue;
       }
       // P → Generic supplier / customer part number
+      // (resolved after the loop — 1P always wins over P)
       if (t.length > 1 && t.startsWith('P') && !t.startsWith('PO')) {
-        if (!result.mpn) {
-          result.mpn = t.slice(1).trim();
-        } else {
-          result.supplierSku = result.supplierSku || t.slice(1).trim();
-        }
+        genericP = genericP || t.slice(1).trim();
         continue;
       }
       // Q → Quantity  (digit must immediately follow)
@@ -115,6 +128,7 @@
         continue;
       }
     }
+    _resolveGenericP(result, genericP);
   }
 
 
@@ -189,7 +203,7 @@
     ['RV',  null,          false],
     ['K',   'poNumber',    false],
     ['Q',   'quantity',    false],
-    ['P',   'mpn',         false],
+    ['P',   'genericP',    false],  // resolved after parsing; 1P always wins
     ['V',   null,          false],
     ['S',   null,          false],
   ];
@@ -303,6 +317,7 @@
     if (fields.batch)       result.batch       = fields.batch;
     if (fields.supplierSku) result.supplierSku = fields.supplierSku;
     if (fields.poNumber)    result.poNumber    = fields.poNumber;
+    _resolveGenericP(result, fields.genericP);
 
     const found = !!(result.mpn || result.quantity !== null || result.batch);
     if (found && matchCount >= 2) {

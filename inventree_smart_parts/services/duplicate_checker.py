@@ -29,10 +29,10 @@ def check_duplicate(mpn: str, manufacturer: str = "") -> DuplicateResult:
     """
     Check if a part with the given MPN already exists in InvenTree.
 
-    Checks in order:
-    1. Exact MPN match in ManufacturerPart table
-    2. Case-insensitive MPN match
-    3. Partial MPN match (for variants like -ND, -TR suffixes)
+    Parts are keyed by MPN: only an exact (case-insensitive, whitespace-
+    stripped) MPN match counts as a duplicate. A slightly different MPN
+    (e.g. a -TR or #PBF variant) is a different part. A match from the
+    given manufacturer is preferred when several parts share the MPN.
 
     Args:
         mpn: Manufacturer Part Number to check
@@ -49,64 +49,29 @@ def check_duplicate(mpn: str, manufacturer: str = "") -> DuplicateResult:
 
         mpn_clean = mpn.strip()
 
-        # 1. Exact MPN match
-        exact_matches = ManufacturerPart.objects.filter(MPN=mpn_clean)
+        matches = ManufacturerPart.objects.filter(MPN__iexact=mpn_clean)
         if manufacturer:
-            exact_matches_mfr = exact_matches.filter(
+            matches_mfr = matches.filter(
                 manufacturer__name__iexact=manufacturer.strip()
             )
-            if exact_matches_mfr.exists():
-                exact_matches = exact_matches_mfr
+            if matches_mfr.exists():
+                matches = matches_mfr
 
-        if exact_matches.exists():
-            match = exact_matches.first()
-            return DuplicateResult(
-                is_duplicate=True,
-                existing_part_id=match.part.pk,
-                existing_part_name=match.part.name,
-                existing_mpn=match.MPN,
-                existing_manufacturer=(
-                    str(match.manufacturer) if match.manufacturer else ""
-                ),
-                match_type="exact_mpn",
-                confidence=1.0,
-            )
+        match = matches.select_related("part", "manufacturer").first()
+        if match is None or match.part is None:
+            return DuplicateResult()
 
-        # 2. Case-insensitive MPN match
-        ci_matches = ManufacturerPart.objects.filter(MPN__iexact=mpn_clean)
-        if ci_matches.exists():
-            match = ci_matches.first()
-            return DuplicateResult(
-                is_duplicate=True,
-                existing_part_id=match.part.pk,
-                existing_part_name=match.part.name,
-                existing_mpn=match.MPN,
-                existing_manufacturer=(
-                    str(match.manufacturer) if match.manufacturer else ""
-                ),
-                match_type="exact_mpn",
-                confidence=0.95,
-            )
-
-        # 3. Partial match (strip common suffixes)
-        base_mpn = _strip_suffixes(mpn_clean)
-        if base_mpn != mpn_clean:
-            partial = ManufacturerPart.objects.filter(MPN__icontains=base_mpn)
-            if partial.exists():
-                match = partial.first()
-                return DuplicateResult(
-                    is_duplicate=True,
-                    existing_part_id=match.part.pk,
-                    existing_part_name=match.part.name,
-                    existing_mpn=match.MPN,
-                    existing_manufacturer=(
-                        str(match.manufacturer) if match.manufacturer else ""
-                    ),
-                    match_type="fuzzy_mpn",
-                    confidence=0.7,
-                )
-
-        return DuplicateResult()
+        return DuplicateResult(
+            is_duplicate=True,
+            existing_part_id=match.part.pk,
+            existing_part_name=match.part.name,
+            existing_mpn=match.MPN,
+            existing_manufacturer=(
+                str(match.manufacturer) if match.manufacturer else ""
+            ),
+            match_type="exact_mpn",
+            confidence=1.0 if match.MPN == mpn_clean else 0.95,
+        )
 
     except ImportError:
         logger.error("Could not import InvenTree models – running outside InvenTree?")
@@ -126,26 +91,3 @@ def check_duplicates_batch(mpn_list: List[str]) -> Dict[str, DuplicateResult]:
     for mpn in mpn_list:
         results[mpn] = check_duplicate(mpn)
     return results
-
-
-def _strip_suffixes(mpn: str) -> str:
-    """Strip common ordering suffixes from MPNs."""
-    suffixes = [
-        "-ND",
-        "-TR",
-        "-CT",
-        "-1",
-        "-2",
-        "-3",
-        "/NOPB",
-        "-REEL",
-        "-TUBE",
-        "-BULK",
-        "#PBF",
-        "-PBF",
-    ]
-    result = mpn.upper()
-    for suffix in suffixes:
-        if result.endswith(suffix):
-            result = result[: -len(suffix)]
-    return result

@@ -512,10 +512,17 @@ def api_search(request):
         plugin.get_setting("API_PRIORITY") or "mouser,digikey,element14,tme,lcsc"
     )
     priority_order = [p.strip() for p in priority_str.split(",") if p.strip()]
-    merged = merge_part_data(api_results, priority_order)
+    # GUI: not strict (the user reviews the result), but only same-MPN
+    # results are merged; mismatching sources are flagged for the editor.
+    merged = merge_part_data(api_results, priority_order, search_term=mpn)
+    if merged:
+        for d in merged.raw_data.get("dropped_sources", []):
+            src = results.get(d["source"])
+            if isinstance(src, dict):
+                src["mpn_mismatch"] = True
 
     logger.debug(
-        f"Search '{mpn}': {len(api_results)} API result(s), "
+        f"Search '{mpn}':{len(api_results)} API result(s), "
         f"merged {len(merged.raw_data.get('supplier_data', [])) if merged else 0} supplier(s)"
     )
 
@@ -639,6 +646,7 @@ def api_search(request):
 
     return JsonResponse(response)
 
+
 @csrf_exempt
 def api_search_details(request):
     """
@@ -715,7 +723,6 @@ def api_search_details(request):
         response["distributor_category"] = details.category
 
     return JsonResponse(response)
-
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1928,12 +1935,16 @@ def _lookup_part_by_mpn_sku(mpn: str, sku: str):
         )
         if part:
             return part
-        sup = SupplierPart.objects.filter(SKU__iexact=mpn).select_related("part").first()
+        sup = (
+            SupplierPart.objects.filter(SKU__iexact=mpn).select_related("part").first()
+        )
         if sup and sup.part:
             return sup.part
 
     if sku:
-        sup = SupplierPart.objects.filter(SKU__iexact=sku).select_related("part").first()
+        sup = (
+            SupplierPart.objects.filter(SKU__iexact=sku).select_related("part").first()
+        )
         if sup and sup.part:
             return sup.part
 
@@ -1987,9 +1998,7 @@ def purescan_token(request):
                 pass
             resp["location_id"] = obj.location.pk if obj.location else None
             try:
-                resp["location"] = (
-                    str(obj.location) if obj.location else "No location"
-                )
+                resp["location"] = str(obj.location) if obj.location else "No location"
             except Exception:
                 pass
         return JsonResponse(resp)
@@ -2065,7 +2074,9 @@ def purescan_createpart(request):
     if not plugin:
         return JsonResponse({"error": "Plugin not loaded"}, status=500)
 
-    _log_activity("INFO", f"[PureScan] CREATEPART: searching distributors for MPN {mpn}")
+    _log_activity(
+        "INFO", f"[PureScan] CREATEPART: searching distributors for MPN {mpn}"
+    )
 
     api_results, _results_dict = _run_all_api_searches(plugin, mpn)
     if not api_results:
@@ -2088,15 +2099,20 @@ def purescan_createpart(request):
         plugin.get_setting("API_PRIORITY") or "mouser,digikey,element14,tme,lcsc"
     )
     priority_order = [p.strip() for p in priority_str.split(",") if p.strip()]
-    merged = merge_part_data(api_results, priority_order)
+    # Strict MPN identity: only distributor hits whose MPN (or SKU) exactly
+    # matches the label are used — a different MPN is a different part.
+    merged = merge_part_data(api_results, priority_order, search_term=mpn, strict=True)
     if not merged:
         return JsonResponse(
             {
                 "success": False,
                 "already_exists": False,
-                "message": "Could not merge distributor data",
-            },
-            status=500,
+                "mpn": mpn,
+                "message": (
+                    f"No distributor returned exact MPN '{mpn}' — "
+                    "create it manually via the dashboard"
+                ),
+            }
         )
 
     dup = check_duplicate(merged.mpn, merged.manufacturer)
@@ -2217,9 +2233,7 @@ def purescan_createstock(request):
     from .services.token_manager import bind_token, resolve_token
 
     if not token_manager.is_valid_token(new_token):
-        return JsonResponse(
-            {"error": "new_token must match STOCK_XXXX"}, status=400
-        )
+        return JsonResponse({"error": "new_token must match STOCK_XXXX"}, status=400)
 
     kind, bound = resolve_token(new_token)
     if bound is not None and kind is not None:
@@ -2255,9 +2269,7 @@ def purescan_createstock(request):
             if not bind_result.get("success"):
                 raise RuntimeError(bind_result.get("error") or "token binding failed")
     except Exception as e:
-        return JsonResponse(
-            {"error": f"Stock creation aborted: {e}"}, status=500
-        )
+        return JsonResponse({"error": f"Stock creation aborted: {e}"}, status=500)
 
     return JsonResponse(
         {
@@ -2396,13 +2408,9 @@ def purescan_deletestock(request):
     try:
         obj.delete()
     except Exception as e:
-        return JsonResponse(
-            {"error": f"Stock item deletion failed: {e}"}, status=500
-        )
+        return JsonResponse({"error": f"Stock item deletion failed: {e}"}, status=500)
 
-    label_note = (
-        f"token {token} is free again" if token != "-" else "label freed"
-    )
+    label_note = f"token {token} is free again" if token != "-" else "label freed"
     _log_activity(
         "INFO",
         f"[PureScan] DELETESTOCK: deleted stock item '{info}' ({label_note})",
@@ -2410,9 +2418,7 @@ def purescan_deletestock(request):
     return JsonResponse(
         {
             "success": True,
-            "message": (
-                f"Stock item '{info}' deleted — {label_note}"
-            ),
+            "message": (f"Stock item '{info}' deleted — {label_note}"),
         }
     )
 
@@ -2520,7 +2526,7 @@ def api_v1_import(request):
         plugin.get_setting("API_PRIORITY") or "mouser,digikey,element14,tme,lcsc"
     )
     priority_order = [p.strip() for p in priority_str.split(",") if p.strip()]
-    merged = merge_part_data(api_results, priority_order)
+    merged = merge_part_data(api_results, priority_order, search_term=mpn, strict=True)
 
     # Category mapping ------------------------------------------------------
     category_match = None
