@@ -477,8 +477,9 @@ def _process_single_row(
 
     # ── Step 2: Search APIs ──
     api_results = []
-    priority_str = plugin_instance.get_setting("API_PRIORITY") or "mouser,digikey,lcsc"
-    priority_order = [p.strip() for p in priority_str.split(",") if p.strip()]
+    from ..services.data_merger import get_priority_order
+
+    priority_order = get_priority_order(plugin_instance)
 
     if plugin_instance.get_setting("MOUSER_ENABLED"):
         try:
@@ -525,33 +526,30 @@ def _process_single_row(
         return result
 
     # Override with CSV data if present
+    # (CSV values count as manual input: drop their distributor provenance)
+    field_sources = merged.raw_data.setdefault("field_sources", {})
     if row.get("manufacturer"):
         merged.manufacturer = row["manufacturer"]
+        field_sources.pop("manufacturer", None)
     if row.get("description"):
         merged.description = row["description"]
+        field_sources.pop("description", None)
 
     # ── Step 4: Map category ──
     category_id = None
     cat_from_row = row.get("category", "")
     cat_source = cat_from_row or merged.category
+    if cat_from_row:
+        field_sources.pop("category", None)
 
     if cat_source:
-        threshold = plugin_instance.get_setting("FUZZY_THRESHOLD") or 65
-        default_cat = plugin_instance.get_setting("DEFAULT_CATEGORY") or ""
-        user_synonyms = plugin_instance.get_setting("CATEGORY_SYNONYMS") or "{}"
-        learned_mappings = (
-            plugin_instance.get_setting("LEARNED_CATEGORY_MAPPINGS") or "{}"
-        )
-        from ..services.category_mapper import resolve_category_with_autocreate
+        from ..services.category_mapper import resolve_category_for_source
 
-        cat_id, cat_path, score, _cat_created = resolve_category_with_autocreate(
+        cat_id, cat_path, score, _cat_created = resolve_category_for_source(
             cat_source,
-            threshold,
-            default_cat,
-            user_synonyms_json=user_synonyms,
-            learned_mappings_json=learned_mappings,
-            plugin=plugin_instance,
-            auto_create=plugin_instance.get_setting("AUTO_CREATE_CATEGORIES"),
+            plugin_instance,
+            source="" if cat_from_row else field_sources.get("category", ""),
+            default_threshold=65,
         )
         category_id = cat_id
 

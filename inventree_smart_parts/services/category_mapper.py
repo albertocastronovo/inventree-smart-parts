@@ -1598,6 +1598,43 @@ def resolve_category_with_autocreate(
     return (cat_id, cat_path, score, False)
 
 
+# Distributors whose API returns only a flat leaf category (no path). Their
+# categories are fuzzy-matched into the existing tree or fall back to the
+# default category — never auto-created as new root categories.
+FLAT_CATEGORY_SOURCES = frozenset({"mouser"})
+
+
+def resolve_category_for_source(
+    distributor_category: str, plugin, source: str = "", default_threshold: int = 45
+) -> Tuple[Optional[int], str, int, bool]:
+    """resolve_category_with_autocreate() driven by the plugin settings.
+
+    ``source`` is the distributor that supplied the category string; flat
+    leaf categories (Mouser) never auto-create.
+    """
+
+    def _get(key, default=None):
+        try:
+            val = plugin.get_setting(key) if plugin is not None else None
+        except Exception:
+            val = None
+        return default if val in (None, "") else val
+
+    auto_create = bool(_get("AUTO_CREATE_CATEGORIES", True))
+    if (source or "").lower() in FLAT_CATEGORY_SOURCES:
+        auto_create = False
+
+    return resolve_category_with_autocreate(
+        distributor_category,
+        _get("FUZZY_THRESHOLD", default_threshold),
+        _get("DEFAULT_CATEGORY", ""),
+        user_synonyms_json=_get("CATEGORY_SYNONYMS", "{}"),
+        learned_mappings_json=_get("LEARNED_CATEGORY_MAPPINGS", "{}"),
+        plugin=plugin,
+        auto_create=auto_create,
+    )
+
+
 # -----------------------------------------------------------------------------
 #  Debug helper (call from a shell to tune thresholds)
 # -----------------------------------------------------------------------------

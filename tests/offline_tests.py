@@ -256,5 +256,236 @@ class CategoryPathTests(unittest.TestCase):
         )
 
 
+MOUSER_LABEL_LITERAL = (
+    "[)>{RS}06{GS}K606-45799789{GS}14K002{GS}1PGRM32EC72A106ME05K{GS}Q50"
+    "{GS}11K087041143{GS}4LJP{GS}1VMurata{RS}<EOT>"
+)
+MOUSER_LABEL = (
+    MOUSER_LABEL_LITERAL.replace("{GS}", GS).replace("{RS}", RS).replace("<EOT>", EOT)
+)
+
+
+class MouserBarcodeTests(unittest.TestCase):
+    def check(self, raw):
+        r = parse_barcode(raw)
+        self.assertEqual(r.mpn, "GRM32EC72A106ME05K")
+        self.assertEqual(r.quantity, 50)
+        self.assertEqual(r.po_number, "606-45799789")
+        self.assertEqual(r.manufacturer, "Murata")
+        self.assertEqual(r.distributor, "mouser")
+        self.assertEqual(r.supplier_sku, "")
+
+    def test_mouser_label_control_chars(self):
+        self.check(MOUSER_LABEL)
+
+    def test_mouser_label_literal_substitutes(self):
+        self.check(MOUSER_LABEL_LITERAL)
+
+    def test_digikey_label_detected(self):
+        self.assertEqual(parse_barcode(DIGIKEY_LABEL).distributor, "digikey")
+
+    def test_gs_stripped_quantity_stops_before_11k(self):
+        raw = MOUSER_LABEL.replace(GS, "").replace(RS, "").replace(EOT, "")
+        r = parse_barcode(raw)
+        self.assertEqual(r.mpn, "GRM32EC72A106ME05K")
+        self.assertEqual(r.quantity, 50)
+
+    def test_gs_stripped_digikey_quantity(self):
+        raw = DIGIKEY_LABEL.replace(GS, "").replace(RS, "").replace(EOT, "")
+        self.assertEqual(parse_barcode(raw).quantity, 25)
+
+
+def mouser_part(**over):
+    raw = {
+        "MouserPartNumber": "81-GRM32EC72A106ME5K",
+        "ManufacturerPartNumber": "GRM32EC72A106ME05K",
+        "Manufacturer": "Murata Electronics",
+        "Description": "Multilayer Ceramic Capacitors MLCC - SMD/SMT 100V 10uF",
+        "Category": "Multilayer Ceramic Capacitors MLCC - SMD/SMT",
+        "LeadTime": "84 Days",
+        "Availability": "12,345 In Stock",
+        "DataSheetUrl": "https://www.mouser.com/datasheet/2/281/x.pdf",
+        "ImagePath": "https://www.mouser.com/images/murata/x.jpg",
+        "ProductDetailUrl": "https://www.mouser.com/ProductDetail/x",
+        "Min": "1",
+        "Mult": "1",
+        "PriceBreaks": [
+            {"Quantity": 1, "Price": "0,89 €", "Currency": "EUR"},
+            {"Quantity": 1000, "Price": "0,089 €", "Currency": "EUR"},
+        ],
+        "ProductAttributes": [
+            {"AttributeName": "Packaging", "AttributeValue": "Reel"},
+            {"AttributeName": "Packaging", "AttributeValue": "Cut Tape"},
+            {"AttributeName": "Standard Pack Qty", "AttributeValue": "1000"},
+        ],
+    }
+    raw.update(over)
+    return raw
+
+
+class MouserParseTests(unittest.TestCase):
+    def setUp(self):
+        from inventree_smart_parts.api_clients.mouser import MouserClient
+
+        self.Client = MouserClient
+        self.client = MouserClient("key")
+
+    def test_parse_fields(self):
+        pd = self.client._parse_part(mouser_part(), "GRM32EC72A106ME05K")
+        self.assertEqual(pd.mpn, "GRM32EC72A106ME05K")
+        self.assertEqual(pd.name, "GRM32EC72A106ME05K")
+        self.assertEqual(pd.supplier_name, "Mouser")
+        self.assertEqual(pd.supplier_sku, "81-GRM32EC72A106ME5K")
+        self.assertEqual(pd.lead_time, "12 Weeks")
+        self.assertEqual(pd.stock_available, 12345)
+        self.assertAlmostEqual(pd.price_breaks[1].price, 0.089)
+        params = {p.name: p.value for p in pd.parameters}
+        self.assertEqual(params["Packaging"], "Reel, Cut Tape")
+        self.assertEqual(pd.confidence, 1.0)
+
+    def test_lead_time_and_prices(self):
+        n = self.Client._normalize_lead_time
+        self.assertEqual(n("84 Days"), "12 Weeks")
+        self.assertEqual(n("3 days"), "1 Week")
+        self.assertEqual(n("15 Weeks"), "15 Weeks")
+        self.assertEqual(n(None), "")
+        p = self.Client._parse_price
+        self.assertAlmostEqual(p("1.234,56 €"), 1234.56)
+        self.assertAlmostEqual(p("$1,234.56"), 1234.56)
+        self.assertAlmostEqual(p("0,089 €"), 0.089)
+        self.assertAlmostEqual(p("$0.50"), 0.5)
+
+    def test_none_fields_do_not_crash(self):
+        pd = self.client._parse_part(
+            mouser_part(ManufacturerPartNumber=None, Manufacturer=None, LeadTime=None),
+            "ABC",
+        )
+        self.assertEqual(pd.mpn, "ABC")
+
+    def test_errors_array_raises(self):
+        from inventree_smart_parts.api_clients.base import ApiError
+
+        self.client._request = lambda *a, **k: {
+            "Errors": [{"Message": "Invalid unique identifier."}],
+            "SearchResults": None,
+        }
+        with self.assertRaises(ApiError):
+            self.client.search_by_mpn("LM7805")
+
+    def test_best_match_exact_prefers_purchasable(self):
+        dead = mouser_part(MouserPartNumber="81-DEAD", PriceBreaks=[], Availability="")
+        live = mouser_part()
+        other = mouser_part(ManufacturerPartNumber="GRM32EC72A106ME05L")
+        self.client._request = lambda *a, **k: {
+            "Errors": [],
+            "SearchResults": {"Parts": [other, dead, live]},
+        }
+        pd = self.client.search_by_mpn("GRM32EC72A106ME05K")
+        self.assertEqual(pd.supplier_sku, "81-GRM32EC72A106ME5K")
+
+    def test_best_match_by_mouser_pn(self):
+        self.client._request = lambda *a, **k: {
+            "Errors": [],
+            "SearchResults": {
+                "Parts": [
+                    mouser_part(ManufacturerPartNumber="X1", MouserPartNumber="81-X1"),
+                    mouser_part(),
+                ]
+            },
+        }
+        pd = self.client.search_by_mpn("81-grm32ec72a106me5k")
+        self.assertEqual(pd.mpn, "GRM32EC72A106ME05K")
+
+
+class PriorityMergeTests(unittest.TestCase):
+    def test_default_priority_is_digikey_first(self):
+        from inventree_smart_parts.services.data_merger import get_priority_order
+
+        self.assertEqual(get_priority_order()[:2], ["digikey", "mouser"])
+
+    def test_digikey_wins_mouser_fills_gaps(self):
+        from inventree_smart_parts.api_clients.base import PartParameter
+
+        dk = PartData(
+            mpn="X1",
+            name="X1",
+            source="digikey",
+            description="DK desc",
+            category="Capacitors > Ceramic Capacitors",
+            image_url="https://dk/img.jpg",
+            parameters=[PartParameter(name="Capacitance", value="10uF")],
+        )
+        mo = PartData(
+            mpn="X1",
+            name="X1",
+            source="mouser",
+            description="Mouser desc",
+            category="MLCC - SMD/SMT",
+            lead_time="12 Weeks",
+            image_url="https://mo/img.jpg",
+            parameters=[PartParameter(name="Packaging", value="Reel")],
+        )
+        merged = merge_part_data([mo, dk], None, search_term="X1", strict=True)
+        fs = merged.raw_data["field_sources"]
+        self.assertEqual(merged.description, "DK desc")
+        self.assertEqual(fs["description"], "digikey")
+        self.assertEqual(fs["category"], "digikey")
+        self.assertEqual(merged.lead_time, "12 Weeks")
+        self.assertEqual(fs["lead_time"], "mouser")
+        self.assertEqual(
+            [u["source"] for u in merged.raw_data["source_image_urls"]],
+            ["digikey", "mouser"],
+        )
+        srcs = {p.name.lower(): p.source for p in merged.parameters}
+        self.assertEqual(srcs["capacitance"], "digikey")
+        self.assertEqual(srcs["package type"], "mouser")  # canonical name
+
+
+class ProvenanceTests(unittest.TestCase):
+    PRIO = ["digikey", "mouser", "lcsc"]
+
+    def setUp(self):
+        from inventree_smart_parts.services import provenance
+
+        self.p = provenance
+
+    def entry(self, src, value):
+        return {"src": src, "h": self.p.value_hash(value)}
+
+    def test_empty_is_written(self):
+        self.assertTrue(self.p.should_write(None, "", "mouser", self.PRIO))
+        self.assertTrue(self.p.should_write(None, "-", "", self.PRIO))
+
+    def test_higher_priority_replaces_unedited_lower(self):
+        e = self.entry("mouser", "12 Weeks")
+        self.assertTrue(self.p.should_write(e, "12 Weeks", "digikey", self.PRIO))
+        # whitespace-normalised hash
+        self.assertTrue(self.p.should_write(e, " 12  Weeks ", "digikey", self.PRIO))
+
+    def test_manual_edit_is_kept(self):
+        e = self.entry("mouser", "12 Weeks")
+        self.assertFalse(self.p.should_write(e, "10 Weeks", "digikey", self.PRIO))
+
+    def test_lower_or_same_priority_never_overwrites(self):
+        e = self.entry("digikey", "14 Weeks")
+        self.assertFalse(self.p.should_write(e, "14 Weeks", "mouser", self.PRIO))
+        self.assertFalse(self.p.should_write(e, "14 Weeks", "digikey", self.PRIO))
+
+    def test_no_provenance_is_kept(self):
+        self.assertFalse(self.p.should_write(None, "legacy", "digikey", self.PRIO))
+        e = self.entry("mouser", "x")
+        self.assertFalse(self.p.should_write(e, "x", "", self.PRIO))
+
+    def test_fallback_description_replaced_by_any_source(self):
+        e = self.entry("fallback", "Murata GRM1")
+        self.assertTrue(self.p.should_write(e, "Murata GRM1", "mouser", self.PRIO))
+
+    def test_record_without_source_protects_field(self):
+        prov = self.p.empty()
+        self.p.record(prov, "description", "mouser", "a")
+        self.p.record(prov, "description", "", "b")
+        self.assertIsNone(self.p.entry(prov, "description"))
+
+
 if __name__ == "__main__":
     unittest.main()

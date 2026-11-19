@@ -2,6 +2,27 @@
 
 All notable changes to SmartParts are documented in this file.
 
+## [1.5.0] - 2026-11-19
+
+### Added
+- **Mouser labels in PureScan, on par with DigiKey**: scanning a Mouser DataMatrix creates the part named after the MPN, with supplier part (Mouser P/N looked up by MPN — Mouser labels carry only `1P`), price breaks, lead time, image, datasheet and parameters.
+- **Priority-aware gap filling for existing parts**: SYS:CREATEPART on an existing part now adds the missing supplier parts and fills empty fields instead of stopping at "already exists". SYS:FASTADD does the same once, when the part has no supplier part from the scanned label's distributor yet (no API calls on later scans, so burst mode stays fast). The PureScan prompt lists what was filled.
+- **Field provenance** (`services/provenance.py`, stored in `Part.metadata["smartparts"]`): each written field records the distributor that supplied it. A higher-priority source (`API_PRIORITY`) may replace a lower-priority value only if it was not edited since; manual edits, editor input and legacy values are never overwritten. Covers description, datasheet link, category, image, core and spec parameters.
+- Barcode decoder: `1V` → `manufacturer`, distributor detection (`digikey` / `mouser`) on ANSI labels; PureScan INFO shows `Label:` / `Mfr:`.
+
+### Changed
+- **`API_PRIORITY` default is now `digikey,mouser,element14,tme,lcsc`** (was Mouser first). Existing installs keep their stored value — set it in the plugin settings.
+- Mouser-only parts: the flat Mouser leaf category is fuzzy-matched into the existing tree or falls back to `DEFAULT_CATEGORY`; it is never auto-created as a root category.
+- Updates of existing parts (dashboard editor, API v1 / batch `update`) no longer overwrite parameter values (`update_or_create` replaced values despite the docstring), no longer replace the image unconditionally, and reuse the part's existing ManufacturerPart when distributors spell the manufacturer differently. Existing supplier parts only get price breaks / link filled when they have none.
+
+### Fixed
+- Mouser client: correct `SearchByPartRequest` body (`partSearchOptions`); API `Errors` (e.g. invalid key) are raised instead of reported as "not found"; lead time `84 Days` → `12 Weeks`; localised prices (`1.234,56 €`); null-safe best match, preferring a purchasable listing and matching by Mouser P/N; repeated attributes (`Packaging`) are joined instead of dropped.
+- Image fallback across sources: the merger now passes all sources' image URLs in priority order.
+- GS-stripped labels: quantity no longer swallows the next field (`Q50`+`11K…` read as 501, DigiKey `Q25`+`11Z` as 2511).
+
+### Housekeeping
+- Cache-buster `purescan.js?v=11`. Shared helpers `get_priority_order()` and `resolve_category_for_source()` replace copy-pasted blocks.
+
 ## [1.4.0] - 2026-11-18
 
 ### Fixed

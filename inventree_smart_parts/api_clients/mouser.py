@@ -3,14 +3,22 @@ Mouser API Client
 =================
 Integration with Mouser Electronics Search API v2.
 Searches parts by MPN and normalizes results to PartData.
+
+Mouser DataMatrix labels carry no Mouser part number (only 1P = MPN), so
+PureScan always looks Mouser parts up by MPN. The search API returns no
+technical specs — ProductAttributes holds only packaging data — and no
+detailed description / series / package.
 """
 
 import logging
+import re
 from typing import Optional, Dict, Any, List
 
 from .base import BaseApiClient, PartData, PriceBreak, PartParameter, ApiError
 
 logger = logging.getLogger("inventree_smart_parts.api.mouser")
+
+_DAYS_RE = re.compile(r"^(\d+)\s*days?$", re.IGNORECASE)
 
 
 class MouserClient(BaseApiClient):
@@ -25,7 +33,7 @@ class MouserClient(BaseApiClient):
 
     def search_by_mpn(self, mpn: str) -> Optional[PartData]:
         """
-        Search Mouser for a part by MPN.
+        Search Mouser for a part by MPN (or Mouser part number).
 
         Uses the SearchByPartNumber endpoint which gives the most
         precise results for exact MPN lookups.
@@ -36,12 +44,13 @@ class MouserClient(BaseApiClient):
         url = f"{self.BASE_URL}/search/partnumber"
         params = {"apiKey": self.api_key}
 
+        # SearchByPartRequest only knows mouserPartNumber + partSearchOptions
+        # (records/startingRecord/searchOptions belong to keyword search).
+        # mouserPartNumber accepts a Mouser PN *or* a manufacturer PN.
         payload = {
             "SearchByPartRequest": {
                 "mouserPartNumber": mpn,
-                "records": 10,
-                "startingRecord": 0,
-                "searchOptions": "None",
+                "partSearchOptions": "None",
             }
         }
 
@@ -55,6 +64,20 @@ class MouserClient(BaseApiClient):
             "POST", url, headers=headers, json_data=payload, params=params
         )
 
+        # Mouser reports API errors (bad key, quota, ...) as HTTP 200 with an
+        # Errors array — surface them instead of pretending "not found".
+        errors = data.get("Errors") or []
+        if errors:
+            msgs = "; ".join(
+                (
+                    str(e.get("Message") or e.get("Code") or e)
+                    if isinstance(e, dict)
+                    else str(e)
+                )
+                for e in errors
+            )
+            raise ApiError(f"Mouser API error: {msgs}")
+
         # Parse the response — guard against None/unexpected shape
         search_results = data.get("SearchResults") or {}
         if not isinstance(search_results, dict):
@@ -62,7 +85,7 @@ class MouserClient(BaseApiClient):
                 f"[Mouser] Unexpected SearchResults type: {type(search_results).__name__}"
             )
             return None
-        parts = search_results.get("Parts") or []
+        parts = [p for p in (search_results.get("Parts") or []) if isinstance(p, dict)]
         if not parts:
             logger.info(f"[Mouser] No results found for MPN: {mpn}")
             return None
@@ -74,92 +97,149 @@ class MouserClient(BaseApiClient):
 
         return self._parse_part(best_match, mpn)
 
-    def _find_best_match(self, parts: List[Dict], mpn: str) -> Optional[Dict]:
-        """Find the part with the closest MPN match."""
-        mpn_lower = mpn.lower().strip()
+    # ── Helpers ─────────────────────────────────────────────────────
 
-        # First pass: exact manufacturer part number match
+    @staticmethod
+    def _s(raw: Dict, key: str) -> str:
+        """Null-safe stripped string field."""
+        return str(raw.get(key) or "").strip()
+
+    @classmethod
+    def _purchasable_score(cls, part: Dict) -> int:
+        """Prefer listings that have prices and stock (Mouser lists some
+        MPNs several times, e.g. obsolete / non-stocked duplicates)."""
+        score = 0
+        if part.get("PriceBreaks"):
+            score += 2
+        if cls._parse_stock(part):
+            score += 1
+        return score
+
+    def _find_best_match(self, parts: List[Dict], mpn: str) -> Optional[Dict]:
+        """Find the part with the closest MPN match.
+
+        Order: exact MPN → search term is the Mouser PN → MPN substring.
+        Among several exact-MPN listings, the purchasable one wins.
+        """
+        mpn_lower = (mpn or "").lower().strip()
+
+        exact = [
+            p
+            for p in parts
+            if self._s(p, "ManufacturerPartNumber").lower() == mpn_lower
+        ]
+        if exact:
+            # max() keeps the first of equal scores → API order preserved
+            return max(exact, key=self._purchasable_score)
+
         for part in parts:
-            mfr_pn = part.get("ManufacturerPartNumber", "").lower().strip()
-            if mfr_pn == mpn_lower:
+            if self._s(part, "MouserPartNumber").lower() == mpn_lower:
                 return part
 
-        # Second pass: manufacturer part number contains the search term
         for part in parts:
-            mfr_pn = part.get("ManufacturerPartNumber", "").lower().strip()
-            if mpn_lower in mfr_pn:
+            mfr_pn = self._s(part, "ManufacturerPartNumber").lower()
+            if mfr_pn and mpn_lower and mpn_lower in mfr_pn:
                 return part
 
         return None
 
-    def _parse_part(self, raw: Dict[str, Any], search_mpn: str) -> PartData:
-        """Convert raw Mouser API response to PartData."""
-        # Parse price breaks
-        price_breaks = []
-        for pb in raw.get("PriceBreaks", []):
-            try:
-                qty = int(pb.get("Quantity", 0))
-                # Price comes as string like "€1.23" or "$1.23"
-                price_str = pb.get("Price", "0")
-                currency = pb.get("Currency", "EUR")
-                # Strip currency symbols and whitespace
-                price_clean = "".join(c for c in price_str if c.isdigit() or c in ".,")
-                # Handle European comma-as-decimal
-                if "," in price_clean and "." not in price_clean:
-                    price_clean = price_clean.replace(",", ".")
-                elif "," in price_clean and "." in price_clean:
-                    price_clean = price_clean.replace(",", "")
+    @staticmethod
+    def _parse_price(price_str) -> float:
+        """Parse a localised Mouser price ("0,089 €", "$1,234.56",
+        "1.234,56 €"). With both separators the last one is the decimal
+        point; a lone comma is a decimal comma."""
+        if isinstance(price_str, (int, float)):
+            return float(price_str)
+        clean = "".join(c for c in str(price_str or "") if c.isdigit() or c in ".,")
+        if not clean:
+            return 0.0
+        if "," in clean and "." in clean:
+            if clean.rfind(",") > clean.rfind("."):
+                clean = clean.replace(".", "").replace(",", ".")
+            else:
+                clean = clean.replace(",", "")
+        elif "," in clean:
+            clean = clean.replace(",", ".")
+        try:
+            return float(clean)
+        except ValueError:
+            return 0.0
 
-                price = float(price_clean) if price_clean else 0.0
-
-                if qty > 0 and price > 0:
-                    price_breaks.append(
-                        PriceBreak(
-                            quantity=qty,
-                            price=price,
-                            currency=currency,
-                        )
-                    )
-            except (ValueError, TypeError):
-                continue
-
-        # Parse stock
-        stock = None
-        availability = raw.get("Availability", "")
-        if availability:
-            stock_str = "".join(c for c in availability if c.isdigit())
-            if stock_str:
+    @staticmethod
+    def _parse_stock(raw: Dict) -> Optional[int]:
+        """Stock from AvailabilityInStock, else digits of "1,234 In Stock"."""
+        for key in ("AvailabilityInStock", "Availability"):
+            val = str(raw.get(key) or "")
+            digits = "".join(c for c in val.split("In Stock")[0] if c.isdigit())
+            if digits:
                 try:
-                    stock = int(stock_str)
+                    return int(digits)
                 except ValueError:
                     pass
+        return None
 
-        # Parse parameters from product attributes
-        parameters = []
-        for attr_name in ["ProductAttributes"]:
-            attrs = raw.get(attr_name, []) or []
-            for attr in attrs:
-                attr_label = attr.get("AttributeName", "")
-                attr_value = attr.get("AttributeValue", "")
-                if attr_label and attr_value:
-                    parameters.append(
-                        PartParameter(
-                            name=attr_label,
-                            value=attr_value,
-                        )
+    @staticmethod
+    def _normalize_lead_time(lead) -> str:
+        """Mouser reports "84 Days"; DigiKey "N Weeks" — normalise to weeks."""
+        text = str(lead or "").strip()
+        m = _DAYS_RE.match(text)
+        if m:
+            days = int(m.group(1))
+            if days <= 0:
+                return ""
+            weeks = -(-days // 7)  # ceiling
+            return f"{weeks} Week" if weeks == 1 else f"{weeks} Weeks"
+        return text
+
+    # ── Parsing ─────────────────────────────────────────────────────
+
+    def _parse_part(self, raw: Dict[str, Any], search_mpn: str) -> PartData:
+        """Convert raw Mouser API response to PartData."""
+        # Price breaks
+        price_breaks = []
+        for pb in raw.get("PriceBreaks") or []:
+            try:
+                qty = int(pb.get("Quantity", 0))
+                price = self._parse_price(pb.get("Price", "0"))
+                currency = pb.get("Currency") or "EUR"
+                if qty > 0 and price > 0:
+                    price_breaks.append(
+                        PriceBreak(quantity=qty, price=price, currency=currency)
                     )
+            except (ValueError, TypeError, AttributeError):
+                continue
 
-        # Build the normalized PartData
-        mpn_result = raw.get("ManufacturerPartNumber", search_mpn)
-        manufacturer = raw.get("Manufacturer", "")
-        description = raw.get("Description", "")
-        package = ""
+        stock = self._parse_stock(raw)
 
-        # v1.3.0: extended metadata. Mouser's search API carries no separate
-        # detailed description; Series / Package / Supplier Device Package
-        # arrive inside ProductAttributes — promote them to dedicated fields.
-        lead_time = raw.get("LeadTime", "")
+        # Parameters from ProductAttributes. Mouser repeats a name for
+        # multi-valued attributes (Packaging: Reel / Cut Tape / MouseReel) —
+        # collapse them into one comma-joined value, keeping order.
+        attr_values: Dict[str, List[str]] = {}
+        for attr in raw.get("ProductAttributes") or []:
+            if not isinstance(attr, dict):
+                continue
+            label = str(attr.get("AttributeName") or "").strip()
+            value = str(attr.get("AttributeValue") or "").strip()
+            if label and value:
+                vals = attr_values.setdefault(label, [])
+                if value not in vals:
+                    vals.append(value)
+        parameters = [
+            PartParameter(name=name, value=", ".join(vals))
+            for name, vals in attr_values.items()
+        ]
+
+        mpn_result = (
+            self._s(raw, "ManufacturerPartNumber") or (search_mpn or "").strip()
+        )
+        manufacturer = self._s(raw, "Manufacturer")
+        description = self._s(raw, "Description")
+
+        # Series / Package / Supplier Device Package if Mouser ever sends
+        # them as attributes — promote to the dedicated fields.
+        lead_time = self._normalize_lead_time(raw.get("LeadTime"))
         series = ""
+        package = ""
         supplier_device_package = ""
         for param in parameters:
             pname = param.name.lower().strip()
@@ -170,49 +250,37 @@ class MouserClient(BaseApiClient):
             elif pname == "package / case" and not package:
                 package = param.value
 
-        # Category from Mouser
-        category = raw.get("Category", "")
+        # Category — Mouser only provides the leaf (no path)
+        category = self._s(raw, "Category")
 
-        # Datasheet — Mouser uses 'DataSheetUrl'; also guard against '#' placeholders
-        datasheet_url = (
-            raw.get("DataSheetUrl", "")  # Mouser v2 standard field
-            or raw.get("DatasheetUrl", "")  # alternate casing seen in some responses
-            or ""
-        )
-        # Mouser sometimes returns '#' when no datasheet is available
+        # Datasheet — 'DataSheetUrl'; Mouser sometimes returns '#' placeholders
+        datasheet_url = str(
+            raw.get("DataSheetUrl") or raw.get("DatasheetUrl") or ""
+        ).strip()
         if datasheet_url and not datasheet_url.startswith("http"):
             datasheet_url = ""
 
-        # Image
-        image_url = raw.get("ImagePath", "")
+        image_url = self._s(raw, "ImagePath")
+        if image_url.startswith("//"):
+            image_url = f"https:{image_url}"
 
-        # Mouser part number as SKU
-        mouser_pn = raw.get("MouserPartNumber", "")
+        mouser_pn = self._s(raw, "MouserPartNumber")
+        product_url = self._s(raw, "ProductDetailUrl")
 
-        # Product URL
-        product_url = raw.get("ProductDetailUrl", "")
-
-        # Min order qty
         min_qty = 1
-        min_str = raw.get("Min", "")
-        if min_str:
-            try:
-                min_qty = int(min_str)
-            except (ValueError, TypeError):
-                pass
+        try:
+            min_qty = int(raw.get("Min") or 1)
+        except (ValueError, TypeError):
+            pass
 
-        # Order multiple
         mult = 1
-        mult_str = raw.get("Mult", "")
-        if mult_str:
-            try:
-                mult = int(mult_str)
-            except (ValueError, TypeError):
-                pass
+        try:
+            mult = int(raw.get("Mult") or 1)
+        except (ValueError, TypeError):
+            pass
 
-        # Determine match confidence
         confidence = 1.0
-        if mpn_result.lower().strip() != search_mpn.lower().strip():
+        if mpn_result.lower().strip() != (search_mpn or "").lower().strip():
             confidence = 0.8
 
         # v1.3.0: bare MPN as part name (see digikey.py note)

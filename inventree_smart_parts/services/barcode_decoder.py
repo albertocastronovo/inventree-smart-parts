@@ -71,6 +71,11 @@ DI_TABLE = [
 
 _STRONG_BOUNDARY_RE = re.compile(r"(?=30P|QTY|1[PTKSE]|2S|3S|4L|6D|Q(?=\d)|$)")
 
+# Extra stops for the quantity value only (GS-stripped labels): Mouser puts
+# 11K<packing list> after Q, DigiKey 11Z PICK — without these "Q50" + "11K…"
+# would read as 501.
+_QTY_STOP_RE = re.compile(r"(?=1[014]K|1[0-3]Z|20Z)")
+
 
 @dataclass
 class BarcodeData:
@@ -83,7 +88,8 @@ class BarcodeData:
     po_number: str = ""
     raw: str = ""
     source: str = ""  # 'ansi', 'heuristic', 'regex', 'fallback', ''
-    distributor: Optional[str] = None
+    distributor: Optional[str] = None  # 'digikey' | 'mouser' | None
+    manufacturer: str = ""  # 1V (Mouser labels)
 
     def to_dict(self) -> Dict[str, Any]:
         from dataclasses import asdict
@@ -108,6 +114,29 @@ def _resolve_generic_p(result: BarcodeData, generic_p: str):
         result.supplier_sku = generic_p
 
 
+_DIGIKEY_FIELD_RE = re.compile(r"^(?:1[1-3]Z|20Z)")
+
+
+def _detect_distributor(fields: List[str], generic_p: str) -> Optional[str]:
+    """Best-effort distributor detection from the ANSI field list.
+
+    DigiKey: 30P, a P/30P value ending in -ND, or 11Z/12Z/13Z/20Z fields.
+    Mouser:  no P/30P, 1V (manufacturer) plus 11K or 14K.
+    """
+    stripped = [f.strip() for f in fields if f.strip()]
+    has_30p = any(f.startswith("30P") for f in stripped)
+    if has_30p or any(_DIGIKEY_FIELD_RE.match(f) for f in stripped):
+        return "digikey"
+    if generic_p.upper().endswith("-ND"):
+        return "digikey"
+    if not generic_p:
+        has_1v = any(f.startswith("1V") and len(f) > 2 for f in stripped)
+        has_k = any(f.startswith(("11K", "14K")) for f in stripped)
+        if has_1v and has_k:
+            return "mouser"
+    return None
+
+
 def _extract_fields(fields: List[str], result: BarcodeData):
     """Populate BarcodeData according to ANSI MH10.8.2 DI assignments."""
     generic_p = ""
@@ -123,6 +152,12 @@ def _extract_fields(fields: List[str], result: BarcodeData):
         if len(t) > 2 and t.startswith("1P"):
             if not result.mpn:
                 result.mpn = t[2:].strip()
+            continue
+
+        # 1V -> Manufacturer name (Mouser labels)
+        if len(t) > 2 and t.startswith("1V"):
+            if not result.manufacturer:
+                result.manufacturer = t[2:].strip()
             continue
 
         # 30P -> Supplier SKU
@@ -160,6 +195,7 @@ def _extract_fields(fields: List[str], result: BarcodeData):
             continue
 
     _resolve_generic_p(result, generic_p)
+    result.distributor = _detect_distributor(fields, generic_p)
 
 
 def _try_ansi_parse(raw: str, result: BarcodeData) -> bool:
@@ -232,7 +268,10 @@ def _try_heuristic_parse(raw: str, result: BarcodeData) -> bool:
                 for i, char in enumerate(after):
                     if not char.isdigit():
                         break
-                    if i > 0 and _STRONG_BOUNDARY_RE.match(after[i:]):
+                    if i > 0 and (
+                        _STRONG_BOUNDARY_RE.match(after[i:])
+                        or _QTY_STOP_RE.match(after[i:])
+                    ):
                         break
                     (
                         digits.push(char)

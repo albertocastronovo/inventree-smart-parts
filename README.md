@@ -43,6 +43,7 @@ SmartParts query engines run simultaneously to fetch high-fidelity data sheets, 
 * **Dual-Mode Header Handling:** Transparently switches user-agents to bypass Akamai/bot-protection networks on strict distributor platforms (e.g. Mouser) without sacrificing reliability.
 * **Intelligent Media Pipeline:** Downloads product images, probes dimensions, validates `Content-Type` headers, verifies magic bytes, and auto-compresses them before attaching them to InvenTree parts. 
 * **Fallback Priority Order:** Configurable search fallbacks ensure that if one API lacks detail or encounters a rate limit, other enabled distributors automatically fill the missing fields.
+* **Priority-Aware Gap Filling:** Scanning a label of a part that already exists (e.g. a Mouser reel of a part created from DigiKey) adds the missing supplier part and fills empty fields only. SmartParts remembers which distributor wrote each field (`Part.metadata["smartparts"]`), so a higher-priority source can later replace lower-priority values - hand-edited values are never overwritten. Mouser labels carry no Mouser part number (only the MPN), and Mouser's API returns no technical specs, so Mouser-only parts get fewer parameters and their flat category is fuzzy-matched (or defaulted), never auto-created.
 * **API Connection Diagnostic Tests:** Instant test endpoints accessible in settings that confirm credentials, returning standard unified messaging (e.g. `Connected successfully. Test search returned: LM7805`).
 * **Robust Credential Filtering:** Exception filters automatically strip query parameters from error stack-traces (e.g., hiding developer keys, tokens, or search payloads) before writing to logs.
 
@@ -162,7 +163,7 @@ Configure settings in **InvenTree Settings → Admin Center → Plugins → Smar
 
 | Key | Type | Default | Description |
 | :--- | :--- | :--- | :--- |
-| `API_PRIORITY` | `str` | `"mouser,digikey,element14,tme,lcsc"` | Comma-separated list specifying the source merge priority. |
+| `API_PRIORITY` | `str` | `"digikey,mouser,element14,tme,lcsc"` | Comma-separated source merge priority. On existing parts a higher-priority source may replace values written by a lower-priority one (never manual edits). |
 | `FUZZY_THRESHOLD` | `int` | `45` | Minimum confidence score (0-100) for category auto-mapping. |
 | `DEFAULT_CATEGORY` | `str` | `"Uncategorized"` | Default category path if no fuzzy match passes threshold. |
 | `DUPLICATE_ACTION` | `str` | `"ask"` | Duplicate MPN action: `"ask"`, `"update"`, or `"skip"`. |

@@ -646,11 +646,24 @@
     }
   }
 
+  const DISTRIBUTOR_LABELS = { mouser: 'Mouser', digikey: 'DigiKey' };
+
+  // "✓ Filled: a, b" / "Nothing to fill" line for gap-fill results
+  function _filledNote(resp) {
+    if (!resp) return '';
+    const filled = resp.enriched || [];
+    if (filled.length) return `✓ Filled: ${filled.join(', ')}`;
+    if (resp.enrich_errors && resp.enrich_errors.length) return `⚠ Gap-fill failed: ${resp.enrich_errors[0]}`;
+    return 'Nothing to fill';
+  }
+
   function _formatDistributorInfo(lk) {
     const d = lk.barcode_data || {};
-    const lines = [
-      `MPN: ${d.mpn || lk.mpn || '—'}`,
-    ];
+    const lines = [];
+    const dist = d.distributor || lk.distributor;
+    if (dist) lines.push(`Label: ${DISTRIBUTOR_LABELS[dist] || dist}`);
+    lines.push(`MPN: ${d.mpn || lk.mpn || '—'}`);
+    if (d.manufacturer) lines.push(`Mfr: ${d.manufacturer}`);
     if (d.supplier_sku) lines.push(`SKU: ${d.supplier_sku}`);
     if (d.quantity != null) lines.push(`Qty: ${d.quantity}`);
     if (d.batch) lines.push(`Batch: ${d.batch}`);
@@ -696,7 +709,7 @@
       const resp = await _apiPost('/plugin/smartparts/api/purescan/createpart/', { barcode: raw });
       if (resp.already_exists) {
         _showResult(STATES.SUCCESS,
-          `⚠ Part already exists: ${resp.part_name || ''}${resp.part_ipn ? ' (' + resp.part_ipn + ')' : ''}\nNothing was created`, 6000);
+          `⚠ Part already exists: ${resp.part_name || ''}${resp.part_ipn ? ' (' + resp.part_ipn + ')' : ''}\n${_filledNote(resp)}`, 8000);
         return;
       }
       if (resp.success) {
@@ -862,6 +875,22 @@
       } else {
         _pendingPartId = lk.part_id;
         _pendingPartName = lk.part_name || '';
+        // One-time gap-fill: the label's distributor (e.g. Mouser) has no
+        // supplier part on this part yet → add it and fill empty fields.
+        // Later scans of the same part skip this (no API call).
+        if (lk.distributor && lk.distributor_supplier_part === false) {
+          _setState(STATES.PROCESSING,
+            `Adding ${DISTRIBUTOR_LABELS[lk.distributor] || lk.distributor} data to "${_pendingPartName}"…`);
+          try {
+            const er = await _apiPost('/plugin/smartparts/api/purescan/createpart/',
+              { barcode: raw, enrich_scope: 'label' });
+            if (er && er.already_exists && (er.enriched || []).length) {
+              _pendingCategoryNote = _filledNote(er);
+            }
+          } catch (e) {
+            console.warn('[PureScan] FASTADD gap-fill failed:', e);
+          }
+        }
       }
       const d = lk.barcode_data || {};
       _pendingQty = d.quantity != null ? parseFloat(d.quantity) : 1;

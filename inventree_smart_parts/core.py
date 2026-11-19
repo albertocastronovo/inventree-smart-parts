@@ -39,7 +39,7 @@ class SmartPartsPlugin(
         "Fetches data from Mouser, DigiKey, LCSC, element14/Farnell, and TME. "
         "Maps categories, detects duplicates, and supports batch Excel import."
     )
-    VERSION = "1.4.0"
+    VERSION = "1.5.0"
     AUTHOR = "StarkStrom Engineering"
 
     # ── Plugin Settings (Admin-configurable) ─────────────────────────
@@ -145,9 +145,11 @@ class SmartPartsPlugin(
                 "Comma-separated priority order for data merging. "
                 "First source wins for each field. "
                 "Valid tokens: mouser, digikey, lcsc, element14, tme. "
-                "Example: mouser,digikey,element14,tme,lcsc"
+                "Higher-priority sources also replace values written by "
+                "lower-priority ones on existing parts (never manual edits). "
+                "Example: digikey,mouser,element14,tme,lcsc"
             ),
-            "default": "mouser,digikey,element14,tme,lcsc",
+            "default": "digikey,mouser,element14,tme,lcsc",
         },
         # ── Category Mapping ──
         "FUZZY_THRESHOLD": {

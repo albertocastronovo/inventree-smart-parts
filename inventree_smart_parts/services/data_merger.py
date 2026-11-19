@@ -30,6 +30,21 @@ MERGEABLE_FIELDS = [
 ]
 
 
+DEFAULT_PRIORITY = "digikey,mouser,element14,tme,lcsc"
+
+
+def get_priority_order(plugin=None) -> List[str]:
+    """Parse the API_PRIORITY setting (DigiKey first by default)."""
+    raw = ""
+    if plugin is not None:
+        try:
+            raw = plugin.get_setting("API_PRIORITY") or ""
+        except Exception:
+            raw = ""
+    raw = raw or DEFAULT_PRIORITY
+    return [p.strip().lower() for p in raw.split(",") if p.strip()]
+
+
 def _norm_mpn(value: str) -> str:
     """Normalise an MPN for identity comparison (strip + case-fold).
 
@@ -106,7 +121,7 @@ def merge_part_data(
 
     # Default priority
     if priority_order is None:
-        priority_order = ["mouser", "digikey", "lcsc"]
+        priority_order = get_priority_order()
 
     # Sort results by priority
     def sort_key(pd: PartData) -> int:
@@ -145,11 +160,13 @@ def merge_part_data(
     # Start with the highest-priority result as base
     merged = PartData()
 
-    # Merge simple string fields: first non-empty wins
+    # Merge simple string fields: first non-empty wins (remember the winner)
+    field_sources = {}
     for field_name in MERGEABLE_FIELDS:
         for result in sorted_results:
             if result.has_field(field_name):
                 setattr(merged, field_name, getattr(result, field_name))
+                field_sources[field_name] = result.source
                 break
 
     # Merge parameters: collect all unique parameters
@@ -165,6 +182,14 @@ def merge_part_data(
     # Collect all supplier info for later use
     merged.raw_data = {
         "merged_sources": [r.source for r in sorted_results],
+        # Which source won each merged field (provenance, see provenance.py)
+        "field_sources": field_sources,
+        # Image candidates in priority order (fallback if a download fails)
+        "source_image_urls": [
+            {"source": r.source, "url": r.image_url}
+            for r in sorted_results
+            if r.image_url and r.image_url.startswith("http")
+        ],
         "dropped_sources": dropped_sources,
         "supplier_data": [
             {
@@ -246,6 +271,7 @@ def _merge_parameters(results: List[PartData]) -> List[PartParameter]:
             name_key = canonical_name.lower().strip()
             if name_key not in seen_names:
                 seen_names.add(name_key)
+                param.source = result.source
                 merged_params.append(param)
 
     return merged_params

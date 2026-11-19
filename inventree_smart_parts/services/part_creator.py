@@ -11,7 +11,7 @@ import os
 from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass, field
 
-from ..api_clients.base import PartData
+from ..api_clients.base import PartData, PriceBreak
 
 logger = logging.getLogger("inventree_smart_parts.services.creator")
 
@@ -65,6 +65,9 @@ class CreationResult:
     errors: List[str] = field(default_factory=list)
     # Audit list of parameters excluded by LIMIT_PARAMETERS_TO_CATEGORY
     dropped_parameters: List[Dict] = field(default_factory=list)
+    # Human-readable list of what was written to an existing part
+    # (e.g. "Mouser supplier part 81-XYZ", "Manufacturer Std Lead Time")
+    filled: List[str] = field(default_factory=list)
 
     # Legacy shim so existing call-sites that read .manufacturer_parts / .supplier_parts still work
     @property
@@ -76,12 +79,57 @@ class CreationResult:
         return self.supplier_parts_created + self.supplier_parts_existing
 
 
+def _default_priority_order() -> List[str]:
+    from .data_merger import get_priority_order
+
+    plugin = None
+    try:
+        from plugin.registry import registry
+
+        plugin = registry.get_plugin("smartparts")
+    except Exception:
+        pass
+    return get_priority_order(plugin)
+
+
+class _WriteContext:
+    """Per-operation state for priority-aware field writes (see provenance)."""
+
+    def __init__(self, part_data: PartData, priority_order: List[str], prov: Dict):
+        self.data = part_data
+        self.priority = priority_order
+        self.prov = prov
+        self.field_sources: Dict[str, str] = dict(
+            (part_data.raw_data or {}).get("field_sources") or {}
+        )
+        self.filled: List[str] = []
+        self.is_update = False
+
+    def source_of(self, field_name: str) -> str:
+        return self.field_sources.get(field_name, "") or ""
+
+    def allowed(self, key: str, current, source: str) -> bool:
+        from . import provenance
+
+        return provenance.should_write(
+            provenance.entry(self.prov, key), current, source, self.priority
+        )
+
+    def wrote(self, key: str, source: str, value, label: str = "") -> None:
+        from . import provenance
+
+        provenance.record(self.prov, key, source, value)
+        if label:
+            self.filled.append(label)
+
+
 def create_part_from_data(
     part_data: PartData,
     category_id: Optional[int] = None,
     update_existing: bool = False,
     existing_part_id: Optional[int] = None,
     auto_create_companies: bool = True,
+    priority_order: Optional[List[str]] = None,
 ) -> CreationResult:
     """
     Create or update an InvenTree Part from merged PartData.
@@ -91,12 +139,19 @@ def create_part_from_data(
     2. ManufacturerPart (links to manufacturer company)
     3. SupplierPart (for each supplier with SKU)
 
+    Updates of an existing part are priority-aware (services/provenance.py):
+    empty fields are filled; a value is only replaced when a higher-priority
+    source than the one that wrote it supplies a new one and the value was
+    not edited since. Data without source info (dashboard editor) only fills
+    empty fields.
+
     Args:
         part_data: Merged/normalized part data
         category_id: InvenTree category ID (None = uncategorized)
         update_existing: Whether to update an existing part
         existing_part_id: ID of existing part to update
         auto_create_companies: Auto-create manufacturer/supplier companies
+        priority_order: Source priority (defaults to the API_PRIORITY setting)
 
     Returns:
         CreationResult with details of what was created
@@ -111,6 +166,10 @@ def create_part_from_data(
             SupplierPart,
         )
         from django.db import transaction
+        from . import provenance
+
+        if priority_order is None:
+            priority_order = _default_priority_order()
 
         # ── Pre-flight: reject structural categories immediately ───────────────
         # InvenTree forbids assigning parts to structural (group-header)
@@ -147,11 +206,17 @@ def create_part_from_data(
 
         with transaction.atomic():
             # ── Step 1: Get or create the Part ──
-            if existing_part_id and update_existing:
-                part = _update_existing_part(existing_part_id, part_data, category_id)
+            is_update = bool(existing_part_id and update_existing)
+            if is_update:
+                part = Part.objects.get(pk=existing_part_id)
+                ctx = _WriteContext(part_data, priority_order, provenance.load(part))
+                ctx.is_update = True
+                _update_existing_part(part, part_data, category_id, ctx)
                 result.action = "updated"
             else:
+                ctx = _WriteContext(part_data, priority_order, provenance.empty())
                 part = _create_new_part(part_data, category_id)
+                _record_new_part_provenance(part, part_data, category_id, ctx)
                 result.action = "created"
 
             result.part_id = part.pk
@@ -186,8 +251,14 @@ def create_part_from_data(
                         if sup_part:
                             if sup_created:
                                 result.supplier_parts_created.append(sup_part.pk)
+                                if is_update:
+                                    ctx.filled.append(
+                                        f"{entry['name']} supplier part {entry['sku']}"
+                                    )
                             else:
                                 result.supplier_parts_existing.append(sup_part.pk)
+                                if is_update and entry.get("fill_prices"):
+                                    ctx.filled.append(f"{entry['name']} price breaks")
                 except Exception as e:
                     logger.error(
                         f"Failed to create SupplierPart "
@@ -200,7 +271,7 @@ def create_part_from_data(
                     )
 
             # ── Step 4: Core parameters (v1.3.0) ──
-            _create_core_parameters(part, part_data)
+            _create_core_parameters(part, part_data, ctx)
 
             # ── Step 4b: Distributor spec parameters ──
             # De-duplicate: parameters promoted to dedicated core templates
@@ -216,24 +287,24 @@ def create_part_from_data(
                     part,
                     spec_params,
                     category_id=category_id,
+                    ctx=ctx,
                 )
                 result.dropped_parameters = dropped
 
             # ── Step 5: Media Import (Image & Datasheet) ──
-            from .image_handler import auto_import_media, attach_datasheet_to_part
+            from .image_handler import attach_datasheet_to_part
 
-            if part_data.image_url or part_data.raw_data.get("source_image_urls"):
-                img_result = auto_import_media(part, part_data)
-                if img_result.success:
-                    logger.info(f"Image: {img_result.message}")
-                else:
-                    # Non-critical – log but don't surface to user as error
-                    logger.info(
-                        f"Image not imported (non-critical): {img_result.message}"
-                    )
+            _import_image(part, part_data, ctx, is_update)
 
-            if part_data.datasheet_url:
+            # Datasheet attachment only when Part.link was (re)written from it
+            if part_data.datasheet_url and (
+                not is_update or "Datasheet link" in ctx.filled
+            ):
                 attach_datasheet_to_part(part, part_data.datasheet_url)
+
+            # ── Step 6: Persist provenance ──
+            provenance.save(part, ctx.prov)
+            result.filled = list(ctx.filled)
 
             result.success = True
             # Build an accurate human-readable summary
@@ -258,6 +329,12 @@ def create_part_from_data(
                 parts.append(f"supplier part ({', '.join(bits)})")
             suffix = (": " + "; ".join(parts)) if parts else " (no linked parts)"
             result.message = f"'{part.name}' {result.action} successfully{suffix}."
+            if is_update:
+                result.message += (
+                    f" Filled: {', '.join(result.filled)}."
+                    if result.filled
+                    else " Nothing to fill."
+                )
 
     except Exception as e:
         logger.error(f"Part creation failed: {e}", exc_info=True)
@@ -266,6 +343,58 @@ def create_part_from_data(
         result.errors.append(str(e))
 
     return result
+
+
+def _import_image(part, data: PartData, ctx: "_WriteContext", is_update: bool):
+    """Download and attach the best image, priority-aware for updates.
+
+    Candidates come from raw_data['source_image_urls'] (priority order) and
+    the merged image_url. When replacing an existing distributor image only
+    sources ranking above the one that supplied it are tried.
+    """
+    from . import provenance
+    from .image_handler import download_best_image, attach_image_to_part
+
+    urls, seen = [], set()
+    for entry in (data.raw_data or {}).get("source_image_urls", []) or []:
+        url = (entry or {}).get("url", "")
+        if url and url not in seen:
+            urls.append({"url": url, "source": entry.get("source", "") or ""})
+            seen.add(url)
+    if data.image_url and data.image_url not in seen:
+        urls.append({"url": data.image_url, "source": ctx.source_of("image_url")})
+    if not urls:
+        return
+
+    current = part.image.name if getattr(part, "image", None) else ""
+    if is_update and not provenance.is_empty(current):
+        urls = [u for u in urls if ctx.allowed("image", current, u["source"])]
+        if not urls:
+            return
+
+    img_data, ext, source, err = download_best_image(urls)
+    if not img_data:
+        logger.info(f"Image not imported (non-critical) for Part {part.pk}: {err}")
+        return
+    img_result = attach_image_to_part(part, img_data, ext, source)
+    if img_result.success:
+        src = source if source in ctx.priority else ""
+        ctx.wrote("image", src, part.image.name, "Image" if is_update else "")
+        logger.info(f"Image: {img_result.message}")
+
+
+def _record_new_part_provenance(part, data: PartData, category_id, ctx) -> None:
+    """Remember which source supplied the fields of a freshly created part."""
+    if data.description:
+        ctx.wrote("description", ctx.source_of("description"), part.description)
+    else:
+        # Synthesised "<Manufacturer> <MPN>" placeholder: any distributor may
+        # replace it later.
+        ctx.wrote("description", "fallback", part.description)
+    if part.link:
+        ctx.wrote("link", ctx.source_of("datasheet_url"), part.link)
+    if part.category_id:
+        ctx.wrote("category", ctx.source_of("category"), str(part.category_id))
 
 
 def _create_new_part(data: PartData, category_id: Optional[int]) -> "Part":
@@ -320,32 +449,49 @@ def _create_new_part(data: PartData, category_id: Optional[int]) -> "Part":
 
 
 def _update_existing_part(
-    part_id: int, data: PartData, category_id: Optional[int]
+    part, data: PartData, category_id: Optional[int], ctx: "_WriteContext"
 ) -> "Part":
-    """Update an existing InvenTree Part with new data.
+    """Update an existing InvenTree Part, priority-aware.
 
-    This is deliberately non-destructive: existing values are NEVER
-    overwritten. Only truly empty fields receive new values.
+    A field is written when it is empty, or when its value was written by a
+    lower-priority source and not edited since (see provenance.should_write).
+    part.name is never touched (MPN identity; may be renamed manually).
     """
-    from part.models import Part, PartCategory
+    from part.models import PartCategory
 
-    part = Part.objects.get(pk=part_id)
     changed = False
 
-    # Never touch part.name – it was set from the MPN at creation time
-    # and the user may have renamed it manually.
-
-    if data.description and not part.description:
-        part.description = data.description[:250]
+    desc = (data.description or "")[:250]
+    src = ctx.source_of("description")
+    if (
+        desc
+        and desc != part.description
+        and ctx.allowed("description", part.description, src)
+    ):
+        part.description = desc
+        ctx.wrote("description", src, desc, "Description")
         changed = True
 
-    if data.datasheet_url and not part.link:
+    src = ctx.source_of("datasheet_url")
+    if (
+        data.datasheet_url
+        and data.datasheet_url != part.link
+        and ctx.allowed("link", part.link, src)
+    ):
         part.link = data.datasheet_url
+        ctx.wrote("link", src, part.link, "Datasheet link")
         changed = True
 
-    if category_id and not part.category_id:
+    src = ctx.source_of("category")
+    current_cat = str(part.category_id) if part.category_id else ""
+    if (
+        category_id
+        and str(category_id) != current_cat
+        and ctx.allowed("category", current_cat, src)
+    ):
         try:
             part.category = PartCategory.objects.get(pk=category_id)
+            ctx.wrote("category", src, str(category_id), "Category")
             changed = True
         except PartCategory.DoesNotExist:
             pass
@@ -368,6 +514,15 @@ def _create_manufacturer_part(
     Returns (manufacturer_part, was_created).
     """
     from company.models import Company, ManufacturerPart
+
+    # MPN is the identity: if this part already has a ManufacturerPart with
+    # the MPN, reuse it whatever the manufacturer is called by this
+    # distributor ("Vishay Dale" vs "Vishay / Dale") — no second MP/company.
+    existing_mp = ManufacturerPart.objects.filter(
+        part=part, MPN__iexact=(data.mpn or "").strip()
+    ).first()
+    if existing_mp:
+        return existing_mp, False
 
     # Get or create the manufacturer company
     manufacturer = _get_or_create_company(
@@ -418,14 +573,17 @@ def _get_supplier_entries(data: PartData, part=None) -> List[Dict]:
     def _mem_key(name: str, sku: str) -> str:
         return f"{name.strip().lower()}:{sku.strip().lower()}"
 
-    def _already_in_db(name: str, sku: str) -> bool:
+    def _db_supplier_part(name: str, sku: str):
         if part is None:
-            return False
+            return None
         return SupplierPart.objects.filter(
             part=part,
             supplier__name__iexact=name.strip(),
             SKU__iexact=sku.strip(),
-        ).exists()
+        ).first()
+
+    def _already_in_db(name: str, sku: str) -> bool:
+        return _db_supplier_part(name, sku) is not None
 
     # ── Primary path: iterate raw_data['supplier_data'] (all API sources) ──
     supplier_data_list = data.raw_data.get("supplier_data", [])
@@ -450,12 +608,32 @@ def _get_supplier_entries(data: PartData, part=None) -> List[Dict]:
             )
             continue
 
-        if _already_in_db(name, sku):
-            logger.debug(f"  [{src}] Skipped – already in DB ({name}:{sku})")
+        existing_sp = _db_supplier_part(name, sku)
+        if existing_sp is not None:
             seen_keys.add(key)
+            # Gap fill: an existing supplier part without any price breaks
+            # gets this source's prices; otherwise it is left untouched.
+            if sd.get("price_breaks") and not existing_sp.pricebreaks.exists():
+                entries.append(
+                    {
+                        "name": name,
+                        "sku": sku,
+                        "url": sd.get("supplier_url", ""),
+                        "fill_prices": True,
+                        "price_breaks": [
+                            PriceBreak(
+                                quantity=pb["qty"],
+                                price=pb["price"],
+                                currency=pb.get("currency", "EUR"),
+                            )
+                            for pb in sd.get("price_breaks", [])
+                        ],
+                    }
+                )
+                logger.debug(f"  [{src}] Queued price-break fill ({name}:{sku})")
+            else:
+                logger.debug(f"  [{src}] Skipped – already in DB ({name}:{sku})")
             continue
-
-        from ..api_clients.base import PriceBreak
 
         pbs = [
             PriceBreak(
@@ -543,18 +721,17 @@ def _create_supplier_part(
                     f"Backfilled manufacturer_part on SupplierPart {existing.pk}"
                 )
 
-        # ── Update URL if changed ──
+        # ── Fill URL if missing (never overwrite) ──
         new_url = supplier_entry.get("url", "")
-        if new_url and existing.link != new_url:
+        if new_url and not existing.link:
             existing.link = new_url
             update_fields.append("link")
 
         if update_fields:
             existing.save(update_fields=update_fields)
 
-        # ── Refresh price breaks if new ones are provided ──
-        if new_price_breaks:
-            existing.pricebreaks.all().delete()
+        # ── Fill price breaks only if the supplier part has none ──
+        if new_price_breaks and not existing.pricebreaks.exists():
             for pb in new_price_breaks:
                 try:
                     SupplierPriceBreak.objects.create(
@@ -606,9 +783,9 @@ def _create_supplier_part(
             update_fields.append("manufacturer_part")
             logger.info(f"Backfilled manufacturer_part on SupplierPart {sup_part.pk}")
 
-        # Update URL if changed
+        # Fill URL if missing
         new_url = supplier_entry.get("url", "")
-        if new_url and sup_part.link != new_url:
+        if new_url and not sup_part.link:
             sup_part.link = new_url
             update_fields.append("link")
 
@@ -694,15 +871,47 @@ CORE_PARAMETER_TEMPLATES = [
 ]
 
 
-def _create_core_parameters(part, data: "PartData") -> None:
+def _write_parameter(part, part_type, template, value: str, source: str, ctx):
+    """Priority-aware write of one Parameter row (see provenance).
+
+    Returns True if the value was written.
+    """
+    from common.models import Parameter
+
+    value = str(value).strip()[:2000]
+    existing = Parameter.objects.filter(
+        model_type=part_type, model_id=part.pk, template=template
+    ).first()
+    current = existing.data if existing else ""
+    if existing and str(current).strip() == value:
+        return False
+    key = f"param:{template.name}"
+    if ctx is not None and not ctx.allowed(key, current, source):
+        return False
+    if ctx is None and existing and not is_useless_value(current):
+        return False  # no context: fill-only
+    if existing:
+        existing.data = value
+        existing.save()
+    else:
+        Parameter.objects.create(
+            model_type=part_type, model_id=part.pk, template=template, data=value
+        )
+    if ctx is not None:
+        ctx.wrote(key, source, value, template.name if ctx.is_update else "")
+    return True
+
+
+def _create_core_parameters(part, data: "PartData", ctx=None) -> None:
     """Store the guaranteed core distributor metadata as Part Parameters.
 
-    Uses find-or-create global ParameterTemplates and the same
-    non-destructive update_or_create pattern as _create_parameters().
-    Exempt from the LIMIT_PARAMETERS_TO_CATEGORY filter so these fields
-    are always written, even for categories without matching templates.
+    Uses find-or-create global ParameterTemplates and the priority-aware
+    _write_parameter (existing values are only replaced by a higher-priority
+    source, never when edited by hand). Exempt from the
+    LIMIT_PARAMETERS_TO_CATEGORY filter so these fields are always written,
+    even for categories without matching templates.
     """
-    from common.models import Parameter, ParameterTemplate
+    from common.models import ParameterTemplate
     from django.contrib.contenttypes.models import ContentType
 
     part_type = ContentType.objects.get_for_model(part)
@@ -716,13 +925,11 @@ def _create_core_parameters(part, data: "PartData") -> None:
                 name=template_name,
                 defaults={"units": ""},
             )
-            Parameter.objects.update_or_create(
-                model_type=part_type,
-                model_id=part.pk,
-                template=template,
-                defaults={"data": value[:2000]},
-            )
-            logger.debug(f"Core parameter {template_name}={value} for Part {part.pk}")
+            source = ctx.source_of(attr) if ctx is not None else ""
+            if _write_parameter(part, part_type, template, value, source, ctx):
+                logger.debug(
+                    f"Core parameter {template_name}={value} for Part {part.pk}"
+                )
         except Exception as e:
             logger.warning(f"Failed to write core parameter {template_name}: {e}")
 
@@ -731,6 +938,7 @@ def _create_parameters(
     part,
     parameters: List[Any],
     category_id: Optional[int] = None,
+    ctx=None,
 ) -> List[Dict]:
     """Create Parameter entries for the Part.
 
@@ -743,10 +951,9 @@ def _create_parameters(
     part's InvenTree category hierarchy are persisted. Parameters excluded
     solely by this rule are collected in the returned audit list.
 
-    User-managed parameters that already exist on the part are never deleted
-    or overwritten (``update_or_create`` only sets ``data`` on new rows;
-    existing user edits are preserved because we key on ``template`` and
-    only supply defaults, not forced updates).
+    Existing parameter values are never deleted. They are only replaced by
+    a higher-priority source than the one that wrote them, and never when
+    edited by hand (``_write_parameter`` / provenance.should_write).
 
     Returns:
         List of dropped-parameter audit dicts
@@ -813,6 +1020,7 @@ def _create_parameters(
                     "name": p.name,
                     "value": getattr(p, "value", ""),
                     "unit": getattr(p, "unit", ""),
+                    "source": getattr(p, "source", ""),
                 }
                 for p in distributor_params
             ]
@@ -839,6 +1047,7 @@ def _create_parameters(
                     name=d["name"],
                     value=d["value"],
                     unit=d.get("unit", ""),
+                    source=d.get("source", ""),
                 )
                 for d in filter_result.accepted_parameters
             ]
@@ -864,18 +1073,13 @@ def _create_parameters(
                 },
             )
 
-            # Create or update the parameter value for this part.
-            # update_or_create keys on (model_type, model_id, template) and only
-            # supplies "data" as a *default* — if the row already exists with a
-            # user-edited value, Django will NOT overwrite it because we use
-            # defaults (not forced kwargs).  This preserves manual user edits.
-            Parameter.objects.update_or_create(
-                model_type=part_type,
-                model_id=part.pk,
-                template=template,
-                defaults={"data": str(param.value).strip()[:2000]},
-            )
-            logger.debug(f"Parameter {param.name}={param.value} for Part {part.pk}")
+            # Priority-aware write (fill gaps; higher-priority sources may
+            # replace unedited values of lower-priority ones).
+            source = getattr(param, "source", "") or ""
+            if getattr(param, "manual", False):
+                source = ""
+            if _write_parameter(part, part_type, template, param.value, source, ctx):
+                logger.debug(f"Parameter {param.name}={param.value} for Part {part.pk}")
         except Exception as e:
             logger.warning(f"Failed to create parameter {param.name}: {e}")
 

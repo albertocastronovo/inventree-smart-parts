@@ -49,6 +49,7 @@ class PartParameter:
     value: str
     unit: str = ""
     manual: bool = False
+    source: str = ""  # distributor that supplied the value (set by the merger)
 
 
 @dataclass

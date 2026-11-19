@@ -360,7 +360,7 @@ def purescan_command_sheet(request):
 # ═══════════════════════════════════════════════════════════════════
 
 
-def _run_all_api_searches(plugin, mpn: str):
+def _run_all_api_searches(plugin, mpn: str, only=None):
     """
     Query all enabled distributor APIs for the given MPN.
 
@@ -373,14 +373,21 @@ def _run_all_api_searches(plugin, mpn: str):
 
     Enabled sources are driven entirely by plugin settings so no code change is
     needed here when new distributors are added to core.py.
+
+    ``only``: optional iterable of source names to restrict the query to
+    (e.g. {"mouser"} for a Mouser label gap-fill).
     """
     from .api_clients import MouserClient, DigiKeyClient, LCSCClient
 
     results: dict = {}
     api_results: list = []
+    only = {o.lower() for o in only} if only else None
+
+    def _wanted(source: str, setting: str) -> bool:
+        return bool(plugin.get_setting(setting)) and (only is None or source in only)
 
     # ── Mouser ──────────────────────────────────────────────────────
-    if plugin.get_setting("MOUSER_ENABLED"):
+    if _wanted("mouser", "MOUSER_ENABLED"):
         try:
             client = MouserClient(api_key=plugin.get_setting("MOUSER_API_KEY"))
             r = client.search_by_mpn(mpn)
@@ -394,7 +401,7 @@ def _run_all_api_searches(plugin, mpn: str):
             logger.warning(f"Mouser search error: {e}")
 
     # ── DigiKey ─────────────────────────────────────────────────────
-    if plugin.get_setting("DIGIKEY_ENABLED"):
+    if _wanted("digikey", "DIGIKEY_ENABLED"):
         try:
             client = DigiKeyClient(
                 client_id=plugin.get_setting("DIGIKEY_CLIENT_ID"),
@@ -411,7 +418,7 @@ def _run_all_api_searches(plugin, mpn: str):
             logger.warning(f"DigiKey search error: {e}")
 
     # ── LCSC ────────────────────────────────────────────────────────
-    if plugin.get_setting("LCSC_ENABLED"):
+    if _wanted("lcsc", "LCSC_ENABLED"):
         try:
             client = LCSCClient()
             r = client.search_by_mpn(mpn)
@@ -425,7 +432,7 @@ def _run_all_api_searches(plugin, mpn: str):
             logger.warning(f"LCSC search error: {e}")
 
     # ── element14 / Farnell ─────────────────────────────────────────
-    if plugin.get_setting("ELEMENT14_ENABLED"):
+    if _wanted("element14", "ELEMENT14_ENABLED"):
         try:
             from .api_clients import Element14Client
 
@@ -444,7 +451,7 @@ def _run_all_api_searches(plugin, mpn: str):
             logger.warning(f"element14 search error: {e}")
 
     # ── TME ─────────────────────────────────────────────────────────
-    if plugin.get_setting("TME_ENABLED"):
+    if _wanted("tme", "TME_ENABLED"):
         try:
             from .api_clients import TMEClient
 
@@ -465,6 +472,99 @@ def _run_all_api_searches(plugin, mpn: str):
             logger.warning(f"TME search error: {e}")
 
     return api_results, results
+
+
+# Supplier company names used by the API clients (PartData.supplier_name)
+DISTRIBUTOR_SUPPLIER_NAMES = {"mouser": "Mouser", "digikey": "DigiKey"}
+DISTRIBUTOR_ENABLE_SETTINGS = {"mouser": "MOUSER_ENABLED", "digikey": "DIGIKEY_ENABLED"}
+
+
+def _resolve_category(plugin, merged, default_threshold: int = 65):
+    """Category resolution for merged distributor data (settings-driven).
+
+    Flat leaf categories (Mouser) are only fuzzy-matched / defaulted, never
+    auto-created. Returns (cat_id, cat_path, score, created).
+    """
+    from .services.category_mapper import resolve_category_for_source
+
+    source = (merged.raw_data or {}).get("field_sources", {}).get("category", "")
+    return resolve_category_for_source(
+        merged.category, plugin, source=source, default_threshold=default_threshold
+    )
+
+
+def _has_distributor_supplier_part(part, distributor: str) -> bool:
+    """True if ``part`` already has a SupplierPart from that distributor."""
+    name = DISTRIBUTOR_SUPPLIER_NAMES.get((distributor or "").lower())
+    if not name or part is None:
+        return False
+    from company.models import SupplierPart
+
+    return SupplierPart.objects.filter(part=part, supplier__name__iexact=name).exists()
+
+
+def _enrich_existing_part(plugin, part, mpn: str, only=None) -> dict:
+    """Fill the gaps of an existing part from distributor data.
+
+    Priority-aware (see services/provenance.py): empty fields are filled,
+    values written by a lower-priority source are replaced by a higher one,
+    manual edits and legacy values are never touched. Missing supplier
+    parts (with their price breaks) are added.
+
+    Returns {"success", "filled", "message", "errors"}.
+    """
+    from .services.data_merger import merge_part_data, get_priority_order
+    from .services.part_creator import create_part_from_data
+    from .services import provenance
+
+    api_results, _ = _run_all_api_searches(plugin, mpn, only=only)
+    priority_order = get_priority_order(plugin)
+    merged = merge_part_data(api_results, priority_order, search_term=mpn, strict=True)
+    if not merged:
+        return {
+            "success": True,
+            "filled": [],
+            "message": "No distributor returned the exact MPN - nothing to fill",
+            "errors": [],
+        }
+
+    # Resolve the category only if it may be written: resolution can
+    # auto-create categories and learn mappings (side effects).
+    category_id = None
+    if merged.category:
+        prov = provenance.load(part)
+        cat_src = merged.raw_data.get("field_sources", {}).get("category", "")
+        current = str(part.category_id) if part.category_id else ""
+        if provenance.should_write(
+            provenance.entry(prov, "category"), current, cat_src, priority_order
+        ):
+            try:
+                category_id, _p, _s, _c = _resolve_category(
+                    plugin, merged, default_threshold=45
+                )
+            except Exception as e:
+                logger.warning(f"[PureScan] gap-fill category mapping failed: {e}")
+
+    creation = create_part_from_data(
+        part_data=merged,
+        category_id=category_id,
+        update_existing=True,
+        existing_part_id=part.pk,
+        auto_create_companies=bool(plugin.get_setting("AUTO_CREATE_MANUFACTURERS")),
+        priority_order=priority_order,
+    )
+    _log_activity(
+        "INFO" if creation.success else "ERROR",
+        f"[PureScan] gap-fill '{part.name}' "
+        f"({','.join(sorted(only)) if only else 'all sources'})",
+        creation.message,
+    )
+    return {
+        "success": creation.success,
+        "filled": creation.filled,
+        "message": creation.message,
+        "errors": creation.errors,
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -500,18 +600,14 @@ def api_search(request):
 
     from .services.data_merger import merge_part_data
     from .services.duplicate_checker import check_duplicate
-    from .services.category_mapper import (
-        get_all_categories_for_ui,
-        resolve_category_with_autocreate,
-    )
+    from .services.category_mapper import get_all_categories_for_ui
 
     api_results, results = _run_all_api_searches(plugin, mpn)
 
     # Merge
-    priority_str = (
-        plugin.get_setting("API_PRIORITY") or "mouser,digikey,element14,tme,lcsc"
-    )
-    priority_order = [p.strip() for p in priority_str.split(",") if p.strip()]
+    from .services.data_merger import get_priority_order
+
+    priority_order = get_priority_order(plugin)
     # GUI: not strict (the user reviews the result), but only same-MPN
     # results are merged; mismatching sources are flagged for the editor.
     merged = merge_part_data(api_results, priority_order, search_term=mpn)
@@ -529,19 +625,8 @@ def api_search(request):
     # Category mapping
     category_match = None
     if merged and merged.category:
-        threshold = plugin.get_setting("FUZZY_THRESHOLD") or 65
-        default_cat = plugin.get_setting("DEFAULT_CATEGORY") or ""
-        user_synonyms = plugin.get_setting("CATEGORY_SYNONYMS") or "{}"
-        learned_mappings = plugin.get_setting("LEARNED_CATEGORY_MAPPINGS") or "{}"
-        auto_create = plugin.get_setting("AUTO_CREATE_CATEGORIES")
-        cat_id, cat_path, score, _cat_created = resolve_category_with_autocreate(
-            merged.category,
-            threshold,
-            default_cat,
-            user_synonyms_json=user_synonyms,
-            learned_mappings_json=learned_mappings,
-            plugin=plugin,
-            auto_create=auto_create,
+        cat_id, cat_path, score, _cat_created = _resolve_category(
+            plugin, merged, default_threshold=65
         )
         category_match = {
             "id": cat_id,
@@ -2047,18 +2132,60 @@ def purescan_createpart(request):
             status=400,
         )
 
+    # enrich_scope: "all" (default, SYS:CREATEPART) queries every enabled
+    # distributor; "label" (FASTADD) only the distributor the label came from,
+    # and only if the part has no supplier part from it yet.
+    enrich_scope = str(body.get("enrich_scope", "all") or "all").lower()
+
+    def _exists_response(part, query_mpn):
+        resp = {
+            "success": False,
+            "already_exists": True,
+            "part_id": part.pk,
+            "part_name": part.name,
+            "part_ipn": getattr(part, "IPN", "") or "",
+            "message": f"Part already exists: {part.name}",
+            "enriched": [],
+        }
+        plugin_ = _get_plugin()
+        if not plugin_ or not query_mpn:
+            return JsonResponse(resp)
+        only = None
+        if enrich_scope == "label":
+            dist = (parsed.distributor or "").lower()
+            setting = DISTRIBUTOR_ENABLE_SETTINGS.get(dist)
+            if (
+                not setting
+                or not plugin_.get_setting(setting)
+                or _has_distributor_supplier_part(part, dist)
+            ):
+                return JsonResponse(resp)
+            only = {dist}
+        try:
+            enr = _enrich_existing_part(plugin_, part, query_mpn, only=only)
+            resp["enriched"] = enr["filled"]
+            if enr["errors"]:
+                resp["enrich_errors"] = enr["errors"]
+            if enr["filled"]:
+                resp["message"] += f" - filled: {', '.join(enr['filled'])}"
+            else:
+                resp["message"] += " - nothing to fill"
+        except Exception as e:
+            logger.warning(f"[PureScan] gap-fill failed for '{part.name}': {e}")
+            resp["enrich_errors"] = [str(e)]
+        return JsonResponse(resp)
+
     existing = _lookup_part_by_mpn_sku(mpn, sku)
     if existing is not None:
-        return JsonResponse(
-            {
-                "success": False,
-                "already_exists": True,
-                "part_id": existing.pk,
-                "part_name": existing.name,
-                "part_ipn": getattr(existing, "IPN", "") or "",
-                "message": f"Part already exists: {existing.name}",
-            }
-        )
+        # Use the MPN stored on the part when the label only had a SKU
+        query = mpn
+        if not query:
+            try:
+                mp = existing.manufacturer_parts.first()
+                query = mp.MPN if mp else ""
+            except Exception:
+                query = ""
+        return _exists_response(existing, query)
 
     if not mpn:
         return JsonResponse(
@@ -2095,10 +2222,9 @@ def purescan_createpart(request):
     from .services.data_merger import merge_part_data
     from .services.duplicate_checker import check_duplicate
 
-    priority_str = (
-        plugin.get_setting("API_PRIORITY") or "mouser,digikey,element14,tme,lcsc"
-    )
-    priority_order = [p.strip() for p in priority_str.split(",") if p.strip()]
+    from .services.data_merger import get_priority_order
+
+    priority_order = get_priority_order(plugin)
     # Strict MPN identity: only distributor hits whose MPN (or SKU) exactly
     # matches the label are used — a different MPN is a different part.
     merged = merge_part_data(api_results, priority_order, search_term=mpn, strict=True)
@@ -2117,6 +2243,11 @@ def purescan_createpart(request):
 
     dup = check_duplicate(merged.mpn, merged.manufacturer)
     if dup.is_duplicate and dup.existing_part_id:
+        from part.models import Part
+
+        dup_part = Part.objects.filter(pk=dup.existing_part_id).first()
+        if dup_part is not None:
+            return _exists_response(dup_part, merged.mpn)
         return JsonResponse(
             {
                 "success": False,
@@ -2132,26 +2263,12 @@ def purescan_createpart(request):
     category_created = False
     if merged.category:
         try:
-            from .services.category_mapper import resolve_category_with_autocreate
-
-            threshold = plugin.get_setting("FUZZY_THRESHOLD") or 45
-            default_cat = plugin.get_setting("DEFAULT_CATEGORY") or ""
-            user_synonyms = plugin.get_setting("CATEGORY_SYNONYMS") or "{}"
-            learned = plugin.get_setting("LEARNED_CATEGORY_MAPPINGS") or "{}"
             (
                 category_id,
                 category_path,
                 _score,
                 category_created,
-            ) = resolve_category_with_autocreate(
-                merged.category,
-                threshold,
-                default_cat,
-                user_synonyms_json=user_synonyms,
-                learned_mappings_json=learned,
-                plugin=plugin,
-                auto_create=plugin.get_setting("AUTO_CREATE_CATEGORIES"),
-            )
+            ) = _resolve_category(plugin, merged, default_threshold=45)
         except Exception as e:
             logger.warning(f"[PureScan] CREATEPART category mapping failed: {e}")
 
@@ -2522,29 +2639,16 @@ def api_v1_import(request):
     # ── Merge ───────────────────────────────────────────────────────
     from .services.data_merger import merge_part_data
 
-    priority_str = (
-        plugin.get_setting("API_PRIORITY") or "mouser,digikey,element14,tme,lcsc"
-    )
-    priority_order = [p.strip() for p in priority_str.split(",") if p.strip()]
+    from .services.data_merger import get_priority_order
+
+    priority_order = get_priority_order(plugin)
     merged = merge_part_data(api_results, priority_order, search_term=mpn, strict=True)
 
     # Category mapping ------------------------------------------------------
     category_match = None
     if merged and merged.category:
-        from .services.category_mapper import resolve_category_with_autocreate
-
-        threshold = plugin.get_setting("FUZZY_THRESHOLD") or 65
-        default_cat = plugin.get_setting("DEFAULT_CATEGORY") or ""
-        user_synonyms = plugin.get_setting("CATEGORY_SYNONYMS") or "{}"
-        learned_mappings = plugin.get_setting("LEARNED_CATEGORY_MAPPINGS") or "{}"
-        cat_id, cat_path, score, _cat_created = resolve_category_with_autocreate(
-            merged.category,
-            threshold,
-            default_cat,
-            user_synonyms_json=user_synonyms,
-            learned_mappings_json=learned_mappings,
-            plugin=plugin,
-            auto_create=plugin.get_setting("AUTO_CREATE_CATEGORIES"),
+        cat_id, cat_path, score, _cat_created = _resolve_category(
+            plugin, merged, default_threshold=65
         )
         category_match = {
             "id": cat_id,
@@ -3261,6 +3365,13 @@ def api_barcode_lookup(request):
             if hasattr(part, "get_absolute_url")
             else f"/web/part/{part.pk}"
         )
+        distributor = parsed.distributor if parsed else None
+        dist_sp = None
+        if distributor:
+            try:
+                dist_sp = _has_distributor_supplier_part(part, distributor)
+            except Exception as exc:
+                logger.debug(f"SmartParts: supplier-part check failed: {exc}")
         return JsonResponse(
             {
                 "found": True,
@@ -3269,7 +3380,10 @@ def api_barcode_lookup(request):
                 "part_ipn": getattr(part, "IPN", "") or "",
                 "part_url": url,
                 "mpn": mpn or part.name,
-                "distributor": parsed.distributor if parsed else None,
+                "distributor": distributor,
+                # False -> the label's distributor has no supplier part on this
+                # part yet (PureScan FASTADD then runs a one-time gap-fill)
+                "distributor_supplier_part": dist_sp,
                 "barcode_data": parsed.to_dict() if parsed else None,
             }
         )
