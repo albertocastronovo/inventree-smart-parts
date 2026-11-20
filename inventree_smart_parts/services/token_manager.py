@@ -45,11 +45,55 @@ def is_valid_token(token: str) -> bool:
 
 
 def hash_token(token: str) -> str:
-    """SHA-256 hex digest of the token — matches InvenTree's hash_barcode()."""
+    """Use the host's current barcode hashing rules."""
+    from InvenTree.helpers import hash_barcode
+
+    return hash_barcode(normalize_token(token))
+
+
+def legacy_hash_token(token: str) -> str:
+    """Hash written by earlier SmartParts releases."""
     return hashlib.sha256(normalize_token(token).encode()).hexdigest()
 
 
-def _barcode_field_name(model) -> Optional[str]:
+def stock_token(token: str) -> str:
+    """Normalize a stock-only token, or raise a validation error."""
+    if not isinstance(token, str):
+        raise ValueError("Stock barcode must match STOCK_XXXX")
+    token = normalize_token(token)
+    if not TOKEN_PATTERNS["STOCK"].fullmatch(token):
+        raise ValueError("Stock barcode must match STOCK_XXXX")
+    return token
+
+
+class TokenConflict(ValueError):
+    """The requested token is already bound."""
+
+
+def lock_token(token: str):
+    """Serialize SmartParts claims for the same token inside a transaction."""
+    from django.db import connection
+
+    if connection.vendor == "postgresql":
+        # The token space fits in a signed integer; use a separate namespace.
+        namespace = 0x53505349 if token.startswith("STOCK_") else 0x53504C4F
+        with connection.cursor() as cursor:
+            cursor.execute(
+                "SELECT pg_advisory_xact_lock(%s, %s)",
+                [namespace, int(token.rsplit("_", 1)[1], 36)],
+            )
+
+
+def require_free_token(token: str):
+    """Check native barcode models and legacy SmartParts bindings."""
+    kind, bound = resolve_token(token)
+    if kind == "ambiguous":
+        raise TokenConflict(f"{token} has conflicting bindings")
+    if bound is not None:
+        raise TokenConflict(f"{token} is already linked to a {kind}")
+
+
+def barcode_field_name(model) -> Optional[str]:
     """Return the name of the custom-barcode field on ``model``, if any."""
     try:
         field_names = {f.name for f in model._meta.get_fields()}
@@ -61,25 +105,6 @@ def _barcode_field_name(model) -> Optional[str]:
     return None
 
 
-def _lookup_by_field(model, token: str):
-    fname = _barcode_field_name(model)
-    if not fname:
-        return None
-    try:
-        return model.objects.filter(**{f"{fname}__iexact": token}).first()
-    except Exception as e:
-        logger.warning(f"token lookup by field failed on {model.__name__}: {e}")
-        return None
-
-
-def _lookup_by_hash(model, token: str):
-    """Fallback lookup via barcode_hash (versions that store only the hash)."""
-    try:
-        return model.objects.filter(barcode_hash=hash_token(token)).first()
-    except Exception:
-        return None
-
-
 def resolve_token(token: str) -> Tuple[Optional[str], Optional[object]]:
     """
     Resolve a token to the InvenTree object it is bound to.
@@ -87,23 +112,39 @@ def resolve_token(token: str) -> Tuple[Optional[str], Optional[object]]:
     Returns:
         (model_name, obj)   e.g. ("stockitem", <StockItem #722>)
         ("free", None)      the token is valid but not bound to anything
+        ("ambiguous", None) multiple records of the matching type use it
         (None, None)        the string is not a valid token at all
     """
     t = normalize_token(token)
     if not is_valid_token(t):
         return (None, None)
 
-    from stock.models import StockItem, StockLocation
+    from django.db.models import Q
     from part.models import Part
+    from stock.models import StockItem, StockLocation
 
-    for name, model in (
+    models = (
         ("stockitem", StockItem),
         ("stocklocation", StockLocation),
         ("part", Part),
-    ):
-        obj = _lookup_by_field(model, t) or _lookup_by_hash(model, t)
-        if obj is not None:
-            return (name, obj)
+    )
+    try:
+        from plugin.base.barcodes.helper import get_supported_barcode_models_map
+    except ImportError:
+        pass
+    else:
+        models = tuple({**dict(models), **get_supported_barcode_models_map()}.items())
+
+    hashes = (hash_token(t), legacy_hash_token(t))
+    for name, model in models:
+        matches = Q(barcode_hash__in=hashes)
+        if field := barcode_field_name(model):
+            matches |= Q(**{f"{field}__iexact": t})
+        options = list(model.objects.filter(matches).order_by("pk")[:2])
+        if len(options) > 1:
+            return ("ambiguous", None)
+        if options:
+            return (name, options[0])
 
     return ("free", None)
 
@@ -127,7 +168,7 @@ def describe_object(kind: Optional[str], obj) -> str:
     return str(obj)
 
 
-def bind_token(token: str, obj) -> dict:
+def bind_token(token: str, obj, *, save: bool = True) -> dict:
     """
     Bind a token to an InvenTree object (StockItem / StockLocation / Part).
 
@@ -141,7 +182,11 @@ def bind_token(token: str, obj) -> dict:
     if not is_valid_token(t):
         return {"success": False, "error": f"Invalid token format: {t}"}
 
-    fname = _barcode_field_name(type(obj))
+    if hasattr(obj, "assign_barcode"):
+        obj.assign_barcode(barcode_data=t, save=save)
+        return {"success": True, "token": t}
+
+    fname = barcode_field_name(type(obj))
     if not fname:
         return {
             "success": False,
@@ -155,16 +200,12 @@ def bind_token(token: str, obj) -> dict:
 
     update_fields = [fname]
 
-    # Keep barcode_hash in sync so native barcode lookups resolve the token
-    try:
-        if hasattr(obj, "generate_barcode_hash"):
-            obj.generate_barcode_hash()
-        else:
-            obj.barcode_hash = hash_token(t)
-        if "barcode_hash" in {f.name for f in type(obj)._meta.get_fields()}:
-            update_fields.append("barcode_hash")
-    except Exception as e:
-        logger.warning(f"bind_token: could not update barcode_hash for {t}: {e}")
+    obj.barcode_hash = hash_token(t)
+    if "barcode_hash" in {f.name for f in type(obj)._meta.get_fields()}:
+        update_fields.append("barcode_hash")
+
+    if not save:
+        return {"success": True, "token": t}
 
     try:
         obj.save(update_fields=update_fields)

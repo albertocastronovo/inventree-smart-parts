@@ -604,6 +604,12 @@
       e._handledBySmartParts = true;
     } catch (_) {}
 
+    if (document.activeElement?.hasAttribute('data-sp-direct-scan')) {
+      _buffer = '';
+      _times = [];
+      return;
+    }
+
     const now   = Date.now();
     const delta = now - _lastTime;
     _lastTime   = now;

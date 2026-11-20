@@ -31,6 +31,7 @@ sys.modules.setdefault("plugin.registry", _registry_mod)
 
 from inventree_smart_parts.api_clients.base import PartData  # noqa: E402
 from inventree_smart_parts.api_clients.digikey import DigiKeyClient  # noqa: E402
+from inventree_smart_parts.api_clients.mouser import MouserClient  # noqa: E402
 from inventree_smart_parts.services.barcode_decoder import parse_barcode  # noqa: E402
 from inventree_smart_parts.services.data_merger import merge_part_data  # noqa: E402
 
@@ -191,6 +192,32 @@ class DigiKeyParseTests(unittest.TestCase):
         self.client._request = lambda *a, **k: {"Products": [other, v4_product()]}
         pd = self.client.search_by_mpn("296-1234-1-nd")
         self.assertEqual(pd.mpn, "SN74HC00N")
+
+    def test_pricing_uses_reported_search_currency_when_tier_omits_it(self):
+        product = v4_product()
+        for variant in product["ProductVariations"]:
+            for tier in variant["StandardPricing"]:
+                tier.pop("Currency", None)
+        self.client._get_auth_headers = lambda: {}
+        self.client._request = lambda *a, **k: {
+            "Products": [product], "SearchLocaleUsed": {"Currency": "EUR"},
+        }
+        pd = self.client.search_by_mpn("296-1234-1-nd")
+        self.assertEqual([tier.currency for tier in pd.price_breaks], ["EUR"])
+
+
+class MouserPricingTests(unittest.TestCase):
+    def test_preserves_reported_currencies_and_recognizes_missing_usd_code(self):
+        parsed = MouserClient(api_key="key")._parse_part({
+            "ManufacturerPartNumber": "R-10K",
+            "PriceBreaks": [
+                {"Quantity": 1, "Price": "$0.0123"},
+                {"Quantity": 10, "Price": "€0,009", "Currency": "EUR"},
+                {"Quantity": 100, "Price": "CA$0.007"},
+            ],
+        }, "R-10K")
+        self.assertEqual([(p.currency, p.price) for p in parsed.price_breaks],
+                         [("USD", 0.0123), ("EUR", 0.009), ("CAD", 0.007)])
 
 
 class MergeIdentityTests(unittest.TestCase):

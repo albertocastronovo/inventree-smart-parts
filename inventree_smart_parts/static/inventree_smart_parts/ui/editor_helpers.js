@@ -148,6 +148,7 @@ function buildInitialSuppliers(searchData, existingData) {
       supplier_sku:  sku,
       supplier_url:  s.supplier_url  || '',
       price_breaks:  s.price_breaks  || [],
+      pricing_warnings: s.pricing_warnings || [],
       _skuMissing:   skuMissing,
     });
   });
@@ -176,8 +177,8 @@ function buildInitialSuppliers(searchData, existingData) {
 
 function buildPriceRow(pb) {
   return `<tr>
-    <td><input type="number" class="sp-price-input" value="${escHtml(pb.quantity)}" min="1" style="width:60px"></td>
-    <td><input type="number" class="sp-price-input" value="${escHtml(pb.price)}" step="0.0001" style="width:80px"></td>
+    <td><input type="number" class="sp-price-input" value="${escHtml(pb.quantity)}" min="1" step="0.00001" style="width:70px"></td>
+    <td><input type="number" class="sp-price-input" value="${escHtml(pb.price)}" step="0.000001" min="0" style="width:100px"></td>
     <td><input type="text" class="sp-price-input" value="${escHtml(pb.currency||'EUR')}" style="width:50px"></td>
     <td><button type="button" class="sp-del-btn" onclick="delPbRow(this)">×</button></td>
   </tr>`;
@@ -424,7 +425,7 @@ function buildReceiveStockSection(defaultQty) {
             <label for="stockQty">Quantity</label>
             <div class="sp-input-wrap">
               <input type="number" id="stockQty" class="sp-input" value="${Math.max(1, Math.round(defaultQty || 1))}"
-                     min="1" step="1" placeholder="1"
+                      min="0.00001" step="0.00001" placeholder="1"
                      style="-moz-appearance:textfield">
             </div>
           </div>
@@ -442,6 +443,12 @@ function buildReceiveStockSection(defaultQty) {
               <option value="">⏳ Loading locations…</option>
             </select>
           </div>
+        </div>
+        <div class="sp-field" style="margin-top:.5rem">
+          <label for="stockToken">Stock barcode / QR code (optional)</label>
+          <input type="text" id="stockToken" class="sp-input" placeholder="STOCK_XXXX"
+                 autocomplete="off" spellcheck="false" data-sp-direct-scan
+                 onkeydown="if (event.key === 'Enter') event.preventDefault()">
         </div>
         <div style="margin-top:.5rem">
           <label style="display:flex;align-items:center;gap:.5rem;cursor:pointer;font-size:.85rem">

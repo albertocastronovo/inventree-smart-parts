@@ -7,9 +7,51 @@ at plugin load time without a fully-initialised Django environment.
 """
 
 import logging
-from typing import Optional
+from decimal import Decimal, InvalidOperation
+from typing import Optional, Union
 
 logger = logging.getLogger("inventree_smart_parts.services.stock")
+
+
+def get_part_stock_summary(part_id: int, location_id: Optional[int] = None) -> dict:
+    """Summarize physical in-stock quantities for one part (no variants)."""
+    from django.db.models import Q, Sum
+    from stock.models import StockItem, StockLocation
+
+    from .token_manager import TOKEN_PATTERNS, barcode_field_name
+
+    entries = StockItem.objects.filter(StockItem.IN_STOCK_FILTER, part_id=part_id)
+    aggregations = {"total": Sum("quantity")}
+    has_location = (
+        location_id is not None
+        and StockLocation.objects.filter(pk=location_id).exists()
+    )
+    if has_location:
+        aggregations["local"] = Sum("quantity", filter=Q(location_id=location_id))
+    quantities = entries.aggregate(**aggregations)
+
+    def display(quantity):
+        value = format(quantity or 0, "f")
+        return value.rstrip("0").rstrip(".") if "." in value else value
+
+    labels = []
+    field = barcode_field_name(StockItem)
+    if has_location and quantities["local"] and field:
+        labels = list(
+            entries.filter(
+                location_id=location_id,
+                **{f"{field}__regex": TOKEN_PATTERNS["STOCK"].pattern},
+            )
+            .order_by(field)
+            .values_list(field, flat=True)
+            .distinct()[:4]
+        )
+    return {
+        "total_stock": display(quantities["total"]),
+        "location_stock": display(quantities["local"]) if has_location else None,
+        "stock_labels": labels[:3],
+        "more_labels": len(labels) > 3,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -19,11 +61,12 @@ logger = logging.getLogger("inventree_smart_parts.services.stock")
 
 def create_stock_item(
     part_id: int,
-    quantity: float,
+    quantity: Union[Decimal, int, float, str],
     location_id: Optional[int] = None,
     batch: str = "",
     delete_on_deplete: bool = True,
     user=None,
+    token: str = "",
 ) -> dict:
     """
     Create a new StockItem for the given Part.
@@ -34,14 +77,30 @@ def create_stock_item(
               booked the stock rather than "No user".
 
     Returns a dict with keys:
-        success (bool), stock_id (int|None), message (str)
+        success (bool), stock_id (int|None), message (str), and a token or error status.
     """
-    try:
-        from stock.models import StockItem
-        from stock.status_codes import StockHistoryCode
-        from part.models import Part
+    from django.core.exceptions import ValidationError
+    from django.db import transaction
 
-        part = Part.objects.get(pk=part_id)
+    from .token_manager import (
+        TokenConflict,
+        bind_token,
+        lock_token,
+        require_free_token,
+        stock_token,
+    )
+
+    try:
+        from part.models import Part
+        from stock.models import StockItem
+
+        quantity = Decimal(str(quantity))
+        if not quantity.is_finite() or quantity <= 0:
+            raise ValueError("Quantity must be a positive number")
+        normalized = stock_token(token) if token != "" else ""
+        part = Part.objects.filter(pk=part_id).first()
+        if part is None:
+            raise ValueError("Part not found")
 
         kwargs = {
             "part": part,
@@ -49,27 +108,87 @@ def create_stock_item(
             "delete_on_deplete": delete_on_deplete,
         }
 
-        if location_id:
+        if location_id is not None and location_id != "":
             from stock.models import StockLocation
 
-            try:
-                kwargs["location"] = StockLocation.objects.get(pk=location_id)
-            except StockLocation.DoesNotExist:
-                logger.warning(
-                    f"StockLocation {location_id} not found – creating without location"
-                )
+            location = StockLocation.objects.filter(pk=location_id).first()
+            if location is None:
+                raise ValueError("Stock location not found")
+            if getattr(location, "structural", False):
+                raise ValueError("Select a non-structural stock location")
+            if (
+                user is not None
+                and hasattr(location, "check_ownership")
+                and not location.check_ownership(user)
+            ):
+                return {
+                    "success": False,
+                    "stock_id": None,
+                    "message": "Stock location is not editable by this user",
+                    "status": 403,
+                }
+            kwargs["location"] = location
 
+        if batch and not isinstance(batch, str):
+            raise ValueError("Invalid stock batch")
         if batch:
             kwargs["batch"] = batch[:100]
 
-        stock_item = StockItem.objects.create(**kwargs)
+        with transaction.atomic():
+            if normalized:
+                lock_token(normalized)
+                require_free_token(normalized)
+            stock_item = StockItem(**kwargs)
+            if normalized:
+                binding = bind_token(normalized, stock_item, save=False)
+                if not binding["success"]:
+                    raise ValueError(binding["error"])
+            stock_item.full_clean()
+            if hasattr(stock_item, "tracking_event"):
+                stock_item.save(user=user, notes="Created via Smart Parts plugin")
+            else:
+                stock_item.save()
+                _attribute_legacy_creation(stock_item, quantity, kwargs, user)
 
-        # InvenTree's post_save signal fires inside .create() and automatically
-        # inserts a CREATED tracking entry with user=None.  We fix that entry
-        # in-place instead of appending a second one (which caused the duplicate).
-        try:
-            from stock.models import StockItemTracking
+        logger.info(
+            f'Created StockItem {stock_item.pk} for Part {part_id} (qty={quantity}, user={getattr(user, "username", "anon")})'
+        )
+        message = f"Stock item created (ID {stock_item.pk})"
+        if normalized:
+            message += f" and linked to {normalized}"
+        return {
+            "success": True,
+            "stock_id": stock_item.pk,
+            "message": message,
+            "token": normalized or None,
+        }
+    except TokenConflict as e:
+        return {"success": False, "stock_id": None, "message": str(e), "status": 409}
+    except (InvalidOperation, ValueError, ValidationError) as e:
+        message = (
+            "Quantity must be a positive number"
+            if isinstance(e, InvalidOperation)
+            else str(e)
+        )
+        return {"success": False, "stock_id": None, "message": message, "status": 400}
+    except Exception:
+        logger.exception("Failed to receive stock for part %s", part_id)
+        return {
+            "success": False,
+            "stock_id": None,
+            "message": "Could not receive stock",
+            "status": 500,
+        }
 
+
+def _attribute_legacy_creation(stock_item, quantity, kwargs, user):
+    """Older InvenTree releases do not accept a user on StockItem.save()."""
+    try:
+        from django.db import transaction
+        from stock.models import StockItemTracking
+        from stock.status_codes import StockHistoryCode
+
+        with transaction.atomic():
             auto_entry = (
                 StockItemTracking.objects.filter(
                     item=stock_item, tracking_type=StockHistoryCode.CREATED
@@ -95,26 +214,8 @@ def create_stock_item(
                     deltas=deltas,
                     notes="Created via Smart Parts plugin",
                 )
-        except Exception as te:
-            # Non-fatal – the stock item is created; just log the tracking failure
-            logger.warning(
-                f"Could not update tracking entry for StockItem {stock_item.pk}: {te}"
-            )
-
-        logger.info(
-            f'Created StockItem {stock_item.pk} for Part {part_id} (qty={quantity}, user={getattr(user, "username", "anon")})'
-        )
-        return {
-            "success": True,
-            "stock_id": stock_item.pk,
-            "message": f"Stock item created (ID {stock_item.pk})",
-        }
-
-    except Exception as e:
-        logger.error(
-            f"Failed to create StockItem for Part {part_id}: {e}", exc_info=True
-        )
-        return {"success": False, "stock_id": None, "message": str(e)}
+    except Exception as te:
+        logger.warning("Could not attribute stock creation for %s: %s", stock_item.pk, te)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -276,13 +377,12 @@ def print_stock_label(
         }
 
     # ── Resolve the print plugin ──────────────────────────────────────────
-    resolved_key = _resolve_print_plugin_key(plugin_slug)
-
     # ── Strategy 1: Direct template.print() ───────────────────────────────
     try:
         from report.models import LabelTemplate
 
-        template = LabelTemplate.objects.get(pk=template_id)
+        template = LabelTemplate.objects.get(pk=template_id, enabled=True, model_type="stockitem")
+        resolved_key = _resolve_print_plugin_key(plugin_slug)
 
         from plugin.registry import registry as plugin_registry
 
@@ -316,6 +416,7 @@ def print_stock_label(
             items=[stock_item],
             plugin=output_plugin,
             options=options,
+            user=getattr(request, "user", None),
             request=request,
         )
         logger.info(

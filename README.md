@@ -120,9 +120,15 @@ PureScan natively resolves **all InvenTree barcode formats** — no specific Inv
 | `SYS:ADD` | **Add Stock** | Increments quantity of the scanned stock item. |
 | `SYS:REMOVE` | **Remove Stock** | Decrements quantity (with automatic negative depletion safeguards). |
 | `SYS:STOCKTAKE` | **Stocktake** | Overwrites the current count with the exact physical count scanned. |
-| `SYS:INFO` | **Lookup Info** | Displays full stock details, location tree, part specifications, and image. |
+| `SYS:INFO` | **Lookup Info** | A distributor DataMatrix shows total stock for the part and stock in the exact `SYS:LAST` location, with up to three linked stock labels. Other labels show the corresponding item, location, or part details. |
+| `SYS:LAST` | **Set Default Location** | Saves a location for the current terminal. |
+| `SYS:FASTADD` | **Fast Receive** | After a successful receive or merge, scan the next reel's DataMatrix within 30 seconds to continue without rescanning the command. |
 | `SYS:UNDO` | **Undo Last** | Reverts the immediately preceding transaction (e.g., in case of a scanning mistake). |
 | `SYS:CANCEL` | **Reset Terminal** | Immediately aborts the current transaction and resets to the idle scanning state. |
+
+When creating a part from the dashboard, enable **Receive Stock** and scan or type a free `STOCK_XXXX` label in the optional **Stock barcode / QR code** field. The label is linked when stock is received.
+
+SmartParts converts USD supplier prices using InvenTree's USD/EUR exchange rates. See the [InvenTree 1.7.3 operator guide](docs/inventree-1.7.3-workflows.md) for refreshing rates, previewing the conversion of existing supplier prices, and repairing legacy barcode hashes.
 
 ---
 

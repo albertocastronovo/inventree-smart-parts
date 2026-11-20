@@ -120,7 +120,7 @@ class DigiKeyClient(BaseApiClient):
         if best is None:
             best = candidates[0]
 
-        return self._parse_part(best, mpn)
+        return self._parse_part(best, mpn, self._response_currency(data))
 
     def get_product_details(self, dkpn: str) -> Optional[PartData]:
         """
@@ -153,7 +153,14 @@ class DigiKeyClient(BaseApiClient):
             logger.info(f"[DigiKey] No details found for: {dkpn}")
             return None
 
-        return self._parse_part(product, dkpn)
+        return self._parse_part(product, dkpn, self._response_currency(data))
+
+    @staticmethod
+    def _response_currency(data):
+        locale = data.get("SearchLocaleUsed") or data.get("LocaleUsed") or {}
+        return data.get("Currency") or data.get("CurrencyCode") or (
+            locale.get("Currency") if isinstance(locale, dict) else None
+        )
 
     @staticmethod
     def _mfr_pn(product: Dict[str, Any]) -> str:
@@ -269,29 +276,39 @@ class DigiKeyClient(BaseApiClient):
                 depth += 1
         return parts
 
-    def _parse_part(self, raw: Dict[str, Any], search_mpn: str) -> PartData:
+    def _parse_part(self, raw: Dict[str, Any], search_mpn: str, response_currency=None) -> PartData:
         """Convert DigiKey product data to PartData."""
         variation = self._select_variation(raw, search_mpn)
+
+        def code(value):
+            if isinstance(value, dict):
+                value = value.get("Code") or value.get("CurrencyCode")
+            return str(value or "").strip().upper()
+
+        product_currency = code(raw.get("Currency")) or code(response_currency) or "USD"
 
         # Price breaks — handle both v3 (StandardPricing at root) and
         # v4 (StandardPricing nested inside ProductVariations; taken from the
         # selected variation so SKU and pricing match).
         price_breaks = []
         pricing_list = raw.get("StandardPricing", [])
+        tier_currency = product_currency
 
         if not pricing_list and variation:
             pricing_list = variation.get("StandardPricing") or []
+            tier_currency = code(variation.get("Currency")) or product_currency
         if not pricing_list:
             for var in self._variations(raw):
                 pricing_list = var.get("StandardPricing") or []
                 if pricing_list:
+                    tier_currency = code(var.get("Currency")) or product_currency
                     break
 
         for pb in pricing_list:
             try:
                 qty = int(pb.get("BreakQuantity", 0))
                 price = float(pb.get("UnitPrice", 0) or pb.get("Price", 0))
-                currency = pb.get("Currency", "USD")
+                currency = code(pb.get("Currency")) or tier_currency
                 if qty > 0 and price > 0:
                     price_breaks.append(
                         PriceBreak(
@@ -312,11 +329,7 @@ class DigiKeyClient(BaseApiClient):
                         PriceBreak(
                             quantity=1,
                             price=float(unit_price),
-                            currency=(
-                                raw.get("Currency", {}).get("Code", "USD")
-                                if isinstance(raw.get("Currency"), dict)
-                                else "USD"
-                            ),
+                            currency=product_currency,
                         )
                     )
                 except (ValueError, TypeError):

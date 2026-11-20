@@ -8,10 +8,11 @@ All views are served under /plugin/smartparts/.
 import json
 import logging
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 
 from django.http import JsonResponse, HttpResponse
 from django.shortcuts import render
-from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.csrf import csrf_exempt, csrf_protect
 
 logger = logging.getLogger("inventree_smart_parts.views")
 
@@ -54,13 +55,25 @@ def _check_perm(request, perm: str):
             {"error": "Authentication required"},
             status=401,
         )
-    if not user.has_perm(perm):
+    if not _has_perm(user, perm):
         logger.warning(f'Permission denied: user="{user.username}" lacks "{perm}"')
         return JsonResponse(
             {"error": f'Permission denied – requires "{perm}"'},
             status=403,
         )
     return None
+
+
+def _has_perm(user, perm):
+    try:
+        from users.permissions import check_user_permission
+    except ImportError:
+        return user.has_perm(perm)
+    from django.apps import apps
+
+    app, codename = perm.split(".", 1)
+    action, model = codename.split("_", 1)
+    return check_user_permission(user, apps.get_model(app, model), action)
 
 
 def _resolve_user(request):
@@ -76,29 +89,15 @@ def _resolve_user(request):
     auth_header = request.META.get("HTTP_AUTHORIZATION", "")
     if auth_header.startswith("Token "):
         token_key = auth_header.split(" ", 1)[1].strip()
-        # Try InvenTree native API tokens (users.models.ApiToken)
+        from rest_framework.exceptions import AuthenticationFailed
+
         try:
-            from users.models import ApiToken
+            from users.authentication import ApiTokenAuthentication
 
-            token = ApiToken.objects.select_related("user").get(key=token_key)
-            active = getattr(token, "active", True)
-            expired = getattr(token, "expired", False)
-            revoked = getattr(token, "revoked", False)
-            if active and not expired and not revoked:
-                return token.user, None
-        except Exception:
-            pass
-
-        # Try standard Django REST Framework token (rest_framework.authtoken.models.Token)
-        try:
-            from rest_framework.authtoken.models import Token
-
-            token = Token.objects.select_related("user").get(key=token_key)
-            return token.user, None
-        except Exception:
-            pass
-
-        return None, JsonResponse({"error": "Invalid or expired token"}, status=401)
+            user, _ = ApiTokenAuthentication().authenticate_credentials(token_key)
+            return user, None
+        except (ImportError, AuthenticationFailed):
+            return None, JsonResponse({"error": "Invalid or expired token"}, status=401)
 
     # Fall back to session auth
     user = getattr(request, "user", None)
@@ -360,7 +359,7 @@ def purescan_command_sheet(request):
 # ═══════════════════════════════════════════════════════════════════
 
 
-def _run_all_api_searches(plugin, mpn: str, only=None):
+def _run_all_api_searches(plugin, mpn: str, *, prices=None, raw_prices=False):
     """
     Query all enabled distributor APIs for the given MPN.
 
@@ -378,6 +377,9 @@ def _run_all_api_searches(plugin, mpn: str, only=None):
     (e.g. {"mouser"} for a Mouser label gap-fill).
     """
     from .api_clients import MouserClient, DigiKeyClient, LCSCClient
+    from .services.pricing import PriceSnapshot
+
+    prices = None if raw_prices else prices or PriceSnapshot()
 
     results: dict = {}
     api_results: list = []
@@ -393,7 +395,7 @@ def _run_all_api_searches(plugin, mpn: str, only=None):
             r = client.search_by_mpn(mpn)
             if r:
                 api_results.append(r)
-                results["mouser"] = _part_data_to_dict(r)
+                results["mouser"] = _part_data_to_dict(r, prices=prices)
             else:
                 results["mouser"] = None
         except Exception as e:
@@ -410,7 +412,7 @@ def _run_all_api_searches(plugin, mpn: str, only=None):
             r = client.search_by_mpn(mpn)
             if r:
                 api_results.append(r)
-                results["digikey"] = _part_data_to_dict(r)
+                results["digikey"] = _part_data_to_dict(r, prices=prices)
             else:
                 results["digikey"] = None
         except Exception as e:
@@ -424,7 +426,7 @@ def _run_all_api_searches(plugin, mpn: str, only=None):
             r = client.search_by_mpn(mpn)
             if r:
                 api_results.append(r)
-                results["lcsc"] = _part_data_to_dict(r)
+                results["lcsc"] = _part_data_to_dict(r, prices=prices)
             else:
                 results["lcsc"] = None
         except Exception as e:
@@ -443,7 +445,7 @@ def _run_all_api_searches(plugin, mpn: str, only=None):
             r = client.search_by_mpn(mpn)
             if r:
                 api_results.append(r)
-                results["element14"] = _part_data_to_dict(r)
+                results["element14"] = _part_data_to_dict(r, prices=prices)
             else:
                 results["element14"] = None
         except Exception as e:
@@ -464,7 +466,7 @@ def _run_all_api_searches(plugin, mpn: str, only=None):
             r = client.search_by_mpn(mpn)
             if r:
                 api_results.append(r)
-                results["tme"] = _part_data_to_dict(r)
+                results["tme"] = _part_data_to_dict(r, prices=prices)
             else:
                 results["tme"] = None
         except Exception as e:
@@ -602,7 +604,10 @@ def api_search(request):
     from .services.duplicate_checker import check_duplicate
     from .services.category_mapper import get_all_categories_for_ui
 
-    api_results, results = _run_all_api_searches(plugin, mpn)
+    from .services.pricing import PriceSnapshot
+
+    prices = PriceSnapshot()
+    api_results, results = _run_all_api_searches(plugin, mpn, prices=prices)
 
     # Merge
     from .services.data_merger import get_priority_order
@@ -656,7 +661,7 @@ def api_search(request):
     # Normalize parameters (data cleaning)
     from .services.parameter_normalizer import normalize_parameter_list
 
-    merged_dict = _part_data_to_dict(merged) if merged else None
+    merged_dict = _part_data_to_dict(merged, prices=prices) if merged else None
     if merged_dict and merged_dict.get("parameters"):
         merged_dict["parameters"] = normalize_parameter_list(merged_dict["parameters"])
 
@@ -815,20 +820,52 @@ def api_search_details(request):
 # ═══════════════════════════════════════════════════════════════════
 
 
-@csrf_exempt
 def create_part(request):
     """Create a part from confirmed search results."""
     if request.method != "POST":
         return JsonResponse({"error": "POST required"}, status=405)
 
-    denied = _check_perm(request, "part.add_part")
-    if denied:
-        return denied
-
     try:
         body = json.loads(request.body)
     except json.JSONDecodeError:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
+    if not isinstance(body, dict):
+        return JsonResponse({"error": "Expected a JSON object"}, status=400)
+
+    updating = bool(body.get("update_existing") and body.get("existing_part_id"))
+    denied = _check_perm(request, "part.change_part" if updating else "part.add_part")
+    if denied:
+        return denied
+
+    from .services.token_manager import TokenConflict, require_free_token, stock_token
+
+    try:
+        stock_qty = Decimal(str(body.get("stock_quantity", 0)))
+        if not stock_qty.is_finite() or stock_qty < 0:
+            raise InvalidOperation
+    except InvalidOperation:
+        return JsonResponse({"error": "Invalid stock quantity"}, status=400)
+    token = body.get("stock_token", "")
+    if stock_qty > 0:
+        denied = _check_perm(request, "stock.add_stockitem")
+        if denied:
+            return denied
+        if token != "":
+            try:
+                token = stock_token(token)
+                require_free_token(token)
+            except TokenConflict as e:
+                return JsonResponse({"error": str(e)}, status=409)
+            except ValueError as e:
+                return JsonResponse({"error": str(e)}, status=400)
+    elif token != "":
+        return JsonResponse(
+            {"error": "Enter a positive receipt quantity to link a barcode"}, status=400
+        )
+    try:
+        template_id = _receipt_template_id(body)
+    except (ValueError, TypeError):
+        return JsonResponse({"error": "Invalid label template"}, status=400)
 
     plugin = _get_plugin()
     if not plugin:
@@ -950,7 +987,6 @@ def create_part(request):
 
     # ── Step B: Receive Stock (optional) ──
     stock_result = None
-    stock_qty = float(body.get("stock_quantity", 0) or 0)
     if stock_qty > 0:
         from .services.stock_manager import create_stock_item
 
@@ -961,6 +997,7 @@ def create_part(request):
             batch=body.get("stock_batch", ""),
             delete_on_deplete=bool(body.get("stock_delete_on_deplete", True)),
             user=request.user,
+            token=token,
         )
         _log_activity(
             "INFO" if stock_result["success"] else "WARNING",
@@ -969,26 +1006,7 @@ def create_part(request):
         )
 
     # ── Step C: Print Label (optional) ──
-    label_result = None
-    if (
-        stock_result
-        and stock_result["success"]
-        and body.get("print_label")
-        and body.get("label_template_id")
-    ):
-        from .services.stock_manager import print_stock_label
-
-        label_result = print_stock_label(
-            stock_item_id=stock_result["stock_id"],
-            template_id=int(body["label_template_id"]),
-            plugin_slug=plugin.get_setting("DEFAULT_PRINT_PLUGIN") or "",
-            request=request,
-        )
-        _log_activity(
-            "INFO" if label_result["success"] else "WARNING",
-            f'Label print for StockItem {stock_result["stock_id"]}',
-            label_result["message"],
-        )
+    label_result = _print_receipt_label(request, stock_result, template_id)
 
     return JsonResponse(
         {
@@ -1015,6 +1033,9 @@ def api_get_part(request, part_id: int):
     Fetch current InvenTree part data for the Live-Editor comparison view.
     Returns all editable fields + parameters + supplier parts as JSON.
     """
+    denied = _check_perm(request, "part.view_part")
+    if denied:
+        return denied
     try:
         from part.models import Part
         from company.models import ManufacturerPart, SupplierPart, SupplierPriceBreak
@@ -1026,17 +1047,25 @@ def api_get_part(request, part_id: int):
 
         mfr_part = ManufacturerPart.objects.filter(part=part).first()
 
-        supplier_parts = []
-        for sp in SupplierPart.objects.filter(part=part).select_related("supplier"):
+        from .services.pricing import PriceSnapshot, present_price_breaks
+
+        supplier_parts, pricing_warnings = [], set()
+        prices = PriceSnapshot()
+        supplier_qs = SupplierPart.objects.filter(part=part).select_related("supplier")
+        if not _has_perm(request.user, "company.view_supplierpricebreak"):
+            supplier_qs = supplier_qs.none()
+        for sp in supplier_qs:
             pbs = []
-            for pb in SupplierPriceBreak.objects.filter(part=sp):
+            for pb in SupplierPriceBreak.objects.filter(part=sp).exclude(price=None):
                 pbs.append(
                     {
-                        "quantity": int(pb.quantity),
-                        "price": str(pb.price),
+                        "quantity": str(pb.quantity),
+                        "price": str(pb.price.amount),
                         "currency": getattr(pb, "price_currency", "EUR"),
                     }
                 )
+            pbs, warnings = present_price_breaks(pbs, prices)
+            pricing_warnings.update(warnings)
             supplier_parts.append(
                 {
                     "supplier_name": sp.supplier.name if sp.supplier else "",
@@ -1082,6 +1111,7 @@ def api_get_part(request, part_id: int):
                 "package": "",  # Not a standard Part field; lives in parameters
                 "image_url": image_url,
                 "supplier_parts": supplier_parts,
+                "pricing_warnings": sorted(pricing_warnings),
                 "parameters": parameters,
             }
         )
@@ -1499,7 +1529,7 @@ def api_logs_clear(request):
 # ═══════════════════════════════════════════════════════════════════
 
 
-def _part_data_to_dict(pd) -> dict:
+def _part_data_to_dict(pd, *, prices=None) -> dict:
     """Convert a PartData instance to a JSON-serializable dict."""
     if pd is None:
         return {}
@@ -1511,6 +1541,24 @@ def _part_data_to_dict(pd) -> dict:
             if entry.get("url", "").startswith("http"):
                 datasheet_url = entry["url"]
                 break
+
+    price_breaks = [
+        {"quantity": pb.quantity, "price": pb.price, "currency": pb.currency}
+        for pb in pd.price_breaks
+    ]
+    supplier_data = pd.raw_data.get("supplier_data", [])
+    warnings = set()
+    if prices is not None:
+        from .services.pricing import present_price_breaks
+
+        price_breaks, price_warnings = present_price_breaks(price_breaks, prices)
+        warnings.update(price_warnings)
+        normalized = []
+        for supplier in supplier_data:
+            tiers, tier_warnings = present_price_breaks(supplier.get("price_breaks", []), prices)
+            normalized.append({**supplier, "price_breaks": tiers})
+            warnings.update(tier_warnings)
+        supplier_data = normalized
 
     return {
         "mpn": pd.mpn,
@@ -1533,16 +1581,14 @@ def _part_data_to_dict(pd) -> dict:
         "parameters": [
             {"name": p.name, "value": p.value, "unit": p.unit} for p in pd.parameters
         ],
-        "price_breaks": [
-            {"quantity": pb.quantity, "price": pb.price, "currency": pb.currency}
-            for pb in pd.price_breaks
-        ],
+        "price_breaks": price_breaks,
+        "pricing_warnings": sorted(warnings),
         "stock_available": pd.stock_available,
         "source": pd.source,
         "confidence": pd.confidence,
         # Pass through aggregated supplier list from the merger so the editor
         # receives one card per distributor and the backend creates all SupplierParts.
-        "supplier_data": pd.raw_data.get("supplier_data", []),
+        "supplier_data": supplier_data,
         "source_image_urls": pd.raw_data.get("source_image_urls", []),
     }
 
@@ -1764,11 +1810,36 @@ def api_label_templates(request):
     return JsonResponse({"templates": templates, "default_id": default_id})
 
 
-@csrf_exempt
+def _receipt_template_id(body):
+    if body.get("print_label") and body.get("label_template_id"):
+        return int(body["label_template_id"])
+    return None
+
+
+def _print_receipt_label(request, stock, template_id):
+    if not (stock and stock["success"] and template_id):
+        return None
+    from .services.stock_manager import print_stock_label
+
+    plugin = _get_plugin()
+    result = print_stock_label(
+        stock_item_id=stock["stock_id"],
+        template_id=template_id,
+        plugin_slug=(plugin.get_setting("DEFAULT_PRINT_PLUGIN") or "") if plugin else "",
+        request=request,
+    )
+    _log_activity(
+        "INFO" if result["success"] else "WARNING",
+        f'Label print for StockItem {stock["stock_id"]}',
+        result["message"],
+    )
+    return result
+
+
 def api_create_stock(request):
     """
     POST: Create a StockItem for an existing Part.
-    Body: { part_id, quantity, location_id?, batch?, delete_on_deplete? }
+    Body: { part_id, quantity, location_id?, batch?, delete_on_deplete?, stock_token? }
     """
     if request.method != "POST":
         return JsonResponse({"error": "POST required"}, status=405)
@@ -1782,28 +1853,30 @@ def api_create_stock(request):
     except json.JSONDecodeError:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
 
-    part_id = body.get("part_id")
-    quantity = float(body.get("quantity", 0) or 0)
-    if not part_id or quantity <= 0:
-        return JsonResponse(
-            {"error": "part_id and quantity > 0 are required"}, status=400
-        )
+    if not isinstance(body, dict):
+        return JsonResponse({"error": "Expected a JSON object"}, status=400)
+    try:
+        part_id = int(body.get("part_id"))
+        template_id = _receipt_template_id(body)
+    except (ValueError, TypeError):
+        return JsonResponse({"error": "Invalid part ID or label template"}, status=400)
 
     from .services.stock_manager import create_stock_item
 
     result = create_stock_item(
-        part_id=int(part_id),
-        quantity=quantity,
+        part_id=part_id,
+        quantity=body.get("quantity"),
         location_id=body.get("location_id") or None,
         batch=body.get("batch", ""),
         delete_on_deplete=bool(body.get("delete_on_deplete", True)),
         user=request.user,
+        token=body.get("stock_token", ""),
     )
-    status_code = 200 if result["success"] else 500
+    result["label"] = _print_receipt_label(request, result, template_id)
+    status_code = 200 if result["success"] else result.get("status", 500)
     return JsonResponse(result, status=status_code)
 
 
-@csrf_exempt
 def api_print_label(request):
     """
     POST: Print a label for an existing StockItem.
@@ -1857,6 +1930,8 @@ def purescan_resolve_barcode(request):
     Query param: ?barcode=...
     Returns: { type: 'stockitem'|'stocklocation'|'part', id: int, name: str }
     """
+    if request.method != "GET":
+        return JsonResponse({"error": "GET required"}, status=405)
     raw = request.GET.get("barcode", "").strip()
     if not raw:
         return JsonResponse({"error": "barcode parameter required"}, status=400)
@@ -1865,24 +1940,7 @@ def purescan_resolve_barcode(request):
     from .services import token_manager
 
     if token_manager.is_valid_token(raw):
-        kind, obj = token_manager.resolve_token(raw)
-        if kind in ("stockitem", "stocklocation", "part") and obj is not None:
-            result = {
-                "type": kind,
-                "id": obj.pk,
-                "name": token_manager.describe_object(kind, obj),
-            }
-            if kind == "stockitem":
-                try:
-                    result["quantity"] = float(obj.quantity)
-                    result["location"] = (
-                        str(obj.location) if obj.location else "No location"
-                    )
-                except Exception:
-                    pass
-            return JsonResponse(result)
-        # valid token, not bound to anything
-        return JsonResponse({"type": "free", "id": None, "name": raw, "token": raw})
+        return _token_lookup_response(request, raw)
 
     # Try JSON parse
     import json as _json
@@ -1897,7 +1955,7 @@ def purescan_resolve_barcode(request):
                     result["type"] = key
                     result["id"] = int(obj[key])
                     break
-        except (ValueError, KeyError):
+        except (ValueError, KeyError, TypeError):
             pass
 
     if not result["type"]:
@@ -1913,6 +1971,10 @@ def purescan_resolve_barcode(request):
         return JsonResponse(
             {"error": "Unrecognised barcode format", "raw": raw}, status=400
         )
+
+    denied = _check_perm(request, _BARCODE_VIEW_PERMISSIONS[result["type"]])
+    if denied:
+        return denied
 
     # Fetch the name for display
     try:
@@ -1939,6 +2001,34 @@ def purescan_resolve_barcode(request):
         logger.warning(f"PureScan barcode lookup failed: {e}")
 
     return JsonResponse(result)
+
+
+def purescan_stock_summary(request):
+    """Return quantities and up to three stock labels for a resolved part."""
+    if request.method != "GET":
+        return JsonResponse({"error": "GET required"}, status=405)
+
+    for perm in ("part.view_part", "stock.view_stockitem"):
+        denied = _check_perm(request, perm)
+        if denied:
+            return denied
+
+    try:
+        part_id = int(request.GET.get("part_id", ""))
+        location = request.GET.get("location_id")
+        location_id = int(location) if location else None
+        if part_id <= 0 or (location_id is not None and location_id <= 0):
+            raise ValueError
+    except (ValueError, TypeError):
+        return JsonResponse({"error": "Invalid part or location ID"}, status=400)
+
+    from part.models import Part
+    from .services.stock_manager import get_part_stock_summary
+
+    if not Part.objects.filter(pk=part_id).exists():
+        return JsonResponse({"error": "Part not found"}, status=404)
+
+    return JsonResponse(get_part_stock_summary(part_id, location_id))
 
 
 def purescan_print_label(request):
@@ -1995,45 +2085,15 @@ def purescan_print_label(request):
 # ═══════════════════════════════════════════════════════════════════
 
 
-def _lookup_part_by_mpn_sku(mpn: str, sku: str):
-    """Find an existing InvenTree Part by MPN or supplier SKU (exact match)."""
-    if not mpn and not sku:
-        return None
-    try:
-        from part.models import Part
-        from company.models import ManufacturerPart, SupplierPart
-    except Exception as e:
-        logger.warning(f"SmartParts: part lookup models unavailable: {e}")
-        return None
-
-    if mpn:
-        mfg = (
-            ManufacturerPart.objects.filter(MPN__iexact=mpn)
-            .select_related("part")
-            .first()
-        )
-        if mfg and mfg.part:
-            return mfg.part
-        part = (
-            Part.objects.filter(IPN__iexact=mpn).first()
-            or Part.objects.filter(name__iexact=mpn).first()
-        )
-        if part:
-            return part
-        sup = (
-            SupplierPart.objects.filter(SKU__iexact=mpn).select_related("part").first()
-        )
-        if sup and sup.part:
-            return sup.part
-
-    if sku:
-        sup = (
-            SupplierPart.objects.filter(SKU__iexact=sku).select_related("part").first()
-        )
-        if sup and sup.part:
-            return sup.part
-
-    return None
+def _part_already_exists(part):
+    return JsonResponse({
+        "success": False,
+        "already_exists": True,
+        "part_id": part.pk,
+        "part_name": part.name,
+        "part_ipn": getattr(part, "IPN", "") or "",
+        "message": f"Part already exists: {part.name}",
+    })
 
 
 @csrf_exempt
@@ -2046,17 +2106,24 @@ def purescan_token(request):
     if request.method != "POST":
         return JsonResponse({"error": "POST required"}, status=405)
 
-    denied = _check_perm(request, "stock.view_stockitem")
-    if denied:
-        return denied
-
     try:
         body = json.loads(request.body)
     except json.JSONDecodeError:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
 
-    token = str(body.get("token", "")).strip()
+    if not isinstance(body, dict):
+        return JsonResponse({"error": "Expected a JSON object"}, status=400)
+    return _token_lookup_response(request, str(body.get("token", "")).strip())
 
+
+_BARCODE_VIEW_PERMISSIONS = {
+    "stockitem": "stock.view_stockitem",
+    "stocklocation": "stock.view_stocklocation",
+    "part": "part.view_part",
+}
+
+
+def _token_lookup_response(request, token):
     from .services import token_manager
 
     if not token_manager.is_valid_token(token):
@@ -2066,8 +2133,15 @@ def purescan_token(request):
         )
 
     kind, obj = token_manager.resolve_token(token)
+    if kind == "ambiguous":
+        return JsonResponse({"error": "Barcode has conflicting bindings"}, status=409)
 
-    if kind in ("stockitem", "stocklocation", "part") and obj is not None:
+    if obj is not None:
+        if kind not in _BARCODE_VIEW_PERMISSIONS:
+            return JsonResponse({"error": "Barcode already linked to another object"}, status=409)
+        denied = _check_perm(request, _BARCODE_VIEW_PERMISSIONS[kind])
+        if denied:
+            return denied
         resp = {
             "type": kind,
             "id": obj.pk,
@@ -2088,10 +2162,12 @@ def purescan_token(request):
                 pass
         return JsonResponse(resp)
 
+    denied = _check_perm(request, "stock.view_stockitem")
+    if denied:
+        return denied
     return JsonResponse({"type": "free", "id": None, "name": token, "token": token})
 
 
-@csrf_exempt
 def purescan_createpart(request):
     """
     POST: Create a part from a scanned distributor DataMatrix barcode.
@@ -2112,11 +2188,18 @@ def purescan_createpart(request):
     except json.JSONDecodeError:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
 
+    if not isinstance(body, dict):
+        return JsonResponse({"error": "Expected a JSON object"}, status=400)
     barcode = str(body.get("barcode", "")).strip()
     if not barcode:
         return JsonResponse({"error": "barcode is required"}, status=400)
 
     from .services.barcode_decoder import parse_barcode
+    from .services.part_identity import (
+        AmbiguousPart,
+        lock_part_identity,
+        resolve_scanned_part,
+    )
 
     parsed = parse_barcode(barcode)
     mpn = (parsed.mpn or "").strip()
@@ -2132,60 +2215,12 @@ def purescan_createpart(request):
             status=400,
         )
 
-    # enrich_scope: "all" (default, SYS:CREATEPART) queries every enabled
-    # distributor; "label" (FASTADD) only the distributor the label came from,
-    # and only if the part has no supplier part from it yet.
-    enrich_scope = str(body.get("enrich_scope", "all") or "all").lower()
-
-    def _exists_response(part, query_mpn):
-        resp = {
-            "success": False,
-            "already_exists": True,
-            "part_id": part.pk,
-            "part_name": part.name,
-            "part_ipn": getattr(part, "IPN", "") or "",
-            "message": f"Part already exists: {part.name}",
-            "enriched": [],
-        }
-        plugin_ = _get_plugin()
-        if not plugin_ or not query_mpn:
-            return JsonResponse(resp)
-        only = None
-        if enrich_scope == "label":
-            dist = (parsed.distributor or "").lower()
-            setting = DISTRIBUTOR_ENABLE_SETTINGS.get(dist)
-            if (
-                not setting
-                or not plugin_.get_setting(setting)
-                or _has_distributor_supplier_part(part, dist)
-            ):
-                return JsonResponse(resp)
-            only = {dist}
-        try:
-            enr = _enrich_existing_part(plugin_, part, query_mpn, only=only)
-            resp["enriched"] = enr["filled"]
-            if enr["errors"]:
-                resp["enrich_errors"] = enr["errors"]
-            if enr["filled"]:
-                resp["message"] += f" - filled: {', '.join(enr['filled'])}"
-            else:
-                resp["message"] += " - nothing to fill"
-        except Exception as e:
-            logger.warning(f"[PureScan] gap-fill failed for '{part.name}': {e}")
-            resp["enrich_errors"] = [str(e)]
-        return JsonResponse(resp)
-
-    existing = _lookup_part_by_mpn_sku(mpn, sku)
+    try:
+        existing = resolve_scanned_part(mpn, sku)
+    except AmbiguousPart as exc:
+        return JsonResponse({"error": str(exc)}, status=409)
     if existing is not None:
-        # Use the MPN stored on the part when the label only had a SKU
-        query = mpn
-        if not query:
-            try:
-                mp = existing.manufacturer_parts.first()
-                query = mp.MPN if mp else ""
-            except Exception:
-                query = ""
-        return _exists_response(existing, query)
+        return _part_already_exists(existing)
 
     if not mpn:
         return JsonResponse(
@@ -2220,11 +2255,11 @@ def purescan_createpart(request):
         )
 
     from .services.data_merger import merge_part_data
-    from .services.duplicate_checker import check_duplicate
 
-    from .services.data_merger import get_priority_order
-
-    priority_order = get_priority_order(plugin)
+    priority_str = (
+        plugin.get_setting("API_PRIORITY") or "mouser,digikey,element14,tme,lcsc"
+    )
+    priority_order = [p.strip() for p in priority_str.split(",") if p.strip()]
     # Strict MPN identity: only distributor hits whose MPN (or SKU) exactly
     # matches the label are used — a different MPN is a different part.
     merged = merge_part_data(api_results, priority_order, search_term=mpn, strict=True)
@@ -2238,23 +2273,6 @@ def purescan_createpart(request):
                     f"No distributor returned exact MPN '{mpn}' — "
                     "create it manually via the dashboard"
                 ),
-            }
-        )
-
-    dup = check_duplicate(merged.mpn, merged.manufacturer)
-    if dup.is_duplicate and dup.existing_part_id:
-        from part.models import Part
-
-        dup_part = Part.objects.filter(pk=dup.existing_part_id).first()
-        if dup_part is not None:
-            return _exists_response(dup_part, merged.mpn)
-        return JsonResponse(
-            {
-                "success": False,
-                "already_exists": True,
-                "part_id": dup.existing_part_id,
-                "part_name": dup.existing_part_name,
-                "message": f"Part already exists: {dup.existing_part_name}",
             }
         )
 
@@ -2273,14 +2291,23 @@ def purescan_createpart(request):
             logger.warning(f"[PureScan] CREATEPART category mapping failed: {e}")
 
     from .services.part_creator import create_part_from_data
+    from django.db import transaction
 
-    creation = create_part_from_data(
-        part_data=merged,
-        category_id=category_id,
-        update_existing=False,
-        existing_part_id=None,
-        auto_create_companies=bool(plugin.get_setting("AUTO_CREATE_MANUFACTURERS")),
-    )
+    try:
+        with transaction.atomic():
+            lock_part_identity(merged.mpn)
+            existing = resolve_scanned_part(merged.mpn, sku, merged.manufacturer)
+            if existing is not None:
+                return _part_already_exists(existing)
+            creation = create_part_from_data(
+                part_data=merged,
+                category_id=category_id,
+                update_existing=False,
+                existing_part_id=None,
+                auto_create_companies=bool(plugin.get_setting("AUTO_CREATE_MANUFACTURERS")),
+            )
+    except AmbiguousPart as exc:
+        return JsonResponse({"error": str(exc)}, status=409)
 
     _log_activity(
         "INFO" if creation.success else "ERROR",
@@ -2303,7 +2330,6 @@ def purescan_createpart(request):
     )
 
 
-@csrf_exempt
 def purescan_createstock(request):
     """
     POST: Create a new StockItem and bind a custom token label to it.
@@ -2323,85 +2349,32 @@ def purescan_createstock(request):
     except json.JSONDecodeError:
         return JsonResponse({"error": "Invalid JSON"}, status=400)
 
-    part_id = body.get("part_id")
-    new_token = str(body.get("new_token", "")).strip()
-    location_id = body.get("location_id") or None
-    batch = str(body.get("batch", "") or "")
-
-    if not part_id:
-        return JsonResponse({"error": "part_id is required"}, status=400)
-
-    try:
-        quantity = float(body.get("quantity"))
-    except (TypeError, ValueError):
-        return JsonResponse({"error": "quantity must be a number"}, status=400)
-    if quantity <= 0:
-        return JsonResponse({"error": "quantity must be > 0"}, status=400)
-
-    if location_id:
-        from stock.models import StockLocation
-
-        if not StockLocation.objects.filter(pk=int(location_id)).exists():
-            return JsonResponse(
-                {"error": f"Location {location_id} not found"}, status=400
-            )
-
-    from .services import token_manager
-    from .services.token_manager import bind_token, resolve_token
-
-    if not token_manager.is_valid_token(new_token):
-        return JsonResponse({"error": "new_token must match STOCK_XXXX"}, status=400)
-
-    kind, bound = resolve_token(new_token)
-    if bound is not None and kind is not None:
-        return JsonResponse(
-            {
-                "error": (
-                    f"Token {new_token} is already bound to a {kind}: "
-                    f"{token_manager.describe_object(kind, bound)}"
-                )
-            },
-            status=409,
-        )
-
-    from django.db import transaction
-    from stock.models import StockItem
     from .services.stock_manager import create_stock_item
+    from .services.token_manager import stock_token
 
-    stock_item = None
+    if not isinstance(body, dict):
+        return JsonResponse({"error": "Expected a JSON object"}, status=400)
     try:
-        with transaction.atomic():
-            result = create_stock_item(
-                part_id=int(part_id),
-                quantity=quantity,
-                location_id=location_id,
-                batch=batch,
-                delete_on_deplete=bool(body.get("delete_on_deplete", True)),
-                user=request.user,
-            )
-            if not result.get("success"):
-                raise RuntimeError(result.get("message") or "stock creation failed")
-            stock_item = StockItem.objects.get(pk=result["stock_id"])
-            bind_result = bind_token(new_token, stock_item)
-            if not bind_result.get("success"):
-                raise RuntimeError(bind_result.get("error") or "token binding failed")
-    except Exception as e:
-        return JsonResponse({"error": f"Stock creation aborted: {e}"}, status=500)
+        part_id = int(body.get("part_id"))
+    except (ValueError, TypeError):
+        return JsonResponse({"error": "Invalid part ID"}, status=400)
+    try:
+        token = stock_token(body.get("new_token", ""))
+    except ValueError as e:
+        return JsonResponse({"error": str(e)}, status=400)
 
-    return JsonResponse(
-        {
-            "success": True,
-            "stock_id": stock_item.pk,
-            "token": new_token,
-            "message": (
-                f"Stock item #{stock_item.pk} created "
-                f"(qty {quantity}) and bound to {new_token}"
-            ),
-        }
+    result = create_stock_item(
+        part_id=part_id,
+        quantity=body.get("quantity"),
+        location_id=body.get("location_id") or None,
+        batch=str(body.get("batch", "") or ""),
+        delete_on_deplete=bool(body.get("delete_on_deplete", True)),
+        user=request.user,
+        token=token,
     )
+    return JsonResponse(result, status=200 if result["success"] else result["status"])
 
 
-@csrf_exempt
 def purescan_deletepart(request):
     """
     POST: Delete a Part.  Refused while stock items exist.
@@ -2458,7 +2431,6 @@ def purescan_deletepart(request):
     return JsonResponse({"success": True, "message": f"Part '{name}' deleted"})
 
 
-@csrf_exempt
 def purescan_deletestock(request):
     """
     POST: Delete a StockItem identified by its custom token label.
@@ -2551,6 +2523,13 @@ def purescan_deletestock(request):
 
 @csrf_exempt
 def api_v1_import(request):
+    """Accept a native API token; require CSRF for browser sessions."""
+    if request.META.get("HTTP_AUTHORIZATION", "").startswith("Token "):
+        return _api_v1_import(request)
+    return csrf_protect(_api_v1_import)(request)
+
+
+def _api_v1_import(request):
     """
     Single-shot MPN search + optional part ingestion endpoint.
 
@@ -2592,6 +2571,8 @@ def api_v1_import(request):
     user, auth_error = _resolve_user(request)
     if auth_error:
         return auth_error
+    if not _has_perm(user, "part.view_part"):
+        return JsonResponse({"error": 'Permission denied – requires "part.view_part"'}, status=403)
 
     # ── Parse body ──────────────────────────────────────────────────
     try:
@@ -2616,7 +2597,7 @@ def api_v1_import(request):
 
     # Permission check – only needed when we will actually write to the DB
     if auto_create and not dry_run:
-        if not user.has_perm("part.add_part"):
+        if not _has_perm(user, "part.add_part"):
             logger.warning(
                 f'API v1 import: permission denied for user="{user.username}"'
             )
@@ -2634,7 +2615,10 @@ def api_v1_import(request):
         "INFO",
         f"[API v1] MPN lookup: {mpn} (auto_create={auto_create}, dry_run={dry_run})",
     )
-    api_results, results_dict = _run_all_api_searches(plugin, mpn)
+    from .services.pricing import PriceSnapshot
+
+    prices = PriceSnapshot()
+    api_results, results_dict = _run_all_api_searches(plugin, mpn, prices=prices)
 
     # ── Merge ───────────────────────────────────────────────────────
     from .services.data_merger import merge_part_data
@@ -2647,8 +2631,25 @@ def api_v1_import(request):
     # Category mapping ------------------------------------------------------
     category_match = None
     if merged and merged.category:
-        cat_id, cat_path, score, _cat_created = _resolve_category(
-            plugin, merged, default_threshold=65
+        from .services.category_mapper import resolve_category_with_autocreate
+
+        threshold = plugin.get_setting("FUZZY_THRESHOLD") or 65
+        default_cat = plugin.get_setting("DEFAULT_CATEGORY") or ""
+        user_synonyms = plugin.get_setting("CATEGORY_SYNONYMS") or "{}"
+        learned_mappings = plugin.get_setting("LEARNED_CATEGORY_MAPPINGS") or "{}"
+        cat_id, cat_path, score, _cat_created = resolve_category_with_autocreate(
+            merged.category,
+            threshold,
+            default_cat,
+            user_synonyms_json=user_synonyms,
+            learned_mappings_json=learned_mappings,
+            plugin=plugin,
+            auto_create=bool(
+                auto_create
+                and not dry_run
+                and _has_perm(user, "part.add_partcategory")
+                and plugin.get_setting("AUTO_CREATE_CATEGORIES")
+            ),
         )
         category_match = {
             "id": cat_id,
@@ -2676,7 +2677,7 @@ def api_v1_import(request):
             dup_info = {"is_duplicate": False}
 
     # ── Serialize merged result ──────────────────────────────────────
-    merged_dict = _part_data_to_dict(merged) if merged else None
+    merged_dict = _part_data_to_dict(merged, prices=prices) if merged else None
     if merged_dict and merged_dict.get("parameters"):
         from .services.parameter_normalizer import normalize_parameter_list
 
@@ -2722,6 +2723,8 @@ def api_v1_import(request):
         existing_part_id = None
         if dup_info and dup_info["is_duplicate"] and effective_update_existing:
             existing_part_id = dup_info["part_id"]
+            if not _has_perm(user, "part.change_part"):
+                return JsonResponse({"error": 'Permission denied – requires "part.change_part"'}, status=403)
 
         creation_result = create_part_from_data(
             part_data=merged,
@@ -2835,7 +2838,7 @@ def api_v1_raw_lookup(request):
     if auth_error:
         return auth_error
 
-    if not user.has_perm("part.view_part"):
+    if not _has_perm(user, "part.view_part"):
         return JsonResponse(
             {"error": 'Permission denied – requires "part.view_part"'},
             status=403,
@@ -2857,7 +2860,7 @@ def api_v1_raw_lookup(request):
 
     # ── Query all enabled distributors ───────────────────────────────
     _log_activity("INFO", f"[API v1] Raw lookup: {mpn}")
-    _api_results, results_dict = _run_all_api_searches(plugin, mpn)
+    _api_results, results_dict = _run_all_api_searches(plugin, mpn, raw_prices=True)
 
     # ── Ensure all 5 known sources are present in the response ───────
     # Sources not queried (disabled) get {"error": "disabled"} so the caller
@@ -2904,6 +2907,12 @@ def api_barcode_lookup(request):
             "barcode_data": dict or None
         }
     """
+    denied = _check_perm(request, "part.view_part")
+    if denied:
+        return denied
+    if request.method not in ("GET", "POST"):
+        return JsonResponse({"error": "GET or POST required"}, status=405)
+
     raw_barcode = ""
     mpn = ""
     sku = ""
@@ -3309,55 +3318,12 @@ def api_barcode_lookup(request):
             }
         )
 
-    part = None
+    from .services.part_identity import AmbiguousPart, resolve_scanned_part
 
     try:
-        from part.models import Part
-        from company.models import ManufacturerPart, SupplierPart
-
-        # 1. Match MPN against ManufacturerPart.MPN
-        if mpn:
-            mfg = (
-                ManufacturerPart.objects.filter(MPN__iexact=mpn)
-                .select_related("part")
-                .first()
-            )
-            if mfg and mfg.part:
-                part = mfg.part
-
-        # 2. Match MPN against Part.IPN or Part.name
-        if not part and mpn:
-            part = (
-                Part.objects.filter(IPN__iexact=mpn).first()
-                or Part.objects.filter(name__iexact=mpn).first()
-            )
-
-        # 3. Match MPN against SupplierPart.SKU
-        if not part and mpn:
-            sup = (
-                SupplierPart.objects.filter(SKU__iexact=mpn)
-                .select_related("part")
-                .first()
-            )
-            if sup and sup.part:
-                part = sup.part
-
-        # 4. Match supplier SKU against SupplierPart.SKU
-        if not part and sku:
-            sup = (
-                SupplierPart.objects.filter(SKU__iexact=sku)
-                .select_related("part")
-                .first()
-            )
-            if sup and sup.part:
-                part = sup.part
-
-        # 5. Fallback: if mpn is purely digits, check if it's a Part PK directly
-        if not part and mpn and mpn.isdigit():
-            part = Part.objects.filter(pk=int(mpn)).first()
-
-    except Exception as exc:
-        logger.warning(f"SmartParts: barcode lookup exception: {exc}")
+        part = resolve_scanned_part(mpn, sku)
+    except AmbiguousPart as exc:
+        return JsonResponse({"error": str(exc)}, status=409)
 
     if part:
         url = (
@@ -3406,6 +3372,3 @@ def api_barcode_lookup(request):
             "barcode_data": parsed.to_dict() if parsed else None,
         }
     )
-
-
-api_barcode_lookup.auth_exempt = True
