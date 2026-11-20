@@ -39,7 +39,7 @@ class SmartPartsPlugin(
         "Fetches data from Mouser, DigiKey, LCSC, element14/Farnell, and TME. "
         "Maps categories, detects duplicates, and supports batch Excel import."
     )
-    VERSION = "1.4.0"
+    VERSION = "1.4.1"
     AUTHOR = "StarkStrom Engineering"
 
     # ── Plugin Settings (Admin-configurable) ─────────────────────────
@@ -315,53 +315,31 @@ class SmartPartsPlugin(
         return []
 
     # ── BarcodeMixin Handler ─────────────────────────────────────────
-    def scan(self, barcode_data):
+    def scan(self, barcode_data, user=None, **kwargs):
         """
         Scan a barcode against SmartParts part database.
         Called by InvenTree's native /api/barcode/ endpoint.
         """
         try:
             from .services.barcode_decoder import parse_barcode
-            from part.models import Part
-            from company.models import ManufacturerPart, SupplierPart
+            from .services.part_identity import resolve_scanned_part
+            from .services.token_manager import is_valid_token
+            from .views import _has_perm
 
-            parsed = parse_barcode(str(barcode_data))
+            if user is not None and not _has_perm(user, "part.view_part"):
+                return None
+
+            raw = str(barcode_data)
+            if is_valid_token(raw):
+                return None  # let InvenTree resolve linked STOCK_/LOC_ barcodes
+            parsed = parse_barcode(raw)
             mpn = (parsed.mpn or "").strip()
             sku = (parsed.supplier_sku or "").strip()
 
-            part = None
-            if mpn:
-                mfg = (
-                    ManufacturerPart.objects.filter(MPN__iexact=mpn)
-                    .select_related("part")
-                    .first()
-                )
-                if mfg and mfg.part:
-                    part = mfg.part
-                if not part:
-                    part = (
-                        Part.objects.filter(IPN__iexact=mpn).first()
-                        or Part.objects.filter(name__iexact=mpn).first()
-                    )
-                if not part:
-                    sup = (
-                        SupplierPart.objects.filter(SKU__iexact=mpn)
-                        .select_related("part")
-                        .first()
-                    )
-                    if sup and sup.part:
-                        part = sup.part
-            if not part and sku:
-                sup = (
-                    SupplierPart.objects.filter(SKU__iexact=sku)
-                    .select_related("part")
-                    .first()
-                )
-                if sup and sup.part:
-                    part = sup.part
+            part = resolve_scanned_part(mpn, sku)
 
             if part and hasattr(part, "format_matched_response"):
-                return {"part": part.format_matched_response()}
+                return {"part": part.format_matched_response(user=user, **kwargs)}
             elif part:
                 return {
                     "part": {
@@ -469,6 +447,11 @@ class SmartPartsPlugin(
             ),
             path(
                 "api/purescan/print/", views.purescan_print_label, name="purescan-print"
+            ),
+            path(
+                "api/purescan/stock-summary/",
+                views.purescan_stock_summary,
+                name="purescan-stock-summary",
             ),
             # PureScan – slow workflow (custom token labels)
             path(

@@ -131,6 +131,10 @@ function renderEditor(data, existing) {
 
   /* ── Supplier cards ───────────────────────────────────────── */
   const supplierCards = _suppliers.map((s, i) => buildSupplierCard(s, i)).join('');
+  const pricingWarnings = new Set([
+    ...(m.pricing_warnings || []), ...(ex?.pricing_warnings || []),
+    ..._suppliers.flatMap(s => s.pricing_warnings || []),
+  ]);
 
   /* ── Category ───────────────────────────────────────────── */
   const catId = data.category_match?.id || (ex?.category_id) || null;
@@ -208,6 +212,7 @@ function renderEditor(data, existing) {
             <i class="fas fa-plus"></i> Add Supplier
           </button>
         </p>
+        ${Array.from(pricingWarnings, message => `<p role="status">⚠ ${escHtml(message)}</p>`).join('')}
         <div id="supplierList">${supplierCards}</div>
       </div>
 
@@ -356,8 +361,8 @@ function collectFormData() {
     card.querySelectorAll('.sp-price-table tbody tr').forEach(tr => {
       const cells = tr.querySelectorAll('input');
       pbs.push({
-        qty:      parseInt(cells[0]?.value) || 1,
-        price:    parseFloat(cells[1]?.value) || 0,
+        qty:      cells[0]?.value || '1',
+        price:    cells[1]?.value ?? '',
         currency: cells[2]?.value.trim() || 'EUR',
       });
     });
@@ -375,9 +380,10 @@ function collectFormData() {
 
   // Stock / label fields
   const enableReceive = document.getElementById('enableReceive')?.checked;
-  const stockQty    = enableReceive ? (parseFloat(document.getElementById('stockQty')?.value) || 0) : 0;
+  const stockQty    = enableReceive ? (document.getElementById('stockQty')?.value || '0') : 0;
   const stockLoc    = enableReceive ? (parseInt(document.getElementById('stockLocation')?.value) || null) : null;
   const stockBatch  = enableReceive ? (document.getElementById('stockBatch')?.value.trim() || '') : '';
+  const stockToken  = enableReceive ? (document.getElementById('stockToken')?.value.trim().toUpperCase() || '') : '';
   const stockDod    = enableReceive ? (document.getElementById('stockDeleteOnDeplete')?.checked ?? true) : true;
   const printLabel  = enableReceive && (document.getElementById('printLabel')?.checked ?? true);
   const labelTplId  = parseInt(document.getElementById('labelTemplate')?.value) || null;
@@ -401,6 +407,7 @@ function collectFormData() {
     stock_quantity:         stockQty,
     stock_location_id:      stockLoc,
     stock_batch:            stockBatch,
+    stock_token:            stockToken,
     stock_delete_on_deplete: stockDod,
     // Label
     print_label:            printLabel,
@@ -411,22 +418,77 @@ function collectFormData() {
 /* ── Save ──────────────────────────────────────────────────────── */
 function saveFromEditor(updateExisting, existingId) {
   const payload = collectFormData();
+  const editor = document.getElementById('receiveStockSection');
+  const savedPart = editor?._savedPart;
+  const showSaveError = (message) => {
+    let error = document.getElementById('spSaveError');
+    if (!error && editor) {
+      error = document.createElement('p');
+      error.id = 'spSaveError';
+      error.setAttribute('role', 'alert');
+      error.style.color = 'var(--sp-danger)';
+      editor.before(error);
+    }
+    if (error) error.textContent = message;
+    else showError(message);
+  };
+  if (document.getElementById('enableReceive')?.checked && !(payload.stock_quantity > 0)) {
+    showSaveError('Enter a positive receipt quantity.');
+    return;
+  }
+  if (payload.stock_token && !/^STOCK_[A-Z0-9]{4}$/.test(payload.stock_token)) {
+    showSaveError('Stock barcode must match STOCK_XXXX.');
+    document.getElementById('stockToken')?.focus();
+    return;
+  }
+  document.getElementById('spSaveError')?.remove();
   payload.update_existing  = !!updateExisting;
   payload.existing_part_id = existingId || null;
 
   const saveBtns = document.querySelectorAll('.sp-btn-success');
+  const captions = Array.from(saveBtns, b => b.innerHTML);
+  const restoreButtons = () => saveBtns.forEach((b, i) => {
+    b.disabled = false;
+    b.innerHTML = savedPart || editor?._savedPart ? 'Retry stock receipt' : captions[i];
+  });
   saveBtns.forEach(b => { b.disabled = true; b.innerHTML = '<span class="sp-loading"></span> Saving…'; });
 
-  fetch('create/', {
+  const post = (url, data) => fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-CSRFToken': getCookie('csrftoken') },
-    body: JSON.stringify(payload),
-  })
-  .then(r => r.json())
-  .then(res => {
+    body: JSON.stringify(data),
+  }).then(async r => {
+    const data = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
+    return { ...data, success: r.ok && data.success };
+  });
+  let save;
+  if (savedPart && payload.stock_quantity > 0) {
+    save = post('api/stock/create/', {
+      part_id: savedPart.part_id,
+      quantity: payload.stock_quantity,
+      location_id: payload.stock_location_id,
+      batch: payload.stock_batch,
+      stock_token: payload.stock_token,
+      delete_on_deplete: payload.stock_delete_on_deplete,
+      print_label: payload.print_label,
+      label_template_id: payload.label_template_id,
+    }).then(stock => ({ ...savedPart, stock, label: stock.label }));
+  } else {
+    save = savedPart ? Promise.resolve(savedPart) : post('create/', payload);
+  }
+
+  save.then(res => {
+    if (editor && !editor.isConnected) return;
+    if (res.success && res.stock && !res.stock.success && editor) {
+      editor._savedPart = { ...res, stock: null, label: null };
+      restoreButtons();
+      showSaveError(`Part saved. Stock receipt failed: ${res.stock.message || res.stock.error || 'Unknown error'}. Correct it and retry the receipt.`);
+      return;
+    }
     if (res.success) {
       // Build extra status lines for stock / label
-      let extraLines = '';
+      let extraLines = (res.errors || []).map(message =>
+        `<p style="font-size:.85rem;margin:.25rem 0">⚠️ ${escHtml(message)}</p>`).join('');
       if (res.stock) {
         const ico = res.stock.success ? '📦' : '⚠️';
         extraLines += `<p style="font-size:.85rem;margin:.25rem 0">${ico} ${escHtml(res.stock.message)}</p>`;
@@ -459,13 +521,14 @@ function saveFromEditor(updateExisting, existingId) {
           </div>
         </div>`;
     } else {
-      saveBtns.forEach(b => { b.disabled = false; b.innerHTML = '<i class="fas fa-save"></i> Save'; });
-      showError('Saving failed: ' + res.message);
+      restoreButtons();
+      showSaveError('Saving failed: ' + (res.message || res.error || 'Unknown error'));
     }
   })
   .catch(err => {
-    saveBtns.forEach(b => { b.disabled = false; });
-    showError('Error: ' + err.message);
+    if (editor && !editor.isConnected) return;
+    restoreButtons();
+    showSaveError('Error: ' + err.message);
   });
 }
 

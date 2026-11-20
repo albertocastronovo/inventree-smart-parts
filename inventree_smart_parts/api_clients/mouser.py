@@ -101,14 +101,30 @@ class MouserClient(BaseApiClient):
                 qty = int(pb.get("Quantity", 0))
                 # Price comes as string like "€1.23" or "$1.23"
                 price_str = pb.get("Price", "0")
-                currency = pb.get("Currency", "EUR")
+                currency = str(pb.get("Currency") or "").strip().upper()
+                if not currency:
+                    if "CAD" in price_str or "CA$" in price_str or "C$" in price_str:
+                        currency = "CAD"
+                    elif "AUD" in price_str or "AU$" in price_str or "A$" in price_str:
+                        currency = "AUD"
+                    elif "€" in price_str:
+                        currency = "EUR"
+                    elif "£" in price_str:
+                        currency = "GBP"
+                    elif "$" in price_str:
+                        currency = "USD"
+                    else:
+                        continue
                 # Strip currency symbols and whitespace
                 price_clean = "".join(c for c in price_str if c.isdigit() or c in ".,")
                 # Handle European comma-as-decimal
                 if "," in price_clean and "." not in price_clean:
                     price_clean = price_clean.replace(",", ".")
                 elif "," in price_clean and "." in price_clean:
-                    price_clean = price_clean.replace(",", "")
+                    if price_clean.rindex(",") > price_clean.rindex("."):
+                        price_clean = price_clean.replace(".", "").replace(",", ".")
+                    else:
+                        price_clean = price_clean.replace(",", "")
 
                 price = float(price_clean) if price_clean else 0.0
 

@@ -64,7 +64,7 @@
 
   const RESULT_DISPLAY_MS = 4000;
   const COMBO_TIMEOUT_MS  = 3000;   // Time to wait for additional qty scans
-  const BURST_TIMEOUT_MS  = 15000;  // v1.2.6: burst window after a FASTADD commit
+  const BURST_TIMEOUT_MS  = 30000;
   const MAX_UNDO_HISTORY  = 20;
   const LOCALSTORAGE_KEY  = 'purescan_history';
   const SYS_LAST_KEY      = 'purescan_last_location';
@@ -87,6 +87,7 @@
 
   // v1.2.6: FASTADD burst window
   let _burstTimer   = null;
+  let _burstDeadline = 0;
 
   // Action history / undo stack
   let _actionLog  = [];    // { ts, description, payload, actionType, undone }
@@ -95,6 +96,8 @@
   let _pendingPartId      = null;
   let _pendingPartName    = '';
   let _pendingCategoryNote = '';    // v1.2.3: category path shown in prompts
+  let _pendingPricingNote = '';
+  let _flowId = 0;
   let _pendingLocationId  = null;
   let _pendingQty         = null;
   let _pendingBatch       = '';
@@ -144,7 +147,7 @@
       } catch (e) {
         console.warn('[PureScan] Token lookup failed:', e);
       }
-      return { type: null, token: trimmed };
+      return { type: 'unresolved_token', token: trimmed };
     }
 
     // Format 1: JSON  {"stockitem": 722}
@@ -237,6 +240,7 @@
   }
 
   function _resetToIdle(detail) {
+    _flowId++;
     _action      = null;
     _stockItemId = null;
     _itemInfo    = null;
@@ -245,8 +249,7 @@
     _clearPendingDelete();
     clearTimeout(_resultTimer);
     clearTimeout(_comboTimer);
-    clearTimeout(_burstTimer);
-    _burstTimer = null;
+    _stopBurst();
     _setState(STATES.IDLE, detail || 'Ready — Scan an Action Code');
   }
 
@@ -256,11 +259,32 @@
     _resultTimer = setTimeout(() => _resetToIdle(), autoResetMs || RESULT_DISPLAY_MS);
   }
 
-  // v1.2.6: FASTADD burst — keep the terminal armed for the next reel
-  function _startBurst(successMsg) {
-    _setState(STATES.SUCCESS, successMsg + '\n⚡ Burst: scan next DataMatrix within 15s');
+  function _stopBurst() {
     clearTimeout(_burstTimer);
+    _burstTimer = null;
+    _burstDeadline = 0;
+  }
+
+  // Keep the terminal armed for the next reel after each FASTADD commit.
+  function _startBurst(successMsg) {
+    _stopBurst();
+    clearTimeout(_resultTimer);
+    _burstDeadline = Date.now() + BURST_TIMEOUT_MS;
+    _setState(STATES.SUCCESS, `${successMsg}\n⚡ Burst: scan next DataMatrix within ${BURST_TIMEOUT_MS / 1000}s`);
     _burstTimer = setTimeout(() => _resetToIdle('Burst ended — scan an Action Code'), BURST_TIMEOUT_MS);
+  }
+
+  function _armAction(action) {
+    _flowId++;
+    clearTimeout(_resultTimer);
+    clearTimeout(_comboTimer);
+    _clearPendingCreate();
+    _clearPendingDelete();
+    _comboQty = 0;
+    _action = action;
+    _stockItemId = null;
+    _itemInfo = null;
+    _setState(STATES.AWAITING_ITEM, `Action: ${action} — ${_itemPrompt(action)}`);
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -329,6 +353,7 @@
     _pendingPartId      = null;
     _pendingPartName    = '';
     _pendingCategoryNote = '';
+    _pendingPricingNote = '';
     _pendingLocationId  = null;
     _pendingQty         = null;
     _pendingBatch       = '';
@@ -466,6 +491,21 @@
   /** Fetch the last N tracking entries for a stock item */
   async function _fetchTrackingHistory(stockItemId, limit) {
     try {
+      const audit = await fetch(
+        `/api/audit/?model_type=stockitem&model_id=${stockItemId}&limit=${limit || 3}&ordering=-timestamp`, {
+        headers: { 'Accept': 'application/json' },
+      });
+      if (audit.ok) {
+        const data = await audit.json();
+        const results = Array.isArray(data) ? data : (data.results || []);
+        return results.slice(0, limit || 3).map(entry => ({
+          date: entry.timestamp,
+          user: entry.actor_username || entry.actor_detail?.username || '?',
+          title: entry.event_label || entry.action_label || '',
+          notes: entry.notes || '',
+        }));
+      }
+      if (audit.status !== 404) return [];
       const resp = await fetch(
         `/api/stock/track/?item=${stockItemId}&limit=${limit || 3}&ordering=-date`, {
         headers: { 'Accept': 'application/json' },
@@ -641,8 +681,7 @@
     try {
       return await _apiPost('/plugin/smartparts/api/barcode/lookup/', { barcode: raw });
     } catch (e) {
-      console.warn('[PureScan] Distributor lookup failed:', e);
-      return null;
+      return { error: e.message };
     }
   }
 
@@ -667,6 +706,31 @@
     _setState(STATES.SUCCESS, `${label}\n${_formatDistributorInfo(lk)}`);
     clearTimeout(_resultTimer);
     _resultTimer = setTimeout(() => _resetToIdle(), 12000);
+  }
+
+  async function _execDistributorStockInfo(lk, flow) {
+    const query = new URLSearchParams({ part_id: lk.part_id });
+    const last = _getLastLocation();
+    if (last) query.set('location_id', last.id);
+    _setState(STATES.PROCESSING, 'Looking up stock…');
+    try {
+      const response = await fetch(`/plugin/smartparts/api/purescan/stock-summary/?${query}`);
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+      // A cancel or new command can arrive while the request is in flight.
+      if (flow !== _flowId) return;
+      let detail = `Total stock: ${data.total_stock}`;
+      if (data.location_stock != null) {
+        detail += `\nIn location: ${data.location_stock}`;
+        const labels = data.stock_labels || [];
+        if (labels.length) detail += ` [${labels.join(', ')}${data.more_labels ? ', ...' : ''}]`;
+      }
+      _showResult(STATES.SUCCESS, detail, 12000);
+    } catch (e) {
+      if (flow === _flowId) {
+        _showResult(STATES.ERROR, `Stock lookup failed: ${e.message}`);
+      }
+    }
   }
 
   // ── v3: SYS:LAST / CREATESTOCK helpers ──
@@ -703,8 +767,9 @@
         const catNote = resp.category_path
           ? `\n→ Category: ${resp.category_path}${resp.category_created ? ' (auto-created)' : ''}`
           : '';
+        const warnings = (resp.errors || []).map(message => `\n⚠ ${message}`).join('');
         _showResult(STATES.SUCCESS,
-          `✓ Part created: ${resp.part_name || '#' + resp.part_id}${catNote}\n(no stock yet — use SYS:CREATESTOCK)`, 6000);
+          `✓ Part created: ${resp.part_name || '#' + resp.part_id}${catNote}\n(no stock yet — use SYS:CREATESTOCK)${warnings}`, warnings ? 12000 : 6000);
       } else {
         _showResult(STATES.ERROR, `✗ ${resp.message || resp.error || 'Part creation failed'}`, 8000);
       }
@@ -750,6 +815,10 @@
     if (!bc.type) {
       _setState(STATES.PROCESSING, 'Looking up part…');
       const lk = await _lookupDistributorBarcode(raw);
+      if (lk.error) {
+        _showResult(STATES.ERROR, `Part lookup failed: ${lk.error}`);
+        return;
+      }
       if (!lk || (!lk.found && !lk.mpn)) {
         _showResult(STATES.ERROR, 'Unknown part — run SYS:CREATEPART first', 6000);
         return;
@@ -775,6 +844,11 @@
   }
 
   async function _execCreateStockCommit(token) {
+    const flow = _flowId;
+    const retryState = _state;
+    const desc = `Created stock "${_pendingPartName}" qty ${_pendingQty}` +
+      (_pendingBatch ? ` batch ${_pendingBatch}` : '') + ` → ${token}`;
+    const msg = `✓ ${desc}\nStick the label on the container${_pendingPricingNote}`;
     _setState(STATES.PROCESSING, 'Creating stock item…');
     try {
       await _apiPost('/plugin/smartparts/api/purescan/createstock/', {
@@ -784,13 +858,11 @@
         batch: _pendingBatch || '',
         new_token: token,
       });
-      const desc = `Created stock "${_pendingPartName}" qty ${_pendingQty}` +
-        (_pendingBatch ? ` batch ${_pendingBatch}` : '') + ` → ${token}`;
       _pushLog({
         ts: new Date(), description: desc, actionType: 'CREATESTOCK', undone: false,
         payload: null,
       });
-      const msg = `✓ ${desc}\nStick the label on the container`;
+      if (flow !== _flowId) return;
       if (_action === ACTIONS.FASTADD) {
         _startBurst(msg);
       } else {
@@ -798,14 +870,18 @@
       }
       _clearPendingCreate();
     } catch (e) {
-      _showResult(STATES.ERROR, `Create stock failed: ${e.message}`, 8000);
+      if (flow !== _flowId) return;
+      _setState(retryState, `⚠ Create stock failed: ${e.message}\nScan a free STOCK_ token, or SYS:CANCEL`);
     }
   }
 
   // ── v3: FASTADD ──
 
   async function _execFastAddStart(raw) {
+    const flow = _flowId;
+    _setState(STATES.PROCESSING, 'Reading label…');
     const bc = await _parseInvenTreeBarcode(raw);
+    if (flow !== _flowId) return;
 
     // Instance label → SYS:ADD combo flow
     if (bc.type === 'stockitem' && bc.id) {
@@ -813,6 +889,7 @@
       _stockItemId = bc.id;
       _setState(STATES.PROCESSING, 'Looking up stock item…');
       const info = await _fetchStockItemInfo(bc.id);
+      if (flow !== _flowId) return;
       if (!info) {
         _showResult(STATES.ERROR, `Stock Item #${bc.id} not found`);
         return;
@@ -834,6 +911,11 @@
     if (!bc.type) {
       _setState(STATES.PROCESSING, 'Looking up part… (this can take a few seconds)');
       const lk = await _lookupDistributorBarcode(raw);
+      if (flow !== _flowId) return;
+      if (lk.error) {
+        _showResult(STATES.ERROR, `Part lookup failed: ${lk.error}`);
+        return;
+      }
       if (!lk || (!lk.found && !lk.mpn)) {
         _showResult(STATES.ERROR, 'Unknown part — run SYS:CREATEPART first', 6000);
         return;
@@ -842,12 +924,14 @@
         // Part not in DB → create it (like SYS:CREATEPART)
         try {
           const resp = await _apiPost('/plugin/smartparts/api/purescan/createpart/', { barcode: raw });
+          if (flow !== _flowId) return;
           if (resp.success) {
             _pendingPartId = resp.part_id;
             _pendingPartName = resp.part_name || '';
             _pendingCategoryNote = resp.category_path
               ? `${resp.category_path}${resp.category_created ? ' (auto-created)' : ''}`
               : '';
+            _pendingPricingNote = (resp.errors || []).map(message => `\n⚠ ${message}`).join('');
           } else if (resp.already_exists) {
             _pendingPartId = resp.part_id;
             _pendingPartName = resp.part_name || '';
@@ -856,6 +940,7 @@
             return;
           }
         } catch (e) {
+          if (flow !== _flowId) return;
           _showResult(STATES.ERROR, `Part creation failed: ${e.message}`, 6000);
           return;
         }
@@ -868,7 +953,7 @@
       _pendingBatch = d.batch || '';
       _pendingBarcodeData = d;
       _setState(STATES.AWAITING_LOCATION,
-        _locationPrompt(`Create stock for "${_pendingPartName}"${_pendingCategoryNote ? ' — ' + _pendingCategoryNote : ''}${_pendingQty ? ' (reel qty ' + _pendingQty + ')' : ''}`));
+        _locationPrompt(`Create stock for "${_pendingPartName}"${_pendingCategoryNote ? ' — ' + _pendingCategoryNote : ''}${_pendingQty ? ' (reel qty ' + _pendingQty + ')' : ''}${_pendingPricingNote}`));
       return;
     }
 
@@ -877,18 +962,22 @@
   }
 
   async function _execFastAddMerge(bc) {
+    const flow = _flowId;
+    const qty = _pendingQty;
+    const partName = _pendingPartName;
     _setState(STATES.PROCESSING, `Adding ${_pendingQty}× to "${_pendingPartName}"…`);
     try {
       await _apiPost('/api/stock/add/', {
-        items: [{ pk: bc.id, quantity: _pendingQty }],
-        notes: `PureScan FASTADD: merge ${_pendingQty}×`,
+        items: [{ pk: bc.id, quantity: qty }],
+        notes: `PureScan FASTADD: merge ${qty}×`,
       });
-      const desc = `Added ${_pendingQty}× "${_pendingPartName}" to existing instance ${bc.token || '#' + bc.id}`;
+      const desc = `Added ${qty}× "${partName}" to existing instance ${bc.token || '#' + bc.id}`;
       _pushLog({
         ts: new Date(), description: desc, actionType: 'ADD', undone: false,
-        payload: { stockItemId: bc.id, quantity: _pendingQty, partName: _pendingPartName, previousQty: null },
+        payload: { stockItemId: bc.id, quantity: qty, partName, previousQty: null },
       });
-      const msg = `✅ ${desc}\nMerged into existing instance`;
+      if (flow !== _flowId) return;
+      const msg = `✅ ${desc}\nMerged into existing instance${_pendingPricingNote}`;
       if (_action === ACTIONS.FASTADD) {
         _startBurst(msg);
       } else {
@@ -896,6 +985,7 @@
       }
       _clearPendingCreate();
     } catch (e) {
+      if (flow !== _flowId) return;
       _showResult(STATES.ERROR, `Merge failed: ${e.message}`, 8000);
     }
   }
@@ -1082,6 +1172,9 @@
   async function handleScan(rawString) {
     const raw = (rawString || '').trim();
     if (!raw) return;
+    if (_state === STATES.PROCESSING && !/^SYS:/i.test(raw)) return;
+    const scanFlow = _flowId;
+    if (/^SYS:/i.test(raw) && _burstTimer !== null) _stopBurst();
 
     // ── Global: SYS:CANCEL always resets ─────────────────────────────────
     if (raw.toUpperCase() === 'SYS:CANCEL' || raw.toUpperCase() === 'SYS:RESET') {
@@ -1092,6 +1185,7 @@
 
     // ── Global: SYS:CLEARLOG clears the action log ──────────────────────
     if (raw.toUpperCase() === 'SYS:CLEARLOG' || raw.toUpperCase() === 'SYS:CLEAR') {
+      _flowId++;
       clearLog();
       _showResult(STATES.SUCCESS, '🗑 Action log cleared', 2000);
       return;
@@ -1099,6 +1193,9 @@
 
     // ── Global: SYS:LAST sets the terminal default location ─────────────
     if (raw.toUpperCase() === 'SYS:LAST') {
+      _flowId++;
+      clearTimeout(_resultTimer);
+      clearTimeout(_comboTimer);
       _clearPendingCreate();
       _clearPendingDelete();
       _action = ACTIONS.LAST;
@@ -1111,8 +1208,14 @@
     // ── Global: SYS:UNDO ─────────────────────────────────────────────────
     const ctrlCode = _parseControlCode(raw);
     if (ctrlCode === '__UNDO__') {
+      _flowId++;
       clearTimeout(_comboTimer);
       await _executeUndo();
+      return;
+    }
+
+    if (_state === STATES.PROCESSING && ctrlCode) {
+      _armAction(ctrlCode);
       return;
     }
 
@@ -1157,10 +1260,9 @@
 
     // ── STATE: IDLE / SUCCESS / ERROR ────────────────────────────────────
     if (_state === STATES.IDLE || _state === STATES.SUCCESS || _state === STATES.ERROR) {
-      const burstActive = _burstTimer != null && _action === ACTIONS.FASTADD;
+      const burstActive = _burstTimer != null && Date.now() < _burstDeadline && _action === ACTIONS.FASTADD;
       clearTimeout(_resultTimer);
-      clearTimeout(_burstTimer);
-      _burstTimer = null;
+      _stopBurst();
 
       // v1.2.6 Burst: during the window, route scans straight into FASTADD
       if (burstActive && _state === STATES.SUCCESS && !ctrlCode) {
@@ -1169,11 +1271,7 @@
       }
 
       if (ctrlCode) {
-        _action = ctrlCode;
-        _stockItemId = null;
-        _itemInfo = null;
-        _setState(STATES.AWAITING_ITEM,
-          `Action: ${ctrlCode} — ${_itemPrompt(ctrlCode)}`);
+        _armAction(ctrlCode);
         return;
       }
 
@@ -1217,6 +1315,10 @@
       // Quick-scan shortcut: distributor DataMatrix in IDLE → part lookup
       if (!bc.type) {
         const lk = await _lookupDistributorBarcode(raw);
+        if (lk.error) {
+          _showResult(STATES.ERROR, `Part lookup failed: ${lk.error}`);
+          return;
+        }
         if (lk && (lk.found || (lk.barcode_data && lk.barcode_data.mpn))) {
           _showDistributorInfo(lk);
           return;
@@ -1231,11 +1333,7 @@
     // ── STATE: AWAITING_ITEM ─────────────────────────────────────────────
     if (_state === STATES.AWAITING_ITEM) {
       if (ctrlCode) {
-        _action = ctrlCode;
-        _stockItemId = null;
-        _itemInfo = null;
-        _setState(STATES.AWAITING_ITEM,
-          `Action: ${ctrlCode} — ${_itemPrompt(ctrlCode)}`);
+        _armAction(ctrlCode);
         return;
       }
 
@@ -1261,7 +1359,10 @@
         return;
       }
 
+      const infoFlow = _action === ACTIONS.INFO ? _flowId : null;
+      if (infoFlow !== null) _setState(STATES.PROCESSING, 'Reading label…');
       const bc = await _parseInvenTreeBarcode(raw);
+      if (infoFlow !== null && infoFlow !== _flowId) return;
 
       // INFO mode also accepts location barcodes
       if (_action === ACTIONS.INFO && bc.type === 'stocklocation' && bc.id) {
@@ -1277,7 +1378,17 @@
 
       // INFO mode also accepts distributor DataMatrix labels
       if (_action === ACTIONS.INFO && !bc.type) {
+        _setState(STATES.PROCESSING, 'Looking up distributor label…');
         const lk = await _lookupDistributorBarcode(raw);
+        if (infoFlow !== _flowId) return;
+        if (lk.error) {
+          _showResult(STATES.ERROR, `Part lookup failed: ${lk.error}`);
+          return;
+        }
+        if (lk?.found && lk.part_id) {
+          await _execDistributorStockInfo(lk, infoFlow);
+          return;
+        }
         if (lk && (lk.found || (lk.barcode_data && lk.barcode_data.mpn))) {
           _showDistributorInfo(lk);
           return;
@@ -1390,20 +1501,19 @@
             '⚠ No default location stored — scan a Location label');
           return;
         }
-        _action = ctrlCode;
-        _clearPendingCreate();
-        _setState(STATES.AWAITING_ITEM,
-          `Action: ${ctrlCode} — ${_itemPrompt(ctrlCode)}`);
+        _armAction(ctrlCode);
         return;
       }
 
       const bc = await _parseInvenTreeBarcode(raw);
+      if (scanFlow !== _flowId || _state !== STATES.AWAITING_LOCATION) return;
 
       if (bc.type === 'stocklocation' && bc.id) {
         if (_action === ACTIONS.LAST) {
           let name = bc.name || `Location #${bc.id}`;
           if (!bc.name) {
             const li = await _fetchLocationInfo(bc.id);
+            if (scanFlow !== _flowId || _state !== STATES.AWAITING_LOCATION) return;
             if (li) name = li.name;
           }
           _setLastLocation({ id: bc.id, name: name });
@@ -1417,7 +1527,7 @@
       }
 
       // v1.2.6 FASTADD: free token in the location step → commit with SYS:LAST
-      if (_action === ACTIONS.FASTADD && bc.type === 'free') {
+      if (_action === ACTIONS.FASTADD && bc.type === 'free' && /^STOCK_/i.test(bc.token)) {
         const last = _getLastLocation();
         if (last && last.id) {
           _pendingLocationId = last.id;
@@ -1435,6 +1545,7 @@
         let bcLocId = bc.locationId;
         if (bcPartId == null || bcLocId == null) {
           const bi = await _fetchStockItemInfo(bc.id);
+          if (scanFlow !== _flowId || _state !== STATES.AWAITING_LOCATION) return;
           if (bi) {
             bcPartId = bi.part_id;
             bcLocId = bi.location_id;
@@ -1478,10 +1589,7 @@
     // ── STATE: AWAITING_QTY ──────────────────────────────────────────────
     if (_state === STATES.AWAITING_QTY) {
       if (ctrlCode) {
-        _action = ctrlCode;
-        _clearPendingCreate();
-        _setState(STATES.AWAITING_ITEM,
-          `Action: ${ctrlCode} — ${_itemPrompt(ctrlCode)}`);
+        _armAction(ctrlCode);
         return;
       }
 
@@ -1496,7 +1604,8 @@
       const bc = await _parseInvenTreeBarcode(raw);
 
       // Scanning the free token here accepts the current (default) quantity
-      if (bc.type === 'free') {
+      if (scanFlow !== _flowId || _state !== STATES.AWAITING_QTY) return;
+      if (bc.type === 'free' && /^STOCK_/i.test(bc.token)) {
         if (_pendingQty == null || _pendingQty <= 0) {
           _setState(STATES.AWAITING_QTY,
             '⚠ Quantity required — scan SYS:QTY:nnn first');
@@ -1514,16 +1623,14 @@
     // ── STATE: AWAITING_TOKEN ────────────────────────────────────────────
     if (_state === STATES.AWAITING_TOKEN) {
       if (ctrlCode) {
-        _action = ctrlCode;
-        _clearPendingCreate();
-        _setState(STATES.AWAITING_ITEM,
-          `Action: ${ctrlCode} — ${_itemPrompt(ctrlCode)}`);
+        _armAction(ctrlCode);
         return;
       }
 
       const bc = await _parseInvenTreeBarcode(raw);
 
-      if (bc.type === 'free') {
+      if (scanFlow !== _flowId || _state !== STATES.AWAITING_TOKEN) return;
+      if (bc.type === 'free' && /^STOCK_/i.test(bc.token)) {
         await _execCreateStockCommit(bc.token);
         return;
       }
@@ -1534,6 +1641,7 @@
           let bcLocId = bc.locationId;
           if (bcPartId == null || bcLocId == null) {
             const bi = await _fetchStockItemInfo(bc.id);
+            if (scanFlow !== _flowId || _state !== STATES.AWAITING_TOKEN) return;
             if (bi) {
               bcPartId = bi.part_id;
               bcLocId = bi.location_id;
@@ -1670,8 +1778,10 @@
   function destroy() {
     document.removeEventListener('keydown', _onKey, { capture: true });
     _onStateChange = null;
+    _flowId++;
     clearTimeout(_resultTimer);
     clearTimeout(_comboTimer);
+    _stopBurst();
     _buffer = '';
     _times  = [];
   }

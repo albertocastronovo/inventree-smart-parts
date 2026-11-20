@@ -1,0 +1,90 @@
+SMARTPARTS IMPLEMENTATION PLAN — InvenTree 1.7.3, SmartParts 1.4.0 baseline
+
+1. Review the plugin, prioritizing warehouse operations. Trace FASTADD, stock
+   creation, barcode resolution, part identity and pricing through the browser,
+   views and models; then review batch/API imports, permissions and assets.
+   Report findings with severity, file, operator impact and a proposed fix.
+   Starting points: SHA-256 legacy token hashes vs native barcode hashing;
+   LOC_ accepted in stock creation; duplicate MPN/SKU lookups and numeric PK
+   fallback; concurrent part/token claims; permissions and session CSRF;
+   native barcode scan signature and audit-backed stock history; supplier/SKU
+   filtering bypasses price refresh and delete-first refresh can lose tiers.
+   Fix blockers in touched paths and record remaining review findings.
+
+2. In purescan.js, make FASTADD burst 30 seconds and derive the prompt from
+   the timer constant. Restart the window on successful receive/merge. Cancel
+   stale timers on command changes (including SYS:LAST), cancel and teardown.
+   Verify continued FASTADD at 29 seconds and disarm after expiry. Update
+   current usage docs and the JS cache-busting version.
+
+3. For explicit SYS:INFO + distributor DataMatrix, use the resolved part ID
+   and the terminal's optional SYS:LAST location. Use a dedicated permission-
+   checked endpoint. Sum eligible in-stock quantities for this exact part;
+   use exact location_id for the subset, never child bins. Include unlabelled
+   stock and retain decimal precision. Read stored barcode text, select at
+   most four distinct valid STOCK_[A-Z0-9]{4} values in a stable order and
+   display up to three, with ... if a fourth exists. Output:
+
+     Total stock: 420
+     In location: 180 [STOCK_1A2B, STOCK_3C4D, STOCK_5E6F, ...]
+
+   With no or deleted saved location, omit the second line. With a valid
+   location and zero stock, show In location: 0 without labels. Also omit
+   brackets for a positive but unlabelled subtotal. Distinguish a lookup error
+   from zero. INFO must never auto-create parts. Preserve other INFO flows.
+
+4. Add an optional Stock barcode / QR code field under dashboard Receive
+   Stock; it accepts typing, paste and an Enter-terminated scanner. Exclude
+   it from the MPN scanner listener. Share the token-aware receipt operation
+   with PureScan, validate and normalize STOCK_XXXX, use the native barcode
+   assignment/hash API and reject conflicts. Create stock and bind atomically
+   and serialize concurrent SmartParts claims. Preflight before saving a part;
+   on late failure retain the form and retry only receipt for the saved part.
+   Print only after successful binding/commit. Verify native Quick Scan and
+   PureScan resolve the same item. Provide a dry-run legacy repair if needed.
+
+5. Convert USD supplier prices to EUR using Decimal and InvenTree's stored
+   exchange rates. Normalize for the editor and at the shared persistence path
+   (dashboard, PureScan, batch, API). Leave EUR and other currencies alone.
+   Verify distributor currency parsing (especially DigiKey/Mouser); preserve
+   six decimal places. Missing rates must be visible and must not destroy
+   valid old tiers or block part receipt solely on account of supplier pricing.
+   Add a dry-run-first maintenance tool for stored USD SupplierPriceBreak rows
+   only: preview ID, supplier/SKU, tier, before/after, fixed rate and timestamp;
+   export originals for rollback, skip rows changed since preview, and apply
+   amount/currency together. Re-run should be a no-op. Verify pricing refresh.
+
+6. Run python -m unittest discover -s tests -p "*_tests.py" and relevant JS
+   checks. On a test InvenTree 1.7.3 deployment, exercise warehouse workflows
+   with a regular operator and a real scanner, all INFO variants, competing
+   tokens, FX failure/small amounts, and a preview/apply/re-run of the backfill.
+   Do not apply maintenance to production as part of the code change.
+
+NON-SMARTPARTS WORKFLOWS (documentation only)
+
+1. InvenTree 1.7.3 lets operators edit a stock item's linked barcode with
+   Barcode Actions -> Unlink Barcode -> Link Barcode. A top-bar Quick Scan
+   finds a stock item by its linked label. Normal stock table search and
+   View Barcode do not reveal the linked text. Provide a no-code workaround:
+   Admin Center -> Label Templates -> Stock Item template, render
+   {{ stock_item.barcode_data }}, then Print -> Print Label with the PDF
+   printer. For on-screen text, document a permission-checked UI plugin
+   stock-item panel and native link/unlink actions. A core table column
+   would need upstream support or a maintained frontend customization.
+
+2. Set the exact quantity via the row checkbox -> Stock Actions -> Count
+   Stock, or Stock Operations -> Count Stock on the detail page. Add/Remove
+   Stock adjusts by a delta. Use the Stock Items -> Change group permission
+   and check Delete on deplete when entering zero.
+
+3. Open Parts, select a category and use Parametric View in its Parts panel.
+   Set Include Subcategories as needed, search description using the table
+   search, and combine value and tolerance filters on parameter columns.
+   Enable the Description column to see matches. If a parameter is missing,
+   check its canonical template, category link and stored part value.
+   SmartParts can omit parameters not attached to the category/ancestors.
+   Document /api-doc/ and /api/part/ for repeatable category, text and parameter
+   filters.
+
+Save these instructions and the maintenance usage in
+docs/inventree-1.7.3-workflows.md.

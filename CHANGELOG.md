@@ -2,6 +2,13 @@
 
 All notable changes to SmartParts are documented in this file.
 
+## [1.4.1] - 2026-11-20
+
+- FASTADD keeps the terminal armed for 30 seconds after a receipt or merge.
+- DataMatrix `SYS:INFO` shows total stock and an exact `SYS:LAST` subtotal with up to three linked stock labels.
+- The dashboard Receive Stock form can bind an optional `STOCK_XXXX` label. New bindings use native InvenTree hashing, and a maintenance preview can identify older labels to repair.
+- SmartParts converts USD supplier price breaks to EUR using stored exchange rates. A separate preview/apply tool converts existing USD supplier price breaks.
+
 ## [1.4.0] - 2026-11-18
 
 ### Fixed
