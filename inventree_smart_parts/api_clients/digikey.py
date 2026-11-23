@@ -158,8 +158,10 @@ class DigiKeyClient(BaseApiClient):
     @staticmethod
     def _response_currency(data):
         locale = data.get("SearchLocaleUsed") or data.get("LocaleUsed") or {}
-        return data.get("Currency") or data.get("CurrencyCode") or (
-            locale.get("Currency") if isinstance(locale, dict) else None
+        return (
+            data.get("Currency")
+            or data.get("CurrencyCode")
+            or (locale.get("Currency") if isinstance(locale, dict) else None)
         )
 
     @staticmethod
@@ -276,7 +278,9 @@ class DigiKeyClient(BaseApiClient):
                 depth += 1
         return parts
 
-    def _parse_part(self, raw: Dict[str, Any], search_mpn: str, response_currency=None) -> PartData:
+    def _parse_part(
+        self, raw: Dict[str, Any], search_mpn: str, response_currency=None
+    ) -> PartData:
         """Convert DigiKey product data to PartData."""
         variation = self._select_variation(raw, search_mpn)
 

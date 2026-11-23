@@ -20,6 +20,37 @@ logger = logging.getLogger("inventree_smart_parts.api.mouser")
 
 _DAYS_RE = re.compile(r"^(\d+)\s*days?$", re.IGNORECASE)
 
+# ISO 4217 code inside a localised price ("USD 0.0123", "0,009 EUR").
+_ISO_CODE_RE = re.compile(r"(?<![A-Za-z])([A-Z]{3})(?![A-Za-z])")
+
+# Currency symbols in Mouser's localised price text, longest first so that
+# "CA$" is not read as "A$" or "$". A bare "$" is the US storefront (USD).
+# Ambiguous symbols ("¥", "kr") are left to the EUR fallback.
+_CURRENCY_SYMBOLS = (
+    ("US$", "USD"),
+    ("CA$", "CAD"),
+    ("AU$", "AUD"),
+    ("NZ$", "NZD"),
+    ("HK$", "HKD"),
+    ("SG$", "SGD"),
+    ("NT$", "TWD"),
+    ("MX$", "MXN"),
+    ("C$", "CAD"),
+    ("A$", "AUD"),
+    ("S$", "SGD"),
+    ("R$", "BRL"),
+    ("$", "USD"),
+    ("€", "EUR"),
+    ("£", "GBP"),
+    ("₹", "INR"),
+    ("₩", "KRW"),
+    ("₪", "ILS"),
+    ("฿", "THB"),
+    ("zł", "PLN"),
+    ("Kč", "CZK"),
+    ("Ft", "HUF"),
+)
+
 
 class MouserClient(BaseApiClient):
     """Client for the Mouser Electronics Search API v2."""
@@ -166,6 +197,29 @@ class MouserClient(BaseApiClient):
             return 0.0
 
     @staticmethod
+    def _parse_currency(price_str, explicit=None) -> str:
+        """ISO currency of a Mouser price break.
+
+        The PriceBreak ``Currency`` field wins. Without it the code or symbol
+        in the localised price text decides ("$0.0123" -> USD, "CA$0.007" ->
+        CAD, "0,089 €" -> EUR). Unrecognised text falls back to EUR. USD is
+        converted to EUR later, when the price is stored (services/pricing).
+        """
+        for value in (explicit, price_str):
+            text = str(value or "").strip()
+            if not text:
+                continue
+            if len(text) == 3 and text.isalpha():
+                return text.upper()
+            match = _ISO_CODE_RE.search(text)
+            if match:
+                return match.group(1)
+            for symbol, code in _CURRENCY_SYMBOLS:
+                if symbol in text:
+                    return code
+        return "EUR"
+
+    @staticmethod
     def _parse_stock(raw: Dict) -> Optional[int]:
         """Stock from AvailabilityInStock, else digits of "1,234 In Stock"."""
         for key in ("AvailabilityInStock", "Availability"):
@@ -201,7 +255,7 @@ class MouserClient(BaseApiClient):
             try:
                 qty = int(pb.get("Quantity", 0))
                 price = self._parse_price(pb.get("Price", "0"))
-                currency = pb.get("Currency") or "EUR"
+                currency = self._parse_currency(pb.get("Price"), pb.get("Currency"))
                 if qty > 0 and price > 0:
                     price_breaks.append(
                         PriceBreak(quantity=qty, price=price, currency=currency)

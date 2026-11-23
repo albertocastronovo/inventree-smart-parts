@@ -15,7 +15,9 @@ def resolve_scanned_part(mpn, sku="", manufacturer=""):
     def unique_id(query, field):
         ids = list(query.order_by(field).values_list(field, flat=True).distinct()[:2])
         if len(ids) > 1:
-            raise AmbiguousPart(f"Multiple parts match {mpn or sku}; select the correct part in SmartParts")
+            raise AmbiguousPart(
+                f"Multiple parts match {mpn or sku}; select the correct part in SmartParts"
+            )
         return ids[0] if ids else None
 
     if mpn:
@@ -26,7 +28,9 @@ def resolve_scanned_part(mpn, sku="", manufacturer=""):
                 matches = same_mfr
         if pk := unique_id(matches, "part_id"):
             return Part.objects.get(pk=pk)
-        if pk := unique_id(Part.objects.filter(Q(IPN__iexact=mpn) | Q(name__iexact=mpn)), "pk"):
+        if pk := unique_id(
+            Part.objects.filter(Q(IPN__iexact=mpn) | Q(name__iexact=mpn)), "pk"
+        ):
             return Part.objects.get(pk=pk)
     for code in dict.fromkeys(code for code in (sku, mpn) if code):
         if pk := unique_id(SupplierPart.objects.filter(SKU__iexact=code), "part_id"):

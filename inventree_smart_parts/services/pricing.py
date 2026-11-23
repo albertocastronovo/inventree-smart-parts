@@ -30,8 +30,10 @@ def get_usd_to_eur_rate() -> ExchangeRate:
         rates = {row.currency: row.value for row in rows}
         rates[backend.base_currency] = Decimal(1)
         usd, eur = rates.get("USD"), rates.get("EUR")
-        if usd is not None and eur is not None and all(
-            value.is_finite() and value > 0 for value in (usd, eur)
+        if (
+            usd is not None
+            and eur is not None
+            and all(value.is_finite() and value > 0 for value in (usd, eur))
         ):
             return ExchangeRate(eur / usd, backend.last_update)
     raise PricingError("No usable USD → EUR exchange rate. Refresh rates in InvenTree.")

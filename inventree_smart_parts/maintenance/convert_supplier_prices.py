@@ -24,16 +24,18 @@ def preview(path):
         if rate is None:
             rate = get_usd_to_eur_rate()
         amount, currency = normalize_price(tier.price.amount, "USD", rate)
-        rows.append({
-            "id": tier.pk,
-            "supplier_part_id": tier.part_id,
-            "supplier": tier.part.supplier.name,
-            "sku": tier.part.SKU,
-            "quantity": str(tier.quantity),
-            "updated": tier.updated.isoformat(),
-            "before": {"amount": str(tier.price.amount), "currency": "USD"},
-            "after": {"amount": str(amount), "currency": currency},
-        })
+        rows.append(
+            {
+                "id": tier.pk,
+                "supplier_part_id": tier.part_id,
+                "supplier": tier.part.supplier.name,
+                "sku": tier.part.SKU,
+                "quantity": str(tier.quantity),
+                "updated": tier.updated.isoformat(),
+                "before": {"amount": str(tier.price.amount), "currency": "USD"},
+                "after": {"amount": str(amount), "currency": currency},
+            }
+        )
 
     plan = {
         "type": "smartparts-supplier-usd-to-eur-v1",
@@ -45,7 +47,11 @@ def preview(path):
     with Path(path).open("x", encoding="utf-8") as output:
         json.dump(plan, output, ensure_ascii=False, indent=2)
         output.write("\n")
-    return {"candidates": len(rows), "eur_per_usd": plan["eur_per_usd"], "file": str(path)}
+    return {
+        "candidates": len(rows),
+        "eur_per_usd": plan["eur_per_usd"],
+        "file": str(path),
+    }
 
 
 def _change(path, *, reverse):
@@ -62,7 +68,11 @@ def _change(path, *, reverse):
     changed, skipped = [], []
     with transaction.atomic():
         for row in sorted(plan["rows"], key=lambda row: row["id"]):
-            tier = SupplierPriceBreak.objects.select_for_update().filter(pk=row["id"]).first()
+            tier = (
+                SupplierPriceBreak.objects.select_for_update()
+                .filter(pk=row["id"])
+                .first()
+            )
             if (
                 tier is None
                 or tier.part_id != row["supplier_part_id"]

@@ -24,16 +24,25 @@ def run(dry_run=True):
             continue
         pattern = TOKEN_PATTERNS[prefix].pattern
         candidates = model.objects.filter(**{f"{field}__regex": pattern}).order_by("pk")
-        for pk, token, legacy in candidates.values_list("pk", field, "barcode_hash").iterator():
+        for pk, token, legacy in candidates.values_list(
+            "pk", field, "barcode_hash"
+        ).iterator():
             native = hash_token(token)
             if legacy != legacy_hash_token(token) or legacy == native:
                 continue
             with transaction.atomic():
                 lock_token(token)
-                item = model.objects.select_for_update().filter(pk=pk, barcode_hash=legacy, **{field: token}).first()
+                item = (
+                    model.objects.select_for_update()
+                    .filter(pk=pk, barcode_hash=legacy, **{field: token})
+                    .first()
+                )
                 if item is None:
                     status = "changed since scan"
-                elif any(_has_conflict(other, model, pk, token, native, legacy, Q) for other in models):
+                elif any(
+                    _has_conflict(other, model, pk, token, native, legacy, Q)
+                    for other in models
+                ):
                     status = "conflict"
                 elif dry_run:
                     status = "would repair"
@@ -41,7 +50,9 @@ def run(dry_run=True):
                     # Preserve the existing label text and stock identity.
                     item.assign_barcode(barcode_data=token)
                     status = "repaired"
-                results.append({"model": prefix, "id": pk, "token": token, "status": status})
+                results.append(
+                    {"model": prefix, "id": pk, "token": token, "status": status}
+                )
     return results
 
 

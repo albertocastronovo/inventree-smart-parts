@@ -2,6 +2,31 @@
 
 All notable changes to SmartParts are documented in this file.
 
+## [1.5.1] - 2026-11-23
+
+Repairs the merge of the 1.4.1 warehouse changes onto 1.5.0. Both feature sets now work together.
+
+### Fixed
+- **Every distributor search crashed** (`NameError: only`). This broke dashboard search, PureScan CREATEPART/FASTADD and API v1. `_run_all_api_searches()` takes the `only` source filter again, together with the 1.4.1 `prices` / `raw_prices` options.
+- **Every part create or update with distributor data failed** ("name 'part' is not defined"). `_get_supplier_entries()` no longer reads the database.
+- **Supplier price tiers**: there is one code path again, for new and existing supplier parts. The leftover 1.5.0 path ("fill only when empty") skipped the 1.4.1 in-place refresh and USD→EUR normalisation, and stored USD tiers unconverted.
+- **Mouser currencies**: the code is read from the price text when the `Currency` field is missing (`$`→USD, `CA$`→CAD, `£`→GBP, ISO codes). It is then normalised like DigiKey prices.
+- **PureScan gap-filling is restored.** SYS:CREATEPART on an existing part and the one-time FASTADD Mouser gap-fill work again, on top of the 1.4.1 part resolution (ambiguous match → 409). They require `part.change_part`. Gap-fill writes take the same per-MPN lock as PureScan creates, and pricing warnings appear in the terminal.
+- PureScan CREATEPART uses `API_PRIORITY` again, with DigiKey first by default, instead of a hard-coded Mouser-first fallback.
+- API v1 import: Mouser's flat category is never auto-created again. The 1.4.1 rule (no category creation on dry runs or without `part.add_partcategory`) is kept.
+- FASTADD: a cancel or a new command during the gap-fill request is no longer overwritten by its late response.
+
+### Changed
+- Existing supplier parts now get their quoted price tiers refreshed in place (1.4.1 behaviour), instead of being filled only when empty (1.5.0). Tiers the distributor did not quote are kept. A missing exchange rate skips that supplier's quote and shows a warning. The supplier part link and manufacturer part are still only filled when empty. Gap-fill reports changed tiers as "<Supplier> prices updated".
+
+### Housekeeping
+- `black` formatting (the push CI failed on 10 files).
+- Cache-busters: `purescan.js?v=12`, and `scanner.js?v=7` on the settings page.
+- New tests:
+  - offline: Mouser currencies, supplier entries;
+  - `warehouse_db_checks`: gap-fill supplier part, `only` filter;
+  - `purescan.test.cjs`: FASTADD gap-fill and cancel during the gap-fill.
+
 ## [1.5.0] - 2026-11-19
 
 ### Added

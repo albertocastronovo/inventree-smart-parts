@@ -235,13 +235,16 @@ def create_part_from_data(
                         result.manufacturer_parts_existing.append(mfr_part.pk)
 
             # ── Step 3: SupplierParts ──
+            # Each distributor owns its SupplierPart: a missing one is
+            # created, an existing one gets its quoted tiers refreshed in
+            # place (USD normalised to EUR, see services/pricing.py).
             from .pricing import PriceSnapshot
 
             supplier_entries = _get_supplier_entries(part_data)
             price_snapshot = PriceSnapshot()
             logger.debug(
                 f"Supplier pipeline for '{part_data.mpn}': "
-                f"{len(supplier_entries)} entries to create"
+                f"{len(supplier_entries)} entries to create or refresh"
             )
 
             for i, entry in enumerate(supplier_entries):
@@ -249,9 +252,15 @@ def create_part_from_data(
                     # Each supplier gets its own savepoint so a constraint
                     # failure on one distributor doesn't roll back the rest.
                     with transaction.atomic():
+                        stats: Dict[str, int] = {}
                         sup_part, sup_created = _create_supplier_part(
-                            part, part_data, entry, auto_create_companies,
-                            price_snapshot=price_snapshot, pricing_warnings=result.errors,
+                            part,
+                            part_data,
+                            entry,
+                            auto_create_companies,
+                            price_snapshot=price_snapshot,
+                            pricing_warnings=result.errors,
+                            stats=stats,
                         )
                         if sup_part:
                             if sup_created:
@@ -262,8 +271,8 @@ def create_part_from_data(
                                     )
                             else:
                                 result.supplier_parts_existing.append(sup_part.pk)
-                                if is_update and entry.get("fill_prices"):
-                                    ctx.filled.append(f"{entry['name']} price breaks")
+                                if is_update and stats.get("price_breaks_changed"):
+                                    ctx.filled.append(f"{entry['name']} prices updated")
                 except Exception as e:
                     logger.error(
                         f"Failed to create SupplierPart "
@@ -565,25 +574,14 @@ def _get_supplier_entries(data: PartData) -> List[Dict]:
     exclusively so every distributor gets a SupplierPart.
 
     Deduplicate the input by supplier and SKU; existing supplier parts still
-    need to be processed so their price tiers can be updated.
+    need to be processed so their price tiers can be updated. Pure function:
+    no database access (_create_supplier_part decides create vs. refresh).
     """
     entries = []
     seen_keys: set = set()  # lower-case "name:sku" keys
 
     def _mem_key(name: str, sku: str) -> str:
         return f"{name.strip().lower()}:{sku.strip().lower()}"
-
-    def _db_supplier_part(name: str, sku: str):
-        if part is None:
-            return None
-        return SupplierPart.objects.filter(
-            part=part,
-            supplier__name__iexact=name.strip(),
-            SKU__iexact=sku.strip(),
-        ).first()
-
-    def _already_in_db(name: str, sku: str) -> bool:
-        return _db_supplier_part(name, sku) is not None
 
     # ── Primary path: iterate raw_data['supplier_data'] (all API sources) ──
     supplier_data_list = data.raw_data.get("supplier_data", [])
@@ -606,33 +604,6 @@ def _get_supplier_entries(data: PartData) -> List[Dict]:
             logger.debug(
                 f"  [{src}] Skipped – duplicate in current batch ({name}:{sku})"
             )
-            continue
-
-        existing_sp = _db_supplier_part(name, sku)
-        if existing_sp is not None:
-            seen_keys.add(key)
-            # Gap fill: an existing supplier part without any price breaks
-            # gets this source's prices; otherwise it is left untouched.
-            if sd.get("price_breaks") and not existing_sp.pricebreaks.exists():
-                entries.append(
-                    {
-                        "name": name,
-                        "sku": sku,
-                        "url": sd.get("supplier_url", ""),
-                        "fill_prices": True,
-                        "price_breaks": [
-                            PriceBreak(
-                                quantity=pb["qty"],
-                                price=pb["price"],
-                                currency=pb.get("currency", "EUR"),
-                            )
-                            for pb in sd.get("price_breaks", [])
-                        ],
-                    }
-                )
-                logger.debug(f"  [{src}] Queued price-break fill ({name}:{sku})")
-            else:
-                logger.debug(f"  [{src}] Skipped – already in DB ({name}:{sku})")
             continue
 
         pbs = [
@@ -671,25 +642,42 @@ def _get_supplier_entries(data: PartData) -> List[Dict]:
             logger.debug(f"  [fallback] Queued SupplierPart: {name} / {sku}")
 
     logger.info(
-        f"_get_supplier_entries → {len(entries)} to create for MPN '{data.mpn}': "
-        f"{[e['name'] + ':' + e['sku'] for e in entries]}"
+        f"_get_supplier_entries → {len(entries)} to create or refresh for MPN "
+        f"'{data.mpn}': {[e['name'] + ':' + e['sku'] for e in entries]}"
     )
     return entries
 
 
 def _create_supplier_part(
-    part, data: PartData, supplier_entry: Dict, auto_create: bool,
-    *, price_snapshot, pricing_warnings,
+    part,
+    data: PartData,
+    supplier_entry: Dict,
+    auto_create: bool,
+    *,
+    price_snapshot=None,
+    pricing_warnings: Optional[List[str]] = None,
+    stats: Optional[Dict[str, int]] = None,
 ) -> Tuple[Optional["SupplierPart"], bool]:
-    """Create or update a SupplierPart linking Part to Supplier.
+    """Create or refresh the SupplierPart linking ``part`` to a distributor.
 
-    Returns (supplier_part, was_created). was_created=False means the record
-    already existed (and may have had its price breaks refreshed).
+    Each distributor owns its SupplierPart (matched by supplier + SKU,
+    case-insensitive):
+    - missing  -> created with the quoted price tiers;
+    - existing -> manufacturer part / link filled only when empty, quoted
+      tiers refreshed in place (_sync_price_breaks); tiers the distributor
+      did not quote are kept.
+
+    ``stats["price_breaks_changed"]`` receives the number of tiers created or
+    changed. Returns (supplier_part, was_created).
     """
-    from django.db import transaction
-    from company.models import ManufacturerPart, SupplierPart, SupplierPriceBreak
-    from djmoney.money import Money
-    from .pricing import PricingError
+    from company.models import ManufacturerPart, SupplierPart
+
+    if price_snapshot is None:
+        from .pricing import PriceSnapshot
+
+        price_snapshot = PriceSnapshot()
+    if pricing_warnings is None:
+        pricing_warnings = []
 
     supplier_name = supplier_entry["name"]
     sku = supplier_entry["sku"]
@@ -704,63 +692,16 @@ def _create_supplier_part(
         logger.warning(f"Could not find/create supplier: {supplier_name}")
         return None, False
 
-    existing = SupplierPart.objects.filter(
-        part__pk=part.pk,
-        supplier=supplier,
-        SKU=sku,
-    ).first()
-
-    if existing:
-        update_fields = []
-
-        # ── Backfill manufacturer_part if missing ──
-        if not existing.manufacturer_part:
-            from company.models import ManufacturerPart as MP
-
-            mfr = MP.objects.filter(part=part, MPN__iexact=data.mpn).first()
-            if mfr:
-                existing.manufacturer_part = mfr
-                update_fields.append("manufacturer_part")
-                logger.info(
-                    f"Backfilled manufacturer_part on SupplierPart {existing.pk}"
-                )
-
-        # ── Fill URL if missing (never overwrite) ──
-        new_url = supplier_entry.get("url", "")
-        if new_url and not existing.link:
-            existing.link = new_url
-            update_fields.append("link")
-
-        if update_fields:
-            existing.save(update_fields=update_fields)
-
-        # ── Fill price breaks only if the supplier part has none ──
-        if new_price_breaks and not existing.pricebreaks.exists():
-            for pb in new_price_breaks:
-                try:
-                    SupplierPriceBreak.objects.create(
-                        part=existing,
-                        quantity=pb.quantity,
-                        price=pb.price,
-                        price_currency=pb.currency,
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to refresh price break for {sku}: {e}")
-
-        logger.debug(f"SupplierPart updated (existing): {sku} @ {supplier_name}")
-        return existing, False  # ← not newly created
-
-    # ── Create new SupplierPart via get_or_create ──
-    # Reuse existing ManufacturerPart (case-insensitive) — critical when
+    # Reuse the part's ManufacturerPart (case-insensitive) — critical when
     # multiple distributors share the same MPN from the same manufacturer.
-    from company.models import ManufacturerPart
-
     mfr_part = ManufacturerPart.objects.filter(
         part=part,
         MPN__iexact=data.mpn,
     ).first()
 
-    sup_part = SupplierPart.objects.filter(part=part, supplier=supplier, SKU__iexact=sku).first()
+    sup_part = SupplierPart.objects.filter(
+        part=part, supplier=supplier, SKU__iexact=sku
+    ).first()
     was_created = False
     if sup_part is None:
         sup_part, was_created = SupplierPart.objects.get_or_create(
@@ -782,7 +723,7 @@ def _create_supplier_part(
             update_fields.append("manufacturer_part")
             logger.info(f"Backfilled manufacturer_part on SupplierPart {sup_part.pk}")
 
-        # Fill URL if missing
+        # Fill URL if missing (never overwrite)
         new_url = supplier_entry.get("url", "")
         if new_url and not sup_part.link:
             sup_part.link = new_url
@@ -795,11 +736,47 @@ def _create_supplier_part(
             f"SupplierPart already existed: {sku} @ {supplier_name} (ID: {sup_part.pk})"
         )
 
+    changed = _sync_price_breaks(
+        sup_part,
+        new_price_breaks,
+        price_snapshot,
+        pricing_warnings,
+        label=f"{supplier_name} {sku}",
+    )
+    if stats is not None:
+        stats["price_breaks_changed"] = changed
+
+    if was_created:
+        logger.info(
+            f"Created SupplierPart: {sku} @ {supplier_name} (ID: {sup_part.pk})"
+        )
+
+    return sup_part, was_created
+
+
+def _sync_price_breaks(
+    sup_part, price_breaks, price_snapshot, pricing_warnings, label: str
+) -> int:
+    """Upsert the quoted price tiers of one SupplierPart.
+
+    The whole quote is normalised first (USD -> EUR with InvenTree's stored
+    rates, services/pricing.py): a missing rate or an invalid tier skips the
+    entire quote with a warning, so stored prices are never replaced by a
+    partial or mislabelled set. Tiers are updated in place; quantities the
+    distributor did not quote are kept. Returns the number of tiers created
+    or changed.
+    """
+    from django.db import transaction
+    from company.models import SupplierPart, SupplierPriceBreak
+    from djmoney.money import Money
+    from .pricing import PricingError
+
+    changed = 0
     try:
         # Normalize the entire quoted set first. A missing rate or invalid tier
         # must not replace any of this supplier's previously stored prices.
         prices = []
-        for pb in new_price_breaks:
+        for pb in price_breaks:
             try:
                 quantity = Decimal(str(pb.quantity))
             except DecimalException as exc:
@@ -812,7 +789,9 @@ def _create_supplier_part(
                 SupplierPart.objects.select_for_update().get(pk=sup_part.pk)
                 for quantity, amount, currency in prices:
                     money = Money(amount, currency)
-                    tier = SupplierPriceBreak.objects.filter(part=sup_part, quantity=quantity).first()
+                    tier = SupplierPriceBreak.objects.filter(
+                        part=sup_part, quantity=quantity
+                    ).first()
                     if tier is None:
                         tier = SupplierPriceBreak(part=sup_part, quantity=quantity)
                     elif tier.price == money:
@@ -820,17 +799,12 @@ def _create_supplier_part(
                     tier.price = money
                     tier.full_clean()
                     tier.save()
+                    changed += 1
     except PricingError as exc:
-        message = f"Supplier pricing skipped for {supplier_name} {sku}: {exc}"
+        message = f"Supplier pricing skipped for {label}: {exc}"
         pricing_warnings.append(message)
         logger.warning(message)
-
-    if was_created:
-        logger.info(
-            f"Created SupplierPart: {sku} @ {supplier_name} (ID: {sup_part.pk})"
-        )
-
-    return sup_part, was_created
+    return changed
 
 
 def _get_or_create_company(

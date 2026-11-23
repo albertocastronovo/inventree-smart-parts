@@ -359,7 +359,9 @@ def purescan_command_sheet(request):
 # ═══════════════════════════════════════════════════════════════════
 
 
-def _run_all_api_searches(plugin, mpn: str, *, prices=None, raw_prices=False):
+def _run_all_api_searches(
+    plugin, mpn: str, only=None, *, prices=None, raw_prices=False
+):
     """
     Query all enabled distributor APIs for the given MPN.
 
@@ -375,6 +377,8 @@ def _run_all_api_searches(plugin, mpn: str, *, prices=None, raw_prices=False):
 
     ``only``: optional iterable of source names to restrict the query to
     (e.g. {"mouser"} for a Mouser label gap-fill).
+    ``prices``: PriceSnapshot used to present results_dict prices in EUR
+    (one FX lookup per request); ``raw_prices=True`` keeps source currencies.
     """
     from .api_clients import MouserClient, DigiKeyClient, LCSCClient
     from .services.pricing import PriceSnapshot
@@ -481,17 +485,25 @@ DISTRIBUTOR_SUPPLIER_NAMES = {"mouser": "Mouser", "digikey": "DigiKey"}
 DISTRIBUTOR_ENABLE_SETTINGS = {"mouser": "MOUSER_ENABLED", "digikey": "DIGIKEY_ENABLED"}
 
 
-def _resolve_category(plugin, merged, default_threshold: int = 65):
+def _resolve_category(
+    plugin, merged, default_threshold: int = 65, allow_create: bool = True
+):
     """Category resolution for merged distributor data (settings-driven).
 
     Flat leaf categories (Mouser) are only fuzzy-matched / defaulted, never
-    auto-created. Returns (cat_id, cat_path, score, created).
+    auto-created. ``allow_create=False`` (dry runs, callers without the
+    ``part.add_partcategory`` permission) disables auto-creation for every
+    source. Returns (cat_id, cat_path, score, created).
     """
     from .services.category_mapper import resolve_category_for_source
 
     source = (merged.raw_data or {}).get("field_sources", {}).get("category", "")
     return resolve_category_for_source(
-        merged.category, plugin, source=source, default_threshold=default_threshold
+        merged.category,
+        plugin,
+        source=source,
+        default_threshold=default_threshold,
+        allow_create=allow_create,
     )
 
 
@@ -511,15 +523,19 @@ def _enrich_existing_part(plugin, part, mpn: str, only=None) -> dict:
     Priority-aware (see services/provenance.py): empty fields are filled,
     values written by a lower-priority source are replaced by a higher one,
     manual edits and legacy values are never touched. Missing supplier
-    parts (with their price breaks) are added.
+    parts are added; existing ones get their quoted price tiers refreshed
+    (USD normalised to EUR). ``errors`` also carries pricing warnings.
 
     Returns {"success", "filled", "message", "errors"}.
     """
+    from django.db import transaction
     from .services.data_merger import merge_part_data, get_priority_order
     from .services.part_creator import create_part_from_data
+    from .services.part_identity import lock_part_identity
     from .services import provenance
 
-    api_results, _ = _run_all_api_searches(plugin, mpn, only=only)
+    # The serialized results are discarded here: skip the display FX lookup.
+    api_results, _ = _run_all_api_searches(plugin, mpn, only=only, raw_prices=True)
     priority_order = get_priority_order(plugin)
     merged = merge_part_data(api_results, priority_order, search_term=mpn, strict=True)
     if not merged:
@@ -547,14 +563,19 @@ def _enrich_existing_part(plugin, part, mpn: str, only=None) -> dict:
             except Exception as e:
                 logger.warning(f"[PureScan] gap-fill category mapping failed: {e}")
 
-    creation = create_part_from_data(
-        part_data=merged,
-        category_id=category_id,
-        update_existing=True,
-        existing_part_id=part.pk,
-        auto_create_companies=bool(plugin.get_setting("AUTO_CREATE_MANUFACTURERS")),
-        priority_order=priority_order,
-    )
+    # Serialise with PureScan creates and other gap-fills of the same MPN
+    # (two terminals scanning the same reel): PostgreSQL advisory lock held
+    # until this transaction ends. Distributor calls happen before it.
+    with transaction.atomic():
+        lock_part_identity(merged.mpn)
+        creation = create_part_from_data(
+            part_data=merged,
+            category_id=category_id,
+            update_existing=True,
+            existing_part_id=part.pk,
+            auto_create_companies=bool(plugin.get_setting("AUTO_CREATE_MANUFACTURERS")),
+            priority_order=priority_order,
+        )
     _log_activity(
         "INFO" if creation.success else "ERROR",
         f"[PureScan] gap-fill '{part.name}' "
@@ -1555,7 +1576,9 @@ def _part_data_to_dict(pd, *, prices=None) -> dict:
         warnings.update(price_warnings)
         normalized = []
         for supplier in supplier_data:
-            tiers, tier_warnings = present_price_breaks(supplier.get("price_breaks", []), prices)
+            tiers, tier_warnings = present_price_breaks(
+                supplier.get("price_breaks", []), prices
+            )
             normalized.append({**supplier, "price_breaks": tiers})
             warnings.update(tier_warnings)
         supplier_data = normalized
@@ -1825,7 +1848,9 @@ def _print_receipt_label(request, stock, template_id):
     result = print_stock_label(
         stock_item_id=stock["stock_id"],
         template_id=template_id,
-        plugin_slug=(plugin.get_setting("DEFAULT_PRINT_PLUGIN") or "") if plugin else "",
+        plugin_slug=(
+            (plugin.get_setting("DEFAULT_PRINT_PLUGIN") or "") if plugin else ""
+        ),
         request=request,
     )
     _log_activity(
@@ -2085,15 +2110,17 @@ def purescan_print_label(request):
 # ═══════════════════════════════════════════════════════════════════
 
 
-def _part_already_exists(part):
-    return JsonResponse({
+def _part_exists_payload(part) -> dict:
+    """Base PureScan CREATEPART body for a part that already exists."""
+    return {
         "success": False,
         "already_exists": True,
         "part_id": part.pk,
         "part_name": part.name,
         "part_ipn": getattr(part, "IPN", "") or "",
         "message": f"Part already exists: {part.name}",
-    })
+        "enriched": [],
+    }
 
 
 @csrf_exempt
@@ -2138,7 +2165,9 @@ def _token_lookup_response(request, token):
 
     if obj is not None:
         if kind not in _BARCODE_VIEW_PERMISSIONS:
-            return JsonResponse({"error": "Barcode already linked to another object"}, status=409)
+            return JsonResponse(
+                {"error": "Barcode already linked to another object"}, status=409
+            )
         denied = _check_perm(request, _BARCODE_VIEW_PERMISSIONS[kind])
         if denied:
             return denied
@@ -2171,10 +2200,11 @@ def _token_lookup_response(request, token):
 def purescan_createpart(request):
     """
     POST: Create a part from a scanned distributor DataMatrix barcode.
-    Body: { barcode }
+    Body: { barcode, enrich_scope?: "all" | "label" }
     Quantity information is discarded (parts carry no stock).
     Part identity is discriminated by MPN/SKU only — batch codes are ignored.
-    Gracefully reports "already exists" instead of failing hard.
+    An existing part is reported as "already exists" and gap-filled
+    (priority-aware, see _enrich_existing_part) when the user may change it.
     """
     if request.method != "POST":
         return JsonResponse({"error": "POST required"}, status=405)
@@ -2215,12 +2245,64 @@ def purescan_createpart(request):
             status=400,
         )
 
+    # enrich_scope: "all" (default, SYS:CREATEPART) queries every enabled
+    # distributor; "label" (FASTADD) only the distributor the label came from,
+    # and only if the part has no supplier part from it yet.
+    enrich_scope = str(body.get("enrich_scope", "all") or "all").lower()
+
+    def _exists_response(part, query_mpn):
+        """Answer "already exists" and gap-fill that part.
+
+        Never called while holding the identity lock (distributor calls).
+        Gap-fill changes the part, so it needs part.change_part; without it
+        the scan only reports the existing part.
+        """
+        resp = _part_exists_payload(part)
+        plugin_ = _get_plugin()
+        if not plugin_ or not query_mpn:
+            return JsonResponse(resp)
+        if not _has_perm(request.user, "part.change_part"):
+            resp["enrich_skipped"] = 'Permission "part.change_part" required'
+            return JsonResponse(resp)
+        only = None
+        if enrich_scope == "label":
+            dist = (parsed.distributor or "").lower()
+            setting = DISTRIBUTOR_ENABLE_SETTINGS.get(dist)
+            if (
+                not setting
+                or not plugin_.get_setting(setting)
+                or _has_distributor_supplier_part(part, dist)
+            ):
+                return JsonResponse(resp)
+            only = {dist}
+        try:
+            enr = _enrich_existing_part(plugin_, part, query_mpn, only=only)
+            resp["enriched"] = enr["filled"]
+            if enr["errors"]:
+                resp["enrich_errors"] = enr["errors"]
+            if enr["filled"]:
+                resp["message"] += f" - filled: {', '.join(enr['filled'])}"
+            else:
+                resp["message"] += " - nothing to fill"
+        except Exception as e:
+            logger.warning(f"[PureScan] gap-fill failed for '{part.name}': {e}")
+            resp["enrich_errors"] = [str(e)]
+        return JsonResponse(resp)
+
     try:
         existing = resolve_scanned_part(mpn, sku)
     except AmbiguousPart as exc:
         return JsonResponse({"error": str(exc)}, status=409)
     if existing is not None:
-        return _part_already_exists(existing)
+        # Use the MPN stored on the part when the label only had a SKU
+        query = mpn
+        if not query:
+            try:
+                mp = existing.manufacturer_parts.first()
+                query = mp.MPN if mp else ""
+            except Exception:
+                query = ""
+        return _exists_response(existing, query)
 
     if not mpn:
         return JsonResponse(
@@ -2254,12 +2336,9 @@ def purescan_createpart(request):
             }
         )
 
-    from .services.data_merger import merge_part_data
+    from .services.data_merger import merge_part_data, get_priority_order
 
-    priority_str = (
-        plugin.get_setting("API_PRIORITY") or "mouser,digikey,element14,tme,lcsc"
-    )
-    priority_order = [p.strip() for p in priority_str.split(",") if p.strip()]
+    priority_order = get_priority_order(plugin)
     # Strict MPN identity: only distributor hits whose MPN (or SKU) exactly
     # matches the label are used — a different MPN is a different part.
     merged = merge_part_data(api_results, priority_order, search_term=mpn, strict=True)
@@ -2293,21 +2372,31 @@ def purescan_createpart(request):
     from .services.part_creator import create_part_from_data
     from django.db import transaction
 
+    creation = None
     try:
         with transaction.atomic():
+            # Recheck the canonical MPN under the identity lock so two
+            # terminals cannot both create the same part.
             lock_part_identity(merged.mpn)
             existing = resolve_scanned_part(merged.mpn, sku, merged.manufacturer)
-            if existing is not None:
-                return _part_already_exists(existing)
-            creation = create_part_from_data(
-                part_data=merged,
-                category_id=category_id,
-                update_existing=False,
-                existing_part_id=None,
-                auto_create_companies=bool(plugin.get_setting("AUTO_CREATE_MANUFACTURERS")),
-            )
+            if existing is None:
+                creation = create_part_from_data(
+                    part_data=merged,
+                    category_id=category_id,
+                    update_existing=False,
+                    existing_part_id=None,
+                    auto_create_companies=bool(
+                        plugin.get_setting("AUTO_CREATE_MANUFACTURERS")
+                    ),
+                    priority_order=priority_order,
+                )
     except AmbiguousPart as exc:
         return JsonResponse({"error": str(exc)}, status=409)
+
+    if existing is not None:
+        # Created meanwhile by another terminal, or the label's 1P was a
+        # distributor SKU: gap-fill it after the lock has been released.
+        return _exists_response(existing, merged.mpn)
 
     _log_activity(
         "INFO" if creation.success else "ERROR",
@@ -2572,7 +2661,9 @@ def _api_v1_import(request):
     if auth_error:
         return auth_error
     if not _has_perm(user, "part.view_part"):
-        return JsonResponse({"error": 'Permission denied – requires "part.view_part"'}, status=403)
+        return JsonResponse(
+            {"error": 'Permission denied – requires "part.view_part"'}, status=403
+        )
 
     # ── Parse body ──────────────────────────────────────────────────
     try:
@@ -2631,24 +2722,15 @@ def _api_v1_import(request):
     # Category mapping ------------------------------------------------------
     category_match = None
     if merged and merged.category:
-        from .services.category_mapper import resolve_category_with_autocreate
-
-        threshold = plugin.get_setting("FUZZY_THRESHOLD") or 65
-        default_cat = plugin.get_setting("DEFAULT_CATEGORY") or ""
-        user_synonyms = plugin.get_setting("CATEGORY_SYNONYMS") or "{}"
-        learned_mappings = plugin.get_setting("LEARNED_CATEGORY_MAPPINGS") or "{}"
-        cat_id, cat_path, score, _cat_created = resolve_category_with_autocreate(
-            merged.category,
-            threshold,
-            default_cat,
-            user_synonyms_json=user_synonyms,
-            learned_mappings_json=learned_mappings,
-            plugin=plugin,
-            auto_create=bool(
-                auto_create
-                and not dry_run
-                and _has_perm(user, "part.add_partcategory")
-                and plugin.get_setting("AUTO_CREATE_CATEGORIES")
+        # Lookups and dry runs never create categories; real imports only
+        # with the category permission. Mouser's flat leaf category is never
+        # auto-created (see _resolve_category).
+        cat_id, cat_path, score, _cat_created = _resolve_category(
+            plugin,
+            merged,
+            default_threshold=65,
+            allow_create=bool(
+                auto_create and not dry_run and _has_perm(user, "part.add_partcategory")
             ),
         )
         category_match = {
@@ -2724,7 +2806,10 @@ def _api_v1_import(request):
         if dup_info and dup_info["is_duplicate"] and effective_update_existing:
             existing_part_id = dup_info["part_id"]
             if not _has_perm(user, "part.change_part"):
-                return JsonResponse({"error": 'Permission denied – requires "part.change_part"'}, status=403)
+                return JsonResponse(
+                    {"error": 'Permission denied – requires "part.change_part"'},
+                    status=403,
+                )
 
         creation_result = create_part_from_data(
             part_data=merged,

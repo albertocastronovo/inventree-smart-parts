@@ -1605,12 +1605,18 @@ FLAT_CATEGORY_SOURCES = frozenset({"mouser"})
 
 
 def resolve_category_for_source(
-    distributor_category: str, plugin, source: str = "", default_threshold: int = 45
+    distributor_category: str,
+    plugin,
+    source: str = "",
+    default_threshold: int = 45,
+    allow_create: bool = True,
 ) -> Tuple[Optional[int], str, int, bool]:
     """resolve_category_with_autocreate() driven by the plugin settings.
 
     ``source`` is the distributor that supplied the category string; flat
-    leaf categories (Mouser) never auto-create.
+    leaf categories (Mouser) never auto-create. ``allow_create=False``
+    (dry runs, users without ``part.add_partcategory``) disables
+    auto-creation for every source.
     """
 
     def _get(key, default=None):
@@ -1620,7 +1626,7 @@ def resolve_category_for_source(
             val = None
         return default if val in (None, "") else val
 
-    auto_create = bool(_get("AUTO_CREATE_CATEGORIES", True))
+    auto_create = bool(allow_create) and bool(_get("AUTO_CREATE_CATEGORIES", True))
     if (source or "").lower() in FLAT_CATEGORY_SOURCES:
         auto_create = False
 

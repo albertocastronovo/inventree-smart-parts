@@ -215,7 +215,9 @@ def _attribute_legacy_creation(stock_item, quantity, kwargs, user):
                     notes="Created via Smart Parts plugin",
                 )
     except Exception as te:
-        logger.warning("Could not attribute stock creation for %s: %s", stock_item.pk, te)
+        logger.warning(
+            "Could not attribute stock creation for %s: %s", stock_item.pk, te
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -381,7 +383,9 @@ def print_stock_label(
     try:
         from report.models import LabelTemplate
 
-        template = LabelTemplate.objects.get(pk=template_id, enabled=True, model_type="stockitem")
+        template = LabelTemplate.objects.get(
+            pk=template_id, enabled=True, model_type="stockitem"
+        )
         resolved_key = _resolve_print_plugin_key(plugin_slug)
 
         from plugin.registry import registry as plugin_registry

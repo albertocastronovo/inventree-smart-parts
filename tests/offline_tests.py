@@ -200,7 +200,8 @@ class DigiKeyParseTests(unittest.TestCase):
                 tier.pop("Currency", None)
         self.client._get_auth_headers = lambda: {}
         self.client._request = lambda *a, **k: {
-            "Products": [product], "SearchLocaleUsed": {"Currency": "EUR"},
+            "Products": [product],
+            "SearchLocaleUsed": {"Currency": "EUR"},
         }
         pd = self.client.search_by_mpn("296-1234-1-nd")
         self.assertEqual([tier.currency for tier in pd.price_breaks], ["EUR"])
@@ -208,16 +209,78 @@ class DigiKeyParseTests(unittest.TestCase):
 
 class MouserPricingTests(unittest.TestCase):
     def test_preserves_reported_currencies_and_recognizes_missing_usd_code(self):
-        parsed = MouserClient(api_key="key")._parse_part({
-            "ManufacturerPartNumber": "R-10K",
-            "PriceBreaks": [
-                {"Quantity": 1, "Price": "$0.0123"},
-                {"Quantity": 10, "Price": "€0,009", "Currency": "EUR"},
-                {"Quantity": 100, "Price": "CA$0.007"},
-            ],
-        }, "R-10K")
-        self.assertEqual([(p.currency, p.price) for p in parsed.price_breaks],
-                         [("USD", 0.0123), ("EUR", 0.009), ("CAD", 0.007)])
+        parsed = MouserClient(api_key="key")._parse_part(
+            {
+                "ManufacturerPartNumber": "R-10K",
+                "PriceBreaks": [
+                    {"Quantity": 1, "Price": "$0.0123"},
+                    {"Quantity": 10, "Price": "€0,009", "Currency": "EUR"},
+                    {"Quantity": 100, "Price": "CA$0.007"},
+                ],
+            },
+            "R-10K",
+        )
+        self.assertEqual(
+            [(p.currency, p.price) for p in parsed.price_breaks],
+            [("USD", 0.0123), ("EUR", 0.009), ("CAD", 0.007)],
+        )
+
+    def test_currency_from_code_symbol_or_fallback(self):
+        cur = MouserClient._parse_currency
+        self.assertEqual(cur("0,089 €"), "EUR")
+        self.assertEqual(cur("£0.50"), "GBP")
+        self.assertEqual(cur("USD 0.0123"), "USD")
+        self.assertEqual(cur("1,23 CHF"), "CHF")
+        self.assertEqual(cur("US$1,234.56"), "USD")
+        self.assertEqual(cur("AU$0.10"), "AUD")
+        self.assertEqual(cur("0.5"), "EUR")  # nothing recognisable
+        self.assertEqual(cur("$0.10", "eur"), "EUR")  # Currency field wins
+
+
+class SupplierEntriesTests(unittest.TestCase):
+    """_get_supplier_entries is pure (no DB): every distributor entry is
+    returned so existing supplier parts get their tiers refreshed.
+    Regression: the 1.4.1 merge left it referencing an undefined `part`."""
+
+    def test_every_distributor_entry_is_returned(self):
+        from inventree_smart_parts.services.part_creator import _get_supplier_entries
+
+        data = PartData(
+            mpn="GRM32EC72A106ME05K",
+            raw_data={
+                "supplier_data": [
+                    {
+                        "source": "digikey",
+                        "supplier_name": "DigiKey",
+                        "supplier_sku": "490-1-ND",
+                        "supplier_url": "https://dk.example/p",
+                        "price_breaks": [{"qty": 1, "price": 0.5, "currency": "USD"}],
+                    },
+                    {
+                        "source": "mouser",
+                        "supplier_name": "Mouser",
+                        "supplier_sku": "81-GRM32",
+                        "price_breaks": [{"qty": 10, "price": 0.4}],
+                    },
+                    # duplicate (case-insensitive) and SKU-less entries are skipped
+                    {
+                        "source": "mouser",
+                        "supplier_name": "mouser",
+                        "supplier_sku": "81-grm32",
+                    },
+                    {"source": "lcsc", "supplier_name": "LCSC", "supplier_sku": ""},
+                ]
+            },
+        )
+        entries = _get_supplier_entries(data)
+        self.assertEqual(
+            [(e["name"], e["sku"]) for e in entries],
+            [("DigiKey", "490-1-ND"), ("Mouser", "81-GRM32")],
+        )
+        self.assertEqual(entries[0]["url"], "https://dk.example/p")
+        self.assertEqual(entries[0]["price_breaks"][0].currency, "USD")
+        self.assertEqual(entries[1]["price_breaks"][0].currency, "EUR")  # default
+        self.assertNotIn("fill_prices", entries[1])
 
 
 class MergeIdentityTests(unittest.TestCase):

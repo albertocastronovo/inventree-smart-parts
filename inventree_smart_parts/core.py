@@ -39,7 +39,7 @@ class SmartPartsPlugin(
         "Fetches data from Mouser, DigiKey, LCSC, element14/Farnell, and TME. "
         "Maps categories, detects duplicates, and supports batch Excel import."
     )
-    VERSION = "1.5.0"
+    VERSION = "1.5.1"
     AUTHOR = "StarkStrom Engineering"
 
     # ── Plugin Settings (Admin-configurable) ─────────────────────────

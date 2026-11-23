@@ -687,13 +687,20 @@
 
   const DISTRIBUTOR_LABELS = { mouser: 'Mouser', digikey: 'DigiKey' };
 
-  // "✓ Filled: a, b" / "Nothing to fill" line for gap-fill results
+  // "✓ Filled: a, b" / "Nothing to fill" line for gap-fill results.
+  // Errors and pricing warnings are listed separately (_warningLines).
   function _filledNote(resp) {
     if (!resp) return '';
     const filled = resp.enriched || [];
     if (filled.length) return `✓ Filled: ${filled.join(', ')}`;
-    if (resp.enrich_errors && resp.enrich_errors.length) return `⚠ Gap-fill failed: ${resp.enrich_errors[0]}`;
+    if (resp.enrich_skipped) return `Not filled: ${resp.enrich_skipped}`;
+    if ((resp.enrich_errors || []).length) return '';
     return 'Nothing to fill';
+  }
+
+  // "\n⚠ …" lines for server warnings (e.g. supplier pricing skipped)
+  function _warningLines(messages) {
+    return (messages || []).map(message => `\n⚠ ${message}`).join('');
   }
 
   function _formatDistributorInfo(lk) {
@@ -772,15 +779,18 @@
     try {
       const resp = await _apiPost('/plugin/smartparts/api/purescan/createpart/', { barcode: raw });
       if (resp.already_exists) {
+        const note = _filledNote(resp);
+        const warnings = _warningLines(resp.enrich_errors);
         _showResult(STATES.SUCCESS,
-          `⚠ Part already exists: ${resp.part_name || ''}${resp.part_ipn ? ' (' + resp.part_ipn + ')' : ''}\n${_filledNote(resp)}`, 8000);
+          `⚠ Part already exists: ${resp.part_name || ''}${resp.part_ipn ? ' (' + resp.part_ipn + ')' : ''}${note ? '\n' + note : ''}${warnings}`,
+          warnings ? 12000 : 8000);
         return;
       }
       if (resp.success) {
         const catNote = resp.category_path
           ? `\n→ Category: ${resp.category_path}${resp.category_created ? ' (auto-created)' : ''}`
           : '';
-        const warnings = (resp.errors || []).map(message => `\n⚠ ${message}`).join('');
+        const warnings = _warningLines(resp.errors);
         _showResult(STATES.SUCCESS,
           `✓ Part created: ${resp.part_name || '#' + resp.part_id}${catNote}\n(no stock yet — use SYS:CREATESTOCK)${warnings}`, warnings ? 12000 : 6000);
       } else {
@@ -944,10 +954,13 @@
             _pendingCategoryNote = resp.category_path
               ? `${resp.category_path}${resp.category_created ? ' (auto-created)' : ''}`
               : '';
-            _pendingPricingNote = (resp.errors || []).map(message => `\n⚠ ${message}`).join('');
+            _pendingPricingNote = _warningLines(resp.errors);
           } else if (resp.already_exists) {
+            // Created meanwhile / found by canonical MPN: the server gap-filled it
             _pendingPartId = resp.part_id;
             _pendingPartName = resp.part_name || '';
+            if ((resp.enriched || []).length) _pendingCategoryNote = _filledNote(resp);
+            _pendingPricingNote = _warningLines(resp.enrich_errors);
           } else {
             _showResult(STATES.ERROR, `⛔ ${resp.message || resp.error || 'Part creation failed'}`, 8000);
             return;
@@ -969,10 +982,14 @@
           try {
             const er = await _apiPost('/plugin/smartparts/api/purescan/createpart/',
               { barcode: raw, enrich_scope: 'label' });
+            // A cancel or new command can arrive while the gap-fill runs.
+            if (flow !== _flowId) return;
             if (er && er.already_exists && (er.enriched || []).length) {
               _pendingCategoryNote = _filledNote(er);
             }
+            _pendingPricingNote = _warningLines(er && er.enrich_errors);
           } catch (e) {
+            if (flow !== _flowId) return;
             console.warn('[PureScan] FASTADD gap-fill failed:', e);
           }
         }
