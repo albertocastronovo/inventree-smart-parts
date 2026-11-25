@@ -64,6 +64,31 @@ def _check_perm(request, perm: str):
     return None
 
 
+def _check_staff(request):
+    """Return a 401/403 JsonResponse unless the user is staff, else None.
+
+    Plugin configuration (synonyms, learned mappings, connection tests,
+    log clearing) is admin-level, like InvenTree's own plugin settings.
+    """
+    user = getattr(request, "user", None)
+    if user is None or not user.is_authenticated:
+        return JsonResponse({"error": "Authentication required"}, status=401)
+    if not getattr(user, "is_staff", False):
+        logger.warning(f'Permission denied: user="{user.username}" is not staff')
+        return JsonResponse({"error": "Permission denied – requires staff"}, status=403)
+    return None
+
+
+def _may_create_categories(request) -> bool:
+    """Category auto-creation needs part.add_partcategory (as in API v1)."""
+    user = getattr(request, "user", None)
+    return bool(
+        user is not None
+        and user.is_authenticated
+        and _has_perm(user, "part.add_partcategory")
+    )
+
+
 def _has_perm(user, perm):
     try:
         from users.permissions import check_user_permission
@@ -114,6 +139,9 @@ def _resolve_user(request):
 
 def dashboard(request):
     """Main dashboard with quick search and recent activity."""
+    denied = _check_perm(request, "part.view_part")
+    if denied:
+        return denied
     plugin = _get_plugin()
     context = {
         "plugin": plugin,
@@ -577,7 +605,9 @@ def _missing_suppliers(plugin, part) -> list:
     ]
 
 
-def _enrich_existing_part(plugin, part, mpn: str, only=None) -> dict:
+def _enrich_existing_part(
+    plugin, part, mpn: str, only=None, allow_create: bool = True
+) -> dict:
     """Fill the gaps of an existing part from distributor data.
 
     Priority-aware (see services/provenance.py): empty fields are filled,
@@ -623,7 +653,7 @@ def _enrich_existing_part(plugin, part, mpn: str, only=None) -> dict:
         ) or provenance.category_upgrade_allowed(cat_entry, current, cat_src):
             try:
                 category_id, _p, _s, _c = _resolve_category(
-                    plugin, merged, default_threshold=45
+                    plugin, merged, default_threshold=45, allow_create=allow_create
                 )
             except Exception as e:
                 logger.warning(f"[PureScan] gap-fill category mapping failed: {e}")
@@ -673,6 +703,10 @@ def api_search(request):
     if request.method != "POST":
         return JsonResponse({"error": "POST required"}, status=405)
 
+    denied = _check_perm(request, "part.view_part")
+    if denied:
+        return denied
+
     try:
         body = json.loads(request.body)
     except json.JSONDecodeError:
@@ -719,7 +753,10 @@ def api_search(request):
     category_match = None
     if merged and merged.category:
         cat_id, cat_path, score, _cat_created = _resolve_category(
-            plugin, merged, default_threshold=65
+            plugin,
+            merged,
+            default_threshold=65,
+            allow_create=_may_create_categories(request),
         )
         category_match = {
             "id": cat_id,
@@ -840,6 +877,10 @@ def api_search_details(request):
     if request.method != "POST":
         return JsonResponse({"error": "POST required"}, status=405)
 
+    denied = _check_perm(request, "part.view_part")
+    if denied:
+        return denied
+
     try:
         body = json.loads(request.body)
     except json.JSONDecodeError:
@@ -884,7 +925,9 @@ def api_search_details(request):
         default_cat = plugin.get_setting("DEFAULT_CATEGORY") or ""
         user_synonyms = plugin.get_setting("CATEGORY_SYNONYMS") or "{}"
         learned_mappings = plugin.get_setting("LEARNED_CATEGORY_MAPPINGS") or "{}"
-        auto_create = plugin.get_setting("AUTO_CREATE_CATEGORIES")
+        auto_create = bool(
+            plugin.get_setting("AUTO_CREATE_CATEGORIES")
+        ) and _may_create_categories(request)
         cat_id, cat_path, score, cat_created = resolve_category_with_autocreate(
             details.category,
             threshold,
@@ -1218,6 +1261,9 @@ def api_get_part(request, part_id: int):
 
 def batch_import(request):
     """Batch import page."""
+    denied = _check_perm(request, "part.add_part")
+    if denied:
+        return denied
     return render(request, "inventree_smart_parts/batch_import.html", {})
 
 
@@ -1306,6 +1352,7 @@ def batch_upload(request):
             assembly_description=assembly_description,
             assembly_revision=assembly_revision,
             assembly_category_id=assembly_category_id,
+            allow_category_create=_may_create_categories(request),
         )
 
         return JsonResponse(
@@ -1330,6 +1377,9 @@ def batch_upload(request):
 @csrf_exempt
 def batch_status(request, job_id: str):
     """AJAX: Get batch job progress."""
+    denied = _check_perm(request, "part.add_part")
+    if denied:
+        return denied
     from .batch.importer import get_job
 
     job = get_job(job_id)
@@ -1342,6 +1392,9 @@ def batch_status(request, job_id: str):
 @csrf_exempt
 def batch_report(request, job_id: str):
     """Download batch job results as CSV."""
+    denied = _check_perm(request, "part.add_part")
+    if denied:
+        return denied
     from .batch.importer import get_job
     import csv
 
@@ -1383,6 +1436,9 @@ def batch_report(request, job_id: str):
 
 def plugin_settings(request):
     """Plugin settings & API management page."""
+    denied = _check_staff(request)
+    if denied:
+        return denied
     plugin = _get_plugin()
     context = {
         "plugin": plugin,
@@ -1419,6 +1475,9 @@ def plugin_settings(request):
 @csrf_exempt
 def test_connection(request, provider: str):
     """AJAX: Test API connection for a specific provider."""
+    denied = _check_staff(request)
+    if denied:
+        return denied
     plugin = _get_plugin()
     if not plugin:
         return JsonResponse({"error": "Plugin not loaded"}, status=500)
@@ -1473,6 +1532,9 @@ def test_connection(request, provider: str):
 
 def logs_view(request):
     """Activity log viewer page."""
+    denied = _check_perm(request, "part.view_part")
+    if denied:
+        return denied
     return render(request, "inventree_smart_parts/logs.html", {})
 
 
@@ -1589,6 +1651,9 @@ def api_category_parameters(request):
 @csrf_exempt
 def api_logs(request):
     """AJAX: Return activity logs as JSON."""
+    denied = _check_perm(request, "part.view_part")
+    if denied:
+        return denied
     level_filter = request.GET.get("level", "") or None
     limit = min(int(request.GET.get("limit", 200)), 1000)
 
@@ -1603,7 +1668,7 @@ def api_logs_clear(request):
     """AJAX: Clear all activity logs (POST only)."""
     if request.method != "POST":
         return JsonResponse({"error": "POST required"}, status=405)
-    denied = _check_perm(request, "part.change_part")
+    denied = _check_staff(request)
     if denied:
         return denied
     from .services.activity_logger import clear_logs
@@ -1691,6 +1756,10 @@ def api_synonyms(request):
     """
     import json as _json
 
+    denied = _check_staff(request)
+    if denied:
+        return denied
+
     plugin = _get_plugin()
     if not plugin:
         return JsonResponse({"error": "Plugin not loaded"}, status=500)
@@ -1700,9 +1769,6 @@ def api_synonyms(request):
         return JsonResponse({"value": value})
 
     if request.method == "POST":
-        denied = _check_perm(request, "part.change_partcategory")
-        if denied:
-            return denied
         try:
             body = _json.loads(request.body)
             raw = body.get("value", "{}")
@@ -1730,6 +1796,10 @@ def api_learned(request):
     """
     import json as _json
 
+    denied = _check_staff(request)
+    if denied:
+        return denied
+
     plugin = _get_plugin()
     if not plugin:
         return JsonResponse({"error": "Plugin not loaded"}, status=500)
@@ -1739,9 +1809,6 @@ def api_learned(request):
         return JsonResponse({"value": value})
 
     if request.method == "POST":
-        denied = _check_perm(request, "part.change_partcategory")
-        if denied:
-            return denied
         try:
             body = _json.loads(request.body)
             raw = body.get("value", "{}")
@@ -1772,6 +1839,10 @@ def api_parameter_mappings(request):
     """
     import json as _json
 
+    denied = _check_staff(request)
+    if denied:
+        return denied
+
     plugin = _get_plugin()
     if not plugin:
         return JsonResponse({"error": "Plugin not loaded"}, status=500)
@@ -1781,9 +1852,6 @@ def api_parameter_mappings(request):
         return JsonResponse({"value": value})
 
     if request.method == "POST":
-        denied = _check_perm(request, "part.change_part")
-        if denied:
-            return denied
         try:
             body = _json.loads(request.body)
             raw = body.get("value", "{}")
@@ -1814,6 +1882,10 @@ def api_unknown_parameters(request):
     """
     import json as _json
 
+    denied = _check_staff(request)
+    if denied:
+        return denied
+
     plugin = _get_plugin()
     if not plugin:
         return JsonResponse({"error": "Plugin not loaded"}, status=500)
@@ -1823,9 +1895,6 @@ def api_unknown_parameters(request):
         return JsonResponse({"value": value})
 
     if request.method == "POST":
-        denied = _check_perm(request, "part.change_part")
-        if denied:
-            return denied
         try:
             body = _json.loads(request.body)
             raw = body.get("value", "{}")
@@ -1850,6 +1919,9 @@ def api_unknown_parameters(request):
 
 def parameter_dashboard(request):
     """View to display the Parameter Normalization Dashboard."""
+    denied = _check_staff(request)
+    if denied:
+        return denied
     plugin = _get_plugin()
     context = {
         "plugin": plugin,
@@ -1859,6 +1931,9 @@ def parameter_dashboard(request):
 
 def api_canonical_parameters(request):
     """Return a list of all existing canonical parameter names from DB and built-in map."""
+    denied = _check_perm(request, "part.view_part")
+    if denied:
+        return denied
     from common.models import ParameterTemplate
     from .services.parameter_normalizer import PARAMETER_MAP
 
@@ -1884,6 +1959,9 @@ def api_canonical_parameters(request):
 
 def api_stock_locations(request):
     """Return the full StockLocation tree as a flat JSON list."""
+    denied = _check_perm(request, "stock.view_stocklocation")
+    if denied:
+        return denied
     from .services.stock_manager import get_stock_locations
 
     locations = get_stock_locations()
@@ -1892,6 +1970,9 @@ def api_stock_locations(request):
 
 def api_label_templates(request):
     """Return available stock item label templates + the configured default."""
+    denied = _check_perm(request, "stock.view_stockitem")
+    if denied:
+        return denied
     from .services.stock_manager import get_label_templates
 
     plugin = _get_plugin()
@@ -2234,6 +2315,45 @@ _BARCODE_VIEW_PERMISSIONS = {
     "part": "part.view_part",
 }
 
+# Every object type api_barcode_lookup can reveal -> its view permission
+_NATIVE_VIEW_PERMISSIONS = {
+    **_BARCODE_VIEW_PERMISSIONS,
+    "purchaseorder": "order.view_purchaseorder",
+    "salesorder": "order.view_salesorder",
+    "returnorder": "order.view_returnorder",
+    "build": "build.view_build",
+    "buildorder": "build.view_build",
+    "supplierpart": "company.view_supplierpart",
+    "manufacturerpart": "company.view_manufacturerpart",
+}
+
+
+def _native_view_denied(request, native_type: str):
+    """403 in the barcode-lookup "native object" shape, or None if allowed.
+
+    Unknown types are refused: the lookup never reveals an object whose
+    view permission it cannot check.
+    """
+    perm = _NATIVE_VIEW_PERMISSIONS.get(native_type)
+    if perm and _has_perm(request.user, perm):
+        return None
+    return JsonResponse(
+        {
+            "found": False,
+            "is_native": True,
+            "native_type": native_type,
+            "part_id": None,
+            "part_name": "",
+            "part_ipn": "",
+            "part_url": None,
+            "mpn": "",
+            "distributor": None,
+            "error": f'Permission denied – requires "{perm or "view"}"',
+            "barcode_data": None,
+        },
+        status=403,
+    )
+
 
 def _token_lookup_response(request, token):
     from .services import token_manager
@@ -2371,7 +2491,13 @@ def purescan_createpart(request):
                     resp["message"] += f" - filled: {default}"
                 return JsonResponse(resp)
         try:
-            enr = _enrich_existing_part(plugin_, part, query_mpn, only=only)
+            enr = _enrich_existing_part(
+                plugin_,
+                part,
+                query_mpn,
+                only=only,
+                allow_create=_may_create_categories(request),
+            )
             default = _set_label_default_supplier(part)
             if default:
                 enr["filled"] = list(enr["filled"]) + [default]
@@ -2463,7 +2589,12 @@ def purescan_createpart(request):
                 category_path,
                 _score,
                 category_created,
-            ) = _resolve_category(plugin, merged, default_threshold=45)
+            ) = _resolve_category(
+                plugin,
+                merged,
+                default_threshold=45,
+                allow_create=_may_create_categories(request),
+            )
         except Exception as e:
             logger.warning(f"[PureScan] CREATEPART category mapping failed: {e}")
 
@@ -3160,6 +3291,9 @@ def api_barcode_lookup(request):
             else j_obj.get("location")
         )
         if loc_id is not None:
+            denied = _native_view_denied(request, "stocklocation")
+            if denied:
+                return denied
             try:
                 from stock.models import StockLocation
 
@@ -3201,6 +3335,9 @@ def api_barcode_lookup(request):
         # 2. Stock Item JSON: {"stockitem": 71} or {"item": 71}
         item_id = j_obj.get("stockitem") if "stockitem" in j_obj else j_obj.get("item")
         if item_id is not None:
+            denied = _native_view_denied(request, "stockitem")
+            if denied:
+                return denied
             try:
                 from stock.models import StockItem
 
@@ -3386,6 +3523,9 @@ def api_barcode_lookup(request):
                     )
                 except (ValueError, TypeError):
                     continue
+                denied = _native_view_denied(request, norm_k.replace("_", ""))
+                if denied:
+                    return denied
                 try:
                     mod = __import__(mod_name, fromlist=[cls_name])
                     model_cls = getattr(mod, cls_name)
@@ -3450,7 +3590,10 @@ def api_barcode_lookup(request):
             for p in registry.with_mixin(PluginMixinEnum.BARCODE):
                 if getattr(p, "slug", "") == "smartparts":
                     continue
-                res = p.scan(clean_raw)
+                try:
+                    res = p.scan(clean_raw, user=request.user)
+                except TypeError:  # scan() without a user argument
+                    res = p.scan(clean_raw)
                 if res and isinstance(res, dict):
                     MODEL_SHORTCODE_MAP = {
                         "stocklocation": ("/web/stock/location/", "name"),
@@ -3471,6 +3614,9 @@ def api_barcode_lookup(request):
                         name_field,
                     ) in MODEL_SHORTCODE_MAP.items():
                         if model_key in res:
+                            denied = _native_view_denied(request, model_key)
+                            if denied:
+                                return denied
                             info = res[model_key]
                             pk = info.get("pk")
                             url = info.get("web_url") or f"{route_pfx}{pk}/"

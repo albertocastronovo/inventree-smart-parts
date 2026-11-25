@@ -504,13 +504,18 @@ class SmartPartsPlugin(
 
 
 def _serve_media(request, path, document_root=None):
-    """Serve media files directly with auth_exempt so browser image tags load without redirects."""
+    """Serve media files to logged-in users only.
+
+    Browser image tags send the session cookie, so images still load. Behind
+    Caddy/nginx this route is not reached: the proxy serves /media/ itself.
+    """
+    from django.http import HttpResponse
     from django.views.static import serve
 
+    user = getattr(request, "user", None)
+    if user is None or not user.is_authenticated:
+        return HttpResponse("Unauthorized", status=401)
     return serve(request, path, document_root=document_root)
-
-
-_serve_media.auth_exempt = True
 
 
 def _ensure_media_url_served():
@@ -538,7 +543,7 @@ def _ensure_media_url_served():
         InvenTree.urls.urlpatterns.insert(0, media_pattern)
         clear_url_caches()
         logger.info(
-            "SmartParts: Added auth-exempt media file serve route to root urlpatterns"
+            "SmartParts: Added login-required media file serve route to root urlpatterns"
         )
     except Exception as e:
         logger.warning(f"SmartParts: Could not ensure media route: {e}")

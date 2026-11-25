@@ -256,6 +256,7 @@ def process_batch(
     assembly_description: str = "",
     assembly_revision: str = "",
     assembly_category_id: Optional[int] = None,
+    allow_category_create: bool = True,
 ) -> str:
     """
     Start a batch import job in a background thread and return the job_id immediately.
@@ -272,6 +273,8 @@ def process_batch(
         assembly_name:        If set, triggers assembly creation (Phase 2+3)
         assembly_description: Optional description for the assembly Part
         assembly_revision:    Optional revision string for the assembly Part
+        allow_category_create: False when the uploading user lacks
+                              part.add_partcategory (match/default only)
 
     Returns:
         job_id (8-char string) – available immediately, before processing starts
@@ -296,6 +299,7 @@ def process_batch(
             assembly_description,
             assembly_revision,
             assembly_category_id,
+            allow_category_create,
         ),
         daemon=True,  # Dies with the process; won't block gunicorn shutdown
         name=f"smartparts-batch-{job_id}",
@@ -313,6 +317,7 @@ def _run_batch(
     assembly_description: str = "",
     assembly_revision: str = "",
     assembly_category_id: Optional[int] = None,
+    allow_category_create: bool = True,
 ) -> None:
     """
     Worker function executed in a background thread.
@@ -331,7 +336,9 @@ def _run_batch(
     # ── Phase 1: Import all rows ──────────────────────────────────────────────
     for idx, row in enumerate(rows, start=1):
         try:
-            row_result = _process_single_row(row, idx, plugin_instance)
+            row_result = _process_single_row(
+                row, idx, plugin_instance, allow_category_create
+            )
             job.results.append(row_result)
 
             if row_result.status == "success":
@@ -442,6 +449,7 @@ def _process_single_row(
     row: Dict[str, str],
     row_number: int,
     plugin_instance,
+    allow_category_create: bool = True,
 ) -> BatchRowResult:
     """
     Process a single batch row: search APIs → merge → check dups → create.
@@ -550,6 +558,7 @@ def _process_single_row(
             plugin_instance,
             source="" if cat_from_row else field_sources.get("category", ""),
             default_threshold=65,
+            allow_create=allow_category_create,
         )
         category_id = cat_id
 

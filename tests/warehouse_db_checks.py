@@ -941,6 +941,66 @@ class DualSupplierScanChecks(_FixtureDatabase):
             ([], ["mouser"]),
         )
 
+    def _without(self, *perms):
+        return SimpleNamespace(
+            is_authenticated=True,
+            username="operator",
+            is_staff=False,
+            has_perm=lambda perm: perm not in perms,
+        )
+
+    def _new_chain(self):
+        root = f"Plugh{self.mpn}"
+        return root, f"{root} > Xyzzy Widgets"
+
+    def test_createpart_needs_add_partcategory_to_create_categories(self):
+        root, chain = self._new_chain()
+        self.user = self._without("part.add_partcategory")
+        dkpn = f"490-{self.mpn}-1-ND"
+        with self.distributors(
+            mouser=None, digikey=digikey_hit(self.mpn, category=chain)
+        ):
+            status, body = self.createpart(digikey_label(self.mpn, dkpn))
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["success"])  # the part is still created
+        self.assertFalse(body["category_created"])
+        self.assertFalse(PartCategory.objects.filter(name=root).exists())
+        self.assertEqual(self.scanned_part().category.name, "Uncategorized")
+
+    def test_gap_fill_needs_add_partcategory_to_create_categories(self):
+        root, chain = self._new_chain()
+        with self.distributors(
+            mouser=mouser_hit(self.mpn), digikey=RuntimeError("DigiKey offline")
+        ):
+            status, body = self.createpart(mouser_label(self.mpn))
+        self.assertEqual(status, 200, body)
+
+        self.user = self._without("part.add_partcategory")
+        with self.distributors(
+            mouser=mouser_hit(self.mpn), digikey=digikey_hit(self.mpn, category=chain)
+        ):
+            status, body = self.createpart(mouser_label(self.mpn), enrich_scope="label")
+        self.assertEqual(status, 200, body)
+        part = self.scanned_part()
+        self.assertEqual(self.suppliers(part), ["DigiKey", "Mouser"])  # still filled
+        self.assertFalse(PartCategory.objects.filter(name=root).exists())
+        self.assertEqual(part.category.name, "Uncategorized")
+
+    def test_dashboard_search_needs_add_partcategory_to_create_categories(self):
+        root, chain = self._new_chain()
+        request = RequestFactory().post(
+            "/", data=json.dumps({"mpn": self.mpn}), content_type="application/json"
+        )
+        request.user = self._without("part.add_partcategory")
+        with self.distributors(
+            mouser=None, digikey=digikey_hit(self.mpn, category=chain)
+        ):
+            response = self.views.api_search(request)
+        self.assertEqual(response.status_code, 200, response.content)
+        match = json.loads(response.content)["category_match"]
+        self.assertEqual(match["path"], "Uncategorized")
+        self.assertFalse(PartCategory.objects.filter(name=root).exists())
+
     def test_stock_summary_reports_mpn_and_description(self):
         part = Part.objects.create(name="R-10K", description="RES 10K 1% 0603")
         ManufacturerPart.objects.create(part=part, MPN="RC0603FR-0710KL")
@@ -956,6 +1016,174 @@ class DualSupplierScanChecks(_FixtureDatabase):
         self.assertEqual(data["description"], "RES 10K 1% 0603")
         self.assertEqual(data["location_stock"], "5")
         self.assertEqual(data["stock_labels"], ["STOCK_SUM1"])
+
+
+def _user(*, authenticated=True, staff=False, missing=()):
+    return SimpleNamespace(
+        is_authenticated=authenticated,
+        username="someone" if authenticated else "",
+        is_staff=staff,
+        has_perm=lambda perm: authenticated and perm not in missing,
+    )
+
+
+class PermissionMatrixChecks(_FixtureDatabase):
+    """Every SmartParts endpoint refuses anonymous users and users without
+    its permission; users holding it get past the gate."""
+
+    STAFF = "staff"
+    # (view name, HTTP method, URL args, required permission or STAFF)
+    MATRIX = [
+        ("dashboard", "get", (), "part.view_part"),
+        ("logs_view", "get", (), "part.view_part"),
+        ("api_logs", "get", (), "part.view_part"),
+        ("api_canonical_parameters", "get", (), "part.view_part"),
+        ("api_search", "post", (), "part.view_part"),
+        ("api_search_details", "post", (), "part.view_part"),
+        ("batch_import", "get", (), "part.add_part"),
+        ("batch_status", "get", ("abc123",), "part.add_part"),
+        ("batch_report", "get", ("abc123",), "part.add_part"),
+        ("api_stock_locations", "get", (), "stock.view_stocklocation"),
+        ("api_label_templates", "get", (), "stock.view_stockitem"),
+        ("plugin_settings", "get", (), STAFF),
+        ("parameter_dashboard", "get", (), STAFF),
+        ("test_connection", "get", ("mouser",), STAFF),
+        ("api_logs_clear", "post", (), STAFF),
+        ("api_synonyms", "get", (), STAFF),
+        ("api_synonyms", "post", (), STAFF),
+        ("api_learned", "get", (), STAFF),
+        ("api_learned", "post", (), STAFF),
+        ("api_parameter_mappings", "get", (), STAFF),
+        ("api_parameter_mappings", "post", (), STAFF),
+        ("api_unknown_parameters", "get", (), STAFF),
+        ("api_unknown_parameters", "post", (), STAFF),
+    ]
+
+    def setUp(self):
+        super().setUp()
+        from django.http import HttpResponse
+        from inventree_smart_parts import views
+
+        self.views = views
+        for name, value in (
+            ("log_activity", lambda *a, **k: None),
+            ("render", lambda *a, **k: HttpResponse("page")),
+        ):
+            patcher = patch.object(views, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def call(self, name, method, args, user, body=None):
+        factory = RequestFactory()
+        if method == "post":
+            request = factory.post(
+                "/", data=json.dumps(body or {}), content_type="application/json"
+            )
+        else:
+            request = factory.get("/")
+        request.user = user
+        return getattr(self.views, name)(request, *args)
+
+    def test_every_endpoint_refuses_anonymous_and_unprivileged_users(self):
+        for name, method, args, required in self.MATRIX:
+            with self.subTest(view=name, method=method):
+                anonymous = self.call(name, method, args, _user(authenticated=False))
+                self.assertEqual(anonymous.status_code, 401)
+                if required == self.STAFF:
+                    # every role permission, but not staff
+                    denied = _user()
+                else:
+                    denied = _user(staff=True, missing=(required,))
+                self.assertEqual(self.call(name, method, args, denied).status_code, 403)
+
+    def test_users_with_the_permission_pass_the_gate(self):
+        allowed = _user(staff=True)
+        for name, args in (
+            ("dashboard", ()),
+            ("logs_view", ()),
+            ("batch_import", ()),
+            ("plugin_settings", ()),
+            ("parameter_dashboard", ()),
+        ):
+            with self.subTest(view=name):
+                self.assertEqual(self.call(name, "get", args, allowed).status_code, 200)
+        for name in ("api_synonyms", "api_learned"):
+            with self.subTest(view=name):
+                response = self.call(name, "get", (), allowed)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(json.loads(response.content), {"value": "{}"})
+        # batch job lookups reach the job store (404 = unknown job, not denied)
+        self.assertEqual(
+            self.call("batch_status", "get", ("abc123",), allowed).status_code, 404
+        )
+
+    def lookup(self, barcode, user):
+        return self.call("api_barcode_lookup", "post", (), user, {"barcode": barcode})
+
+    def test_barcode_lookup_needs_the_view_permission_of_each_object(self):
+        item = StockItem.objects.create(part=self.part, quantity=1)
+        for barcode, perm in (
+            (json.dumps({"stockitem": item.pk}), "stock.view_stockitem"),
+            (
+                json.dumps({"stocklocation": self.location.pk}),
+                "stock.view_stocklocation",
+            ),
+            (json.dumps({"purchaseorder": 1}), "order.view_purchaseorder"),
+            (json.dumps({"sales_order": 1}), "order.view_salesorder"),
+            (json.dumps({"returnorder": 1}), "order.view_returnorder"),
+            (json.dumps({"build": 1}), "build.view_build"),
+            (json.dumps({"supplierpart": 1}), "company.view_supplierpart"),
+            (json.dumps({"manufacturer_part": 1}), "company.view_manufacturerpart"),
+        ):
+            with self.subTest(perm=perm):
+                response = self.lookup(barcode, _user(missing=(perm,)))
+                self.assertEqual(response.status_code, 403)
+                data = json.loads(response.content)
+                self.assertTrue(data["is_native"])
+                self.assertFalse(data["found"])
+                self.assertIn(perm, data["error"])
+        # Whoever may see stock items still gets the item
+        response = self.lookup(json.dumps({"stockitem": item.pk}), _user())
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content)
+        self.assertTrue(data["found"])
+        self.assertEqual(data["barcode_data"], {"type": "stockitem", "pk": item.pk})
+
+    def test_media_route_requires_login(self):
+        import importlib
+
+        host = {
+            "plugin": module("plugin", InvenTreePlugin=type("InvenTreePlugin", (), {})),
+            "plugin.mixins": module(
+                "plugin.mixins",
+                **{
+                    name: type(name, (), {})
+                    for name in (
+                        "BarcodeMixin",
+                        "SettingsMixin",
+                        "UrlsMixin",
+                        "UserInterfaceMixin",
+                    )
+                },
+            ),
+        }
+        with patch.dict(sys.modules, host):
+            sys.modules.pop("inventree_smart_parts.core", None)
+            core = importlib.import_module("inventree_smart_parts.core")
+
+        with tempfile.TemporaryDirectory() as root:
+            Path(root, "secret.txt").write_text("attachment", encoding="utf-8")
+            self.assertFalse(getattr(core._serve_media, "auth_exempt", False))
+            request = RequestFactory().get("/media/secret.txt")
+            request.user = _user(authenticated=False)
+            response = core._serve_media(request, "secret.txt", document_root=root)
+            self.assertEqual(response.status_code, 401)
+
+            request.user = _user()
+            response = core._serve_media(request, "secret.txt", document_root=root)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(b"".join(response.streaming_content), b"attachment")
+            response.close()  # release the file before the directory is removed
 
 
 if __name__ == "__main__":
