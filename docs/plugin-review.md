@@ -17,8 +17,8 @@ Scope: warehouse state machine and input listeners; barcode/part resolution, sto
 
 | Priority | Area | Finding and proposed next step |
 | --- | --- | --- |
-| High | `views.py` / `services/image_handler.py` | The dashboard accepts image/datasheet URLs and download code runs on the server. Review routing these downloads through InvenTree's hardened remote-fetch path, including redirect and response-size handling. Several older batch/settings routes still exempt browser requests from CSRF; audit them separately. |
-| Medium | `views.py` / `services/category_mapper.py` | Normal dashboard search can create categories before the operator saves a part. Move auto-create to confirmed ingestion or establish an explicit separate permission for it. API v1 dry-run/lookups now avoid category creation. |
+| High | `views.py` / `services/image_handler.py` | The dashboard accepts image/datasheet URLs and download code runs on the server. Review routing these downloads through InvenTree's hardened remote-fetch path, including redirect and response-size handling. Several older batch/settings routes still exempt browser requests from CSRF; audit them separately. **1.7.0:** downloads refuse non-public addresses on every redirect hop, SVG is refused, and the session write routes enforce CSRF. Still open: InvenTree's own remote-fetch helper is not used, and DNS is resolved twice (check, then connect), so DNS rebinding remains possible. |
+| Medium | `views.py` / `services/category_mapper.py` | Normal dashboard search can create categories before the operator saves a part. Move auto-create to confirmed ingestion or establish an explicit separate permission for it. API v1 dry-run/lookups now avoid category creation. **1.7.0:** gated by `part.add_partcategory` everywhere; creation at search time (for users holding it) is unchanged. |
 | Medium | `batch/importer.py`, `views.py` | Batch jobs use in-process state, and distributor searches in `_run_all_api_searches` are sequential despite parallel-search wording in the README. Use the host worker for durable jobs, measure provider latency, and introduce bounded parallel lookups only if needed. |
 | Medium | `services/part_identity.py`, `services/token_manager.py` | The advisory locks coordinate SmartParts on PostgreSQL. Core InvenTree writes and third-party integrations don't acquire these locks. If cross-client claims are common, coordinate with a native uniqueness guarantee. |
 | Low | `core.py`, `tools/` | Global scanner/static integration relies on host UI patch points, and there is a separate generated command sheet. Verify these on each upgrade and consolidate the duplicate command catalogs when updating them next. |
@@ -36,9 +36,9 @@ Overall: MPN identity, per-MPN advisory locks, provenance-aware gap filling, in-
 
 | Priority | Area | Finding | Status |
 | --- | --- | --- | --- |
-| High | `core.py` `_serve_media` | An auth-exempt `/media/` route serves all of `MEDIA_ROOT` (attachments, reports, images) without login whenever Django is reached without the Caddy/nginx front. | Open — remove the route or require login. |
-| High | `views.py` | `@csrf_exempt` session writes: `api_synonyms`, `api_learned`, `api_parameter_mappings`, `api_unknown_parameters` rewrite plugin settings with part-level permissions only; `api_logs_clear` clears the log. A cross-site POST can trigger them. | Open — drop `csrf_exempt` for session callers (as API v1 does) and require staff for settings. |
-| High | `views.py` `api_search`, `api_search_details` | Dashboard searches auto-create categories with no permission check (also CSRF-exempt). PureScan create/gap-fill ignores `part.add_partcategory` too; API v1 enforces it. | Open |
+| High | `core.py` `_serve_media` | An auth-exempt `/media/` route serves all of `MEDIA_ROOT` (attachments, reports, images) without login whenever Django is reached without the Caddy/nginx front. | **Fixed in 1.7.0** (login required). |
+| High | `views.py` | `@csrf_exempt` session writes: `api_synonyms`, `api_learned`, `api_parameter_mappings`, `api_unknown_parameters` rewrite plugin settings with part-level permissions only; `api_logs_clear` clears the log. A cross-site POST can trigger them. | **Fixed in 1.7.0** (CSRF for session callers, token clients exempt; settings and log clearing staff-only). |
+| High | `views.py` `api_search`, `api_search_details` | Dashboard searches auto-create categories with no permission check (also CSRF-exempt). PureScan create/gap-fill ignores `part.add_partcategory` too; API v1 enforces it. | **Fixed in 1.7.0** (`part.view_part` to search; categories created only with `part.add_partcategory`, also in batch import). |
 | Medium | `api_clients/digikey.py` | OAuth token cached per client instance; a new client per search meant a token request on every scan. | **Fixed in 1.6.0** (process-wide cache). |
 | Medium | `batch/importer.py` | Own copy of the search loop (element14/TME ignored), in-memory jobs on a thread (lost on restart, invisible across gunicorn workers, DB connection never closed), no identity lock, category creation without permission check. | Open — reuse `_run_all_api_searches` and the host worker. |
 | Medium | `core.py` | Import-time side effects: appends a script tag to InvenTree's own `favicon.html` on disk (survives an uninstall), silently sets the global download User-Agent, injects URL patterns. | Open |
@@ -48,3 +48,17 @@ Overall: MPN identity, per-MPN advisory locks, provenance-aware gap filling, in-
 | Low | `views.py` | 3.5k-line module; `api_barcode_lookup` re-implements native barcode routing (~500 lines). | Open |
 | Low | comments | "DigiKey KeywordSearch has no Category" (`views.py` `api_search_details`, `editor_main.js`) is stale since 1.4.0. | Open |
 | Low | CI | Only flake8/black ran; no tests. | **Fixed in 1.6.0** (`.github/workflows/tests.yml`). |
+
+## 1.7.0 security audit (authorization, CSRF, outbound requests)
+
+Every `/plugin/smartparts/` route now checks an explicit permission; see CHANGELOG 1.7.0 for the matrix. Remaining findings:
+
+| Priority | Area | Finding | Status |
+| --- | --- | --- | --- |
+| Medium | `create_part`, `batch_upload`, gap-fill | Secondary writes (companies, supplier and manufacturer parts, parameter templates, assembly and BOM items) are not checked against their own permissions. | Open |
+| Medium | `api_barcode_lookup`, `purescan_token`, `api_category_parameters` | Read-only POSTs are still `csrf_exempt`. They don't change state, and a cross-site page can't read the response. | Accepted |
+| Low | `test_connection` | Triggered by GET (staff-only now). | Open |
+| Low | `batch/importer.py` | Jobs have no owner: any user with `part.add_part` who knows the 8-hex job ID can read another user's job. | Open |
+| Low | `purescan_deletestock` | No location ownership check, unlike `create_stock_item`. | Open |
+| Low | `services/part_creator.py` `_attach_image` | Unused; fetches URLs without the download guard. Remove or route through `image_handler`. | Open |
+| Low | `core.py` | Plugin static files are served `auth_exempt` with `Access-Control-Allow-Origin: *`. They are static JS only. | Accepted |

@@ -13,11 +13,14 @@ Features:
 - Automatic format detection
 """
 
+import ipaddress
 import os
 import logging
+import socket
 import tempfile
 from typing import Optional, List, Dict, Tuple
 from dataclasses import dataclass
+from urllib.parse import urljoin, urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -33,13 +36,15 @@ MAX_IMAGE_SIZE = 10 * 1024 * 1024  # 10 MB
 MIN_IMAGE_SIZE = 512  # 512 bytes (skip tiny/corrupt)
 DOWNLOAD_TIMEOUT = 15  # seconds
 MAX_RETRIES = 2
+MAX_REDIRECTS = 5
 
+# SVG is not accepted: it can carry scripts that would run on the InvenTree
+# origin when the stored image is opened directly.
 ALLOWED_CONTENT_TYPES = {
     "image/jpeg": ".jpg",
     "image/png": ".png",
     "image/webp": ".webp",
     "image/gif": ".gif",
-    "image/svg+xml": ".svg",
     "image/bmp": ".bmp",
 }
 
@@ -130,6 +135,61 @@ def _get_session() -> requests.Session:
 
 
 # ═══════════════════════════════════════════════════════════════════
+#  Outbound URL guard (SSRF)
+# ═══════════════════════════════════════════════════════════════════
+
+
+class BlockedURL(ValueError):
+    """The URL points at a non-public address (or redirects too often)."""
+
+
+def public_url_error(url: str) -> str:
+    """Return "" if ``url`` is http(s) and every address of its host is
+    public, else the reason it is refused.
+
+    Image URLs reach the server from the dashboard request body, so without
+    this check a user could make the server fetch internal services
+    (router, other containers, cloud metadata at 169.254.169.254).
+    """
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError:
+        return f"Invalid URL: {url}"
+    if parsed.scheme not in ("http", "https") or not host:
+        return f"Invalid URL: {url}"
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except (OSError, UnicodeError) as e:
+        return f"Cannot resolve {host}: {e}"
+    for info in infos:
+        addr = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
+        if addr.version == 6 and addr.ipv4_mapped:
+            addr = addr.ipv4_mapped
+        if not addr.is_global or addr.is_multicast:
+            return f"Refusing non-public address {addr} for {host}"
+    return ""
+
+
+def _safe_get(session: requests.Session, url: str) -> requests.Response:
+    """session.get() that checks the target, and every redirect target,
+    with public_url_error(). Raises BlockedURL when refused."""
+    for _ in range(MAX_REDIRECTS + 1):
+        reason = public_url_error(url)
+        if reason:
+            raise BlockedURL(reason)
+        resp = session.get(
+            url, timeout=DOWNLOAD_TIMEOUT, stream=True, allow_redirects=False
+        )
+        if not resp.is_redirect:
+            return resp
+        url = urljoin(url, resp.headers.get("location", ""))
+        resp.close()
+    raise BlockedURL(f"More than {MAX_REDIRECTS} redirects")
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  Core: Download & Validate
 # ═══════════════════════════════════════════════════════════════════
 
@@ -171,9 +231,7 @@ def download_image(url: str) -> Tuple[Optional[bytes], str, str]:
         session.headers["Referer"] = f"{parsed.scheme}://{host}/"
 
     try:
-        resp = session.get(
-            url, timeout=DOWNLOAD_TIMEOUT, stream=True, allow_redirects=True
-        )
+        resp = _safe_get(session, url)
         resp.raise_for_status()
 
         # ── Content-Type check ──
@@ -213,8 +271,6 @@ def download_image(url: str) -> Tuple[Optional[bytes], str, str]:
         detected_ext = _detect_ext_from_magic(data)
         if detected_ext:
             ext = detected_ext  # trust magic bytes over Content-Type
-        elif ext == ".svg" and (b"<svg" in data.lower() or b"<?xml" in data.lower()):
-            ext = ".svg"
         else:
             # Body is not a recognized image (likely bot-challenge HTML or error)
             if not use_minimal:
@@ -229,6 +285,9 @@ def download_image(url: str) -> Tuple[Optional[bytes], str, str]:
         )
         return data, ext, ""
 
+    except BlockedURL as e:
+        logger.warning(f"Image download refused: {e}")
+        return None, "", f"Refused: {e}"
     except requests.exceptions.Timeout:
         return None, "", f"Timeout downloading image from {url}"
     except requests.exceptions.HTTPError as e:
@@ -244,9 +303,7 @@ def _download_with_minimal_ua(url: str) -> Tuple[Optional[bytes], str, str]:
     """Fallback download using minimal UA (for Akamai-protected hosts)."""
     session = _make_session(minimal=True)
     try:
-        resp = session.get(
-            url, timeout=DOWNLOAD_TIMEOUT, stream=True, allow_redirects=True
-        )
+        resp = _safe_get(session, url)
         resp.raise_for_status()
         ct = resp.headers.get("content-type", "").split(";")[0].strip().lower()
         ext = ALLOWED_CONTENT_TYPES.get(ct)
@@ -271,8 +328,6 @@ def _download_with_minimal_ua(url: str) -> Tuple[Optional[bytes], str, str]:
         detected_ext = _detect_ext_from_magic(data)
         if detected_ext:
             ext = detected_ext
-        elif ext == ".svg" and (b"<svg" in data.lower() or b"<?xml" in data.lower()):
-            ext = ".svg"
         else:
             return (
                 None,
@@ -283,6 +338,8 @@ def _download_with_minimal_ua(url: str) -> Tuple[Optional[bytes], str, str]:
         logger.debug(f"Fallback download OK: {len(data)} bytes, {ext} from {url}")
         return data, ext, ""
 
+    except BlockedURL as e:
+        return None, "", f"Refused: {e}"
     except Exception as e:
         return None, "", f"Fallback download failed: {e}"
 

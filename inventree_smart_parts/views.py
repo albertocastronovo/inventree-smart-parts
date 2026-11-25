@@ -8,6 +8,7 @@ All views are served under /plugin/smartparts/.
 import json
 import logging
 from datetime import datetime, timezone
+from functools import wraps
 from decimal import Decimal, InvalidOperation
 
 from django.http import JsonResponse, HttpResponse
@@ -130,6 +131,30 @@ def _resolve_user(request):
         return user, None
 
     return None, JsonResponse({"error": "Authentication required"}, status=401)
+
+
+def _csrf_unless_token(view):
+    """CSRF protection for browser sessions; API-token clients are exempt.
+
+    Same rule as API v1: a request carrying ``Authorization: Token <key>``
+    is authenticated by that token alone (an invalid token is a 401, the
+    session is never used), so it cannot be forged cross-site. Any other
+    request must carry the CSRF token, which the plugin's pages send in
+    the ``X-CSRFToken`` header.
+    """
+
+    @csrf_exempt
+    @wraps(view)
+    def wrapper(request, *args, **kwargs):
+        if request.META.get("HTTP_AUTHORIZATION", "").startswith("Token "):
+            user, auth_error = _resolve_user(request)
+            if auth_error:
+                return auth_error
+            request.user = user
+            return view(request, *args, **kwargs)
+        return csrf_protect(view)(request, *args, **kwargs)
+
+    return wrapper
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -697,7 +722,7 @@ def search(request):
     return render(request, "inventree_smart_parts/search_results.html", {})
 
 
-@csrf_exempt
+@_csrf_unless_token
 def api_search(request):
     """AJAX endpoint: search for a part by MPN across all enabled APIs."""
     if request.method != "POST":
@@ -862,7 +887,7 @@ def api_search(request):
     return JsonResponse(response)
 
 
-@csrf_exempt
+@_csrf_unless_token
 def api_search_details(request):
     """
     AJAX endpoint: fetch full product details from a single source at
@@ -1267,7 +1292,7 @@ def batch_import(request):
     return render(request, "inventree_smart_parts/batch_import.html", {})
 
 
-@csrf_exempt
+@_csrf_unless_token
 def batch_upload(request):
     """Handle batch file upload and start processing."""
     if request.method != "POST":
@@ -1472,7 +1497,7 @@ def plugin_settings(request):
     return render(request, "inventree_smart_parts/settings_page.html", context)
 
 
-@csrf_exempt
+@_csrf_unless_token
 def test_connection(request, provider: str):
     """AJAX: Test API connection for a specific provider."""
     denied = _check_staff(request)
@@ -1663,7 +1688,7 @@ def api_logs(request):
     return JsonResponse({"logs": logs, "total": total})
 
 
-@csrf_exempt
+@_csrf_unless_token
 def api_logs_clear(request):
     """AJAX: Clear all activity logs (POST only)."""
     if request.method != "POST":
@@ -1748,7 +1773,7 @@ def _part_data_to_dict(pd, *, prices=None) -> dict:
     }
 
 
-@csrf_exempt
+@_csrf_unless_token
 def api_synonyms(request):
     """
     GET  → return current CATEGORY_SYNONYMS plugin setting as JSON
@@ -1787,7 +1812,7 @@ def api_synonyms(request):
     return JsonResponse({"error": "Method not allowed"}, status=405)
 
 
-@csrf_exempt
+@_csrf_unless_token
 def api_learned(request):
     """
     GET  → return current LEARNED_CATEGORY_MAPPINGS plugin setting as JSON
@@ -1831,7 +1856,7 @@ def api_learned(request):
     return JsonResponse({"error": "Method not allowed"}, status=405)
 
 
-@csrf_exempt
+@_csrf_unless_token
 def api_parameter_mappings(request):
     """
     GET  → return current LEARNED_PARAMETER_MAPPINGS plugin setting as JSON
@@ -1874,7 +1899,7 @@ def api_parameter_mappings(request):
     return JsonResponse({"error": "Method not allowed"}, status=405)
 
 
-@csrf_exempt
+@_csrf_unless_token
 def api_unknown_parameters(request):
     """
     GET  → return current TRACKED_UNKNOWN_PARAMETERS plugin setting as JSON
@@ -3125,7 +3150,7 @@ def _api_v1_import(request):
     return JsonResponse(response)
 
 
-@csrf_exempt
+@_csrf_unless_token
 def api_v1_raw_lookup(request):
     """
     Raw distributor aggregation endpoint for debugging / data inspection.

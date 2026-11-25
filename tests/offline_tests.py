@@ -829,5 +829,140 @@ class LookupMemoryTests(unittest.TestCase):
         self.assertEqual(self.p.recent_misses(None, self.now), set())
 
 
+# ── v1.7.0: image downloads refuse internal addresses and SVG ─────────────
+PNG = b"\x89PNG\r\n\x1a\n" + b"0" * 600
+
+
+class _FakeResponse:
+    def __init__(self, status=200, headers=None, body=b""):
+        self.status_code = status
+        self.headers = headers or {}
+        self.body = body
+
+    @property
+    def is_redirect(self):
+        return self.status_code in (301, 302, 303, 307, 308) and (
+            "location" in self.headers
+        )
+
+    def raise_for_status(self):
+        pass
+
+    def iter_content(self, chunk_size=1):
+        yield self.body
+
+    def close(self):
+        pass
+
+
+class ImageDownloadGuardTests(unittest.TestCase):
+    DNS = {
+        "cdn.example.com": "93.184.216.34",
+        "img.example.net": "151.101.1.1",
+        "router.lan": "192.168.1.1",
+        "localhost": "127.0.0.1",
+        "metadata.example.com": "169.254.169.254",
+        "mapped.example.com": "::ffff:10.0.0.7",
+    }
+
+    def setUp(self):
+        from unittest.mock import patch
+
+        from inventree_smart_parts.services import image_handler
+
+        self.ih = image_handler
+        self.fetched = []
+        self.routes = {}
+
+        def getaddrinfo(host, port, *args, **kwargs):
+            ip = self.DNS.get(host, host)  # literal IPs resolve to themselves
+            family = 10 if ":" in ip else 2
+            return [(family, 1, 6, "", (ip, port))]
+
+        test = self
+
+        class Session:
+            headers = {}
+
+            def get(self, url, **kwargs):
+                test.assertFalse(kwargs.get("allow_redirects", True))
+                test.fetched.append(url)
+                return test.routes[url]
+
+        for target, name, value in (
+            (image_handler.socket, "getaddrinfo", getaddrinfo),
+            (image_handler, "_make_session", lambda minimal=False: Session()),
+        ):
+            patcher = patch.object(target, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def png(self):
+        return _FakeResponse(headers={"content-type": "image/png"}, body=PNG)
+
+    def test_public_image_downloads_as_before(self):
+        self.routes["https://cdn.example.com/a.png"] = self.png()
+        data, ext, err = self.ih.download_image("https://cdn.example.com/a.png")
+        self.assertEqual((data, ext, err), (PNG, ".png", ""))
+
+    def test_redirect_between_public_hosts_is_followed(self):
+        self.routes["https://cdn.example.com/a"] = _FakeResponse(
+            302, {"location": "https://img.example.net/b.png"}
+        )
+        self.routes["https://img.example.net/b.png"] = self.png()
+        data, ext, _err = self.ih.download_image("https://cdn.example.com/a")
+        self.assertEqual((data, ext), (PNG, ".png"))
+        self.assertEqual(
+            self.fetched,
+            ["https://cdn.example.com/a", "https://img.example.net/b.png"],
+        )
+
+    def test_internal_addresses_are_never_fetched(self):
+        for url in (
+            "http://router.lan/admin.png",
+            "http://localhost:8000/media/x.png",
+            "http://127.0.0.1/x.png",
+            "http://10.1.2.3/x.png",
+            "http://[::1]/x.png",
+            "http://metadata.example.com/latest/meta-data",
+            "http://mapped.example.com/x.png",
+        ):
+            with self.subTest(url=url):
+                data, _ext, err = self.ih.download_image(url)
+                self.assertIsNone(data)
+                self.assertIn("non-public", err)
+        self.assertEqual(self.fetched, [])
+
+    def test_redirect_to_an_internal_address_is_refused(self):
+        self.routes["https://cdn.example.com/a.png"] = _FakeResponse(
+            302, {"location": "http://169.254.169.254/latest/meta-data"}
+        )
+        data, _ext, err = self.ih.download_image("https://cdn.example.com/a.png")
+        self.assertIsNone(data)
+        self.assertIn("non-public", err)
+        self.assertEqual(self.fetched, ["https://cdn.example.com/a.png"])
+
+    def test_redirect_loops_stop(self):
+        self.routes["https://cdn.example.com/loop"] = _FakeResponse(
+            302, {"location": "https://cdn.example.com/loop"}
+        )
+        data, _ext, err = self.ih.download_image("https://cdn.example.com/loop")
+        self.assertIsNone(data)
+        self.assertIn("redirects", err)
+
+    def test_svg_is_refused(self):
+        svg = (
+            b'<svg xmlns="http://www.w3.org/2000/svg"><script>x()</script>'
+            + (b" " * 600)
+            + b"</svg>"
+        )
+        self.routes["https://cdn.example.com/a.svg"] = _FakeResponse(
+            headers={"content-type": "image/svg+xml"}, body=svg
+        )
+        data, _ext, _err = self.ih.download_image("https://cdn.example.com/a.svg")
+        self.assertIsNone(data)
+        self.assertNotIn("image/svg+xml", self.ih.ALLOWED_CONTENT_TYPES)
+
+
 if __name__ == "__main__":
     unittest.main()

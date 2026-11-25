@@ -2,6 +2,34 @@
 
 All notable changes to SmartParts are documented in this file.
 
+## [1.7.0] - 2026-11-25
+
+Security hardening. Users who hold the matching InvenTree permissions see no change. The changes only affect users without those permissions, anonymous requests and forged requests.
+
+### Security
+- **Every endpoint checks an explicit permission.** Before, several endpoints only required a login.
+
+  | Permission | Endpoints |
+  | --- | --- |
+  | `part.view_part` | dashboard, dashboard search and search details, the Logs page and log list, canonical parameter names |
+  | `part.add_part` | batch import page, batch job status and CSV report |
+  | `stock.view_stocklocation` | stock location list |
+  | `stock.view_stockitem` | label template list |
+  | **staff only** | Settings page, Parameters page, Test connection, Clear logs, and reading or saving the synonym, learned-category, parameter-mapping and unknown-parameter editors |
+
+- **Category auto-creation needs `part.add_partcategory`.** This covers dashboard search, search details, PureScan CREATEPART, FASTADD gap-fill and batch import. API v1 already had this rule. A user without the permission still creates and fills parts; categories come from the fuzzy match or `DEFAULT_CATEGORY`.
+- **Barcode lookup (`api/barcode/lookup/`) checks the object's own view permission.** This applies to stock items, locations, purchase/sales/return orders, builds, and supplier and manufacturer parts. Before, any user with `part.view_part` could look them up. A refused scan shows "Permission denied" in the scanner toast. `INV-` short codes are resolved with the user passed to the barcode plugins.
+- **`/media/` requires a login.** The route SmartParts adds when Django is reached without Caddy/nginx served every uploaded file (attachments, images, reports) to anonymous requests. Behind Caddy nothing changes, because the proxy serves `/media/` itself.
+- **CSRF protection on session writes.** This covers dashboard search and search details, batch upload, Test connection, Clear logs, the four settings editors and API v1 raw lookup. Browser requests must carry the CSRF token, which the plugin's pages already send. Requests with `Authorization: Token <key>` stay exempt, as with API v1 import. They run as the token's user, and an invalid token is a 401 that never falls back to the browser session.
+- **Image downloads refuse internal addresses.** Image URLs, which can come from the dashboard request body, must resolve to public addresses only. Private, loopback, link-local, metadata and IPv4-mapped addresses are refused, and every redirect hop (at most 5) is checked again.
+- **SVG images are no longer accepted.** An SVG can carry scripts that would run on the InvenTree origin.
+
+### Housekeeping
+- Tests:
+  - `warehouse_db_checks`: permission matrix (anonymous → 401, missing permission or not staff → 403), category creation without `part.add_partcategory` (create, gap-fill, dashboard search), per-object barcode permissions, the media route, CSRF and token authentication;
+  - offline: image download guard (internal hosts, redirects, redirect loops, SVG).
+- Review status updated in `docs/plugin-review.md`.
+
 ## [1.6.0] - 2026-11-25
 
 ### Added

@@ -992,6 +992,7 @@ class DualSupplierScanChecks(_FixtureDatabase):
             "/", data=json.dumps({"mpn": self.mpn}), content_type="application/json"
         )
         request.user = self._without("part.add_partcategory")
+        request._dont_enforce_csrf_checks = True  # as django.test.Client
         with self.distributors(
             mouser=None, digikey=digikey_hit(self.mpn, category=chain)
         ):
@@ -1073,16 +1074,111 @@ class PermissionMatrixChecks(_FixtureDatabase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def call(self, name, method, args, user, body=None):
+    def call(self, name, method, args, user, body=None, csrf=False, **headers):
+        """Call a view; ``csrf=False`` skips CSRF like django.test.Client."""
         factory = RequestFactory()
         if method == "post":
             request = factory.post(
-                "/", data=json.dumps(body or {}), content_type="application/json"
+                "/",
+                data=json.dumps(body or {}),
+                content_type="application/json",
+                **headers,
             )
         else:
-            request = factory.get("/")
+            request = factory.get("/", **headers)
         request.user = user
+        if not csrf:
+            request._dont_enforce_csrf_checks = True
         return getattr(self.views, name)(request, *args)
+
+    # Session writes that must carry the CSRF token (batch 2)
+    CSRF_PROTECTED = [
+        ("api_search", ()),
+        ("api_search_details", ()),
+        ("batch_upload", ()),
+        ("test_connection", ("mouser",)),
+        ("api_logs_clear", ()),
+        ("api_synonyms", ()),
+        ("api_learned", ()),
+        ("api_parameter_mappings", ()),
+        ("api_unknown_parameters", ()),
+        ("api_v1_raw_lookup", ()),
+    ]
+
+    def test_session_writes_need_the_csrf_token(self):
+        secret = "a" * 32
+        for name, args in self.CSRF_PROTECTED:
+            with self.subTest(view=name):
+                # A forged cross-site POST: session cookie, no CSRF token
+                forged = self.call(name, "post", args, _user(staff=True), csrf=True)
+                self.assertEqual(forged.status_code, 403)
+                self.assertIn(b"CSRF", forged.content)
+
+                # The plugin's pages send the token in X-CSRFToken
+                factory = RequestFactory()
+                request = factory.post(
+                    "/",
+                    data="{}",
+                    content_type="application/json",
+                    HTTP_X_CSRFTOKEN=secret,
+                )
+                request.COOKIES["csrftoken"] = secret
+                request.user = _user(staff=True)
+                response = getattr(self.views, name)(request, *args)
+                self.assertNotIn(b"CSRF", response.content)
+
+    def test_token_header_never_rides_the_session(self):
+        class AuthenticationFailed(Exception):
+            pass
+
+        token_user = _user(staff=False)  # a valid token of a non-staff user
+
+        class ApiTokenAuthentication:
+            def authenticate_credentials(self, key):
+                if key != "good-token":
+                    raise AuthenticationFailed("invalid")
+                return token_user, None
+
+        host = {
+            "rest_framework": module("rest_framework"),
+            "rest_framework.exceptions": module(
+                "rest_framework.exceptions", AuthenticationFailed=AuthenticationFailed
+            ),
+            "users": module("users"),
+            "users.authentication": module(
+                "users.authentication", ApiTokenAuthentication=ApiTokenAuthentication
+            ),
+        }
+        session_user = _user(staff=True)  # the browser session is staff
+        with patch.dict(sys.modules, host):
+            for name, args in self.CSRF_PROTECTED:
+                with self.subTest(view=name):
+                    # An invalid token is refused; the session is not used
+                    response = self.call(
+                        name,
+                        "post",
+                        args,
+                        session_user,
+                        csrf=True,
+                        HTTP_AUTHORIZATION="Token not-a-real-token",
+                    )
+                    self.assertEqual(response.status_code, 401)
+                    self.assertIn(b"Invalid or expired token", response.content)
+            # A valid token skips CSRF and acts as the token's user
+            response = self.call(
+                "api_logs_clear",
+                "post",
+                (),
+                session_user,
+                csrf=True,
+                HTTP_AUTHORIZATION="Token good-token",
+            )
+            self.assertEqual(response.status_code, 403)
+            self.assertIn(b"requires staff", response.content)
+
+    def test_read_only_views_keep_working_without_csrf_token(self):
+        response = self.call("api_logs", "get", (), _user(), csrf=True)
+        self.assertNotEqual(response.status_code, 403)
 
     def test_every_endpoint_refuses_anonymous_and_unprivileged_users(self):
         for name, method, args, required in self.MATRIX:
