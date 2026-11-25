@@ -490,6 +490,10 @@ def _resolve_category(
 ):
     """Category resolution for merged distributor data (settings-driven).
 
+    Order: the merged category (DigiKey's chain wins over Mouser's flat
+    leaf, see data_merger) -> if it cannot be placed, the flat fallback
+    category, fuzzy-matched only -> DEFAULT_CATEGORY.
+
     Flat leaf categories (Mouser) are only fuzzy-matched / defaulted, never
     auto-created. ``allow_create=False`` (dry runs, callers without the
     ``part.add_partcategory`` permission) disables auto-creation for every
@@ -497,13 +501,31 @@ def _resolve_category(
     """
     from .services.category_mapper import resolve_category_for_source
 
-    source = (merged.raw_data or {}).get("field_sources", {}).get("category", "")
+    raw = merged.raw_data or {}
+    field_sources = raw.setdefault("field_sources", {})
+    fallback = raw.get("fallback_category") or {}
+    kwargs = {"default_threshold": default_threshold, "allow_create": allow_create}
+    if fallback.get("category"):
+        result = resolve_category_for_source(
+            merged.category,
+            plugin,
+            source=field_sources.get("category", ""),
+            use_default=False,
+            **kwargs,
+        )
+        if result[0] is not None:
+            return result
+        # DigiKey's category could not be placed: Mouser's leaf, fuzzy only.
+        # Its provenance is the flat source, so DigiKey may upgrade it later.
+        field_sources["category"] = fallback.get("source", "")
+        return resolve_category_for_source(
+            fallback["category"], plugin, source=fallback.get("source", ""), **kwargs
+        )
     return resolve_category_for_source(
         merged.category,
         plugin,
-        source=source,
-        default_threshold=default_threshold,
-        allow_create=allow_create,
+        source=field_sources.get("category", ""),
+        **kwargs,
     )
 
 
@@ -515,6 +537,44 @@ def _has_distributor_supplier_part(part, distributor: str) -> bool:
     from company.models import SupplierPart
 
     return SupplierPart.objects.filter(part=part, supplier__name__iexact=name).exists()
+
+
+def _lookup_outcomes(results: dict, merged) -> tuple:
+    """(found, missed) DigiKey/Mouser sources of one distributor search.
+
+    Missed = the distributor answered but does not carry this exact MPN
+    (no hit, or a hit with another MPN). Errors are neither: an API outage
+    must be retried on the next scan, not remembered.
+    """
+    merged_sources = set()
+    if merged is not None:
+        merged_sources = set((merged.raw_data or {}).get("merged_sources", []))
+    found, missed = [], []
+    for source in DISTRIBUTOR_SUPPLIER_NAMES:
+        if source not in results:
+            continue
+        value = results[source]
+        if isinstance(value, dict) and "error" in value:
+            continue
+        (found if source in merged_sources else missed).append(source)
+    return found, missed
+
+
+def _missing_suppliers(plugin, part) -> list:
+    """Enabled DigiKey/Mouser distributors worth a gap-fill for ``part``:
+    no supplier part from them yet and no recent "not carried" answer."""
+    from .services import provenance
+
+    if plugin is None or part is None:
+        return []
+    misses = provenance.recent_misses(provenance.load(part))
+    return [
+        source
+        for source, setting in DISTRIBUTOR_ENABLE_SETTINGS.items()
+        if plugin.get_setting(setting)
+        and source not in misses
+        and not _has_distributor_supplier_part(part, source)
+    ]
 
 
 def _enrich_existing_part(plugin, part, mpn: str, only=None) -> dict:
@@ -535,10 +595,14 @@ def _enrich_existing_part(plugin, part, mpn: str, only=None) -> dict:
     from .services import provenance
 
     # The serialized results are discarded here: skip the display FX lookup.
-    api_results, _ = _run_all_api_searches(plugin, mpn, only=only, raw_prices=True)
+    api_results, results = _run_all_api_searches(
+        plugin, mpn, only=only, raw_prices=True
+    )
     priority_order = get_priority_order(plugin)
     merged = merge_part_data(api_results, priority_order, search_term=mpn, strict=True)
+    found, missed = _lookup_outcomes(results, merged)
     if not merged:
+        provenance.record_lookups(part.pk, found, missed)
         return {
             "success": True,
             "filled": [],
@@ -553,9 +617,10 @@ def _enrich_existing_part(plugin, part, mpn: str, only=None) -> dict:
         prov = provenance.load(part)
         cat_src = merged.raw_data.get("field_sources", {}).get("category", "")
         current = str(part.category_id) if part.category_id else ""
+        cat_entry = provenance.entry(prov, "category")
         if provenance.should_write(
-            provenance.entry(prov, "category"), current, cat_src, priority_order
-        ):
+            cat_entry, current, cat_src, priority_order
+        ) or provenance.category_upgrade_allowed(cat_entry, current, cat_src):
             try:
                 category_id, _p, _s, _c = _resolve_category(
                     plugin, merged, default_threshold=45
@@ -576,6 +641,8 @@ def _enrich_existing_part(plugin, part, mpn: str, only=None) -> dict:
             auto_create_companies=bool(plugin.get_setting("AUTO_CREATE_MANUFACTURERS")),
             priority_order=priority_order,
         )
+        if creation.success:
+            provenance.record_lookups(part.pk, found, missed)
     _log_activity(
         "INFO" if creation.success else "ERROR",
         f"[PureScan] gap-fill '{part.name}' "
@@ -2050,10 +2117,28 @@ def purescan_stock_summary(request):
     from part.models import Part
     from .services.stock_manager import get_part_stock_summary
 
-    if not Part.objects.filter(pk=part_id).exists():
+    part = Part.objects.filter(pk=part_id).first()
+    if part is None:
         return JsonResponse({"error": "Part not found"}, status=404)
 
-    return JsonResponse(get_part_stock_summary(part_id, location_id))
+    summary = get_part_stock_summary(part_id, location_id)
+    summary.update(_part_identity_payload(part))
+    return JsonResponse(summary)
+
+
+def _part_identity_payload(part) -> dict:
+    """MPN (first ManufacturerPart, else the part name), name, description."""
+    mpn = ""
+    try:
+        mp = part.manufacturer_parts.order_by("pk").first()
+        mpn = (mp.MPN or "").strip() if mp else ""
+    except Exception:
+        mpn = ""
+    return {
+        "part_name": part.name or "",
+        "mpn": mpn or part.name or "",
+        "description": getattr(part, "description", "") or "",
+    }
 
 
 def purescan_print_label(request):
@@ -2250,6 +2335,16 @@ def purescan_createpart(request):
     # and only if the part has no supplier part from it yet.
     enrich_scope = str(body.get("enrich_scope", "all") or "all").lower()
 
+    label_supplier = DISTRIBUTOR_SUPPLIER_NAMES.get((parsed.distributor or "").lower())
+
+    def _set_label_default_supplier(part):
+        """The scanned distributor becomes the default supplier (if unset)."""
+        from .services.part_creator import set_default_supplier_if_empty
+
+        if not label_supplier:
+            return ""
+        return set_default_supplier_if_empty(part.pk, label_supplier)
+
     def _exists_response(part, query_mpn):
         """Answer "already exists" and gap-fill that part.
 
@@ -2265,18 +2360,21 @@ def purescan_createpart(request):
             resp["enrich_skipped"] = 'Permission "part.change_part" required'
             return JsonResponse(resp)
         only = None
-        if enrich_scope == "label":
-            dist = (parsed.distributor or "").lower()
-            setting = DISTRIBUTOR_ENABLE_SETTINGS.get(dist)
-            if (
-                not setting
-                or not plugin_.get_setting(setting)
-                or _has_distributor_supplier_part(part, dist)
-            ):
+        if enrich_scope in ("label", "missing"):
+            # FASTADD: only the DigiKey/Mouser supplier parts still missing
+            # (not recently reported as not carried) - no call otherwise.
+            only = set(_missing_suppliers(plugin_, part))
+            if not only:
+                default = _set_label_default_supplier(part)
+                if default:
+                    resp["enriched"] = [default]
+                    resp["message"] += f" - filled: {default}"
                 return JsonResponse(resp)
-            only = {dist}
         try:
             enr = _enrich_existing_part(plugin_, part, query_mpn, only=only)
+            default = _set_label_default_supplier(part)
+            if default:
+                enr["filled"] = list(enr["filled"]) + [default]
             resp["enriched"] = enr["filled"]
             if enr["errors"]:
                 resp["enrich_errors"] = enr["errors"]
@@ -2322,7 +2420,7 @@ def purescan_createpart(request):
         "INFO", f"[PureScan] CREATEPART: searching distributors for MPN {mpn}"
     )
 
-    api_results, _results_dict = _run_all_api_searches(plugin, mpn)
+    api_results, results_dict = _run_all_api_searches(plugin, mpn)
     if not api_results:
         return JsonResponse(
             {
@@ -2373,6 +2471,7 @@ def purescan_createpart(request):
     from django.db import transaction
 
     creation = None
+    default_supplier = ""
     try:
         with transaction.atomic():
             # Recheck the canonical MPN under the identity lock so two
@@ -2390,6 +2489,15 @@ def purescan_createpart(request):
                     ),
                     priority_order=priority_order,
                 )
+                if creation.success:
+                    from .services import provenance
+                    from .services.part_creator import set_default_supplier_if_empty
+
+                    found, missed = _lookup_outcomes(results_dict, merged)
+                    provenance.record_lookups(creation.part_id, found, missed)
+                    default_supplier = set_default_supplier_if_empty(
+                        creation.part_id, label_supplier
+                    )
     except AmbiguousPart as exc:
         return JsonResponse({"error": str(exc)}, status=409)
 
@@ -2414,6 +2522,7 @@ def purescan_createpart(request):
             "errors": creation.errors,
             "category_path": category_path,
             "category_created": category_created,
+            "default_supplier": label_supplier if default_supplier else "",
         },
         status=200 if creation.success else 500,
     )
@@ -3418,11 +3527,20 @@ def api_barcode_lookup(request):
         )
         distributor = parsed.distributor if parsed else None
         dist_sp = None
-        if distributor:
-            try:
+        missing = []
+        enrich_needed = False
+        try:
+            if distributor:
                 dist_sp = _has_distributor_supplier_part(part, distributor)
-            except Exception as exc:
-                logger.debug(f"SmartParts: supplier-part check failed: {exc}")
+            missing = _missing_suppliers(_get_plugin(), part)
+            # FASTADD gap-fills when a supplier part is missing, or to make
+            # the scanned distributor the default supplier of a part that
+            # has none yet.
+            enrich_needed = bool(missing) or bool(
+                dist_sp and not getattr(part, "default_supplier_id", None)
+            )
+        except Exception as exc:
+            logger.debug(f"SmartParts: supplier-part check failed: {exc}")
         return JsonResponse(
             {
                 "found": True,
@@ -3435,6 +3553,9 @@ def api_barcode_lookup(request):
                 # False -> the label's distributor has no supplier part on this
                 # part yet (PureScan FASTADD then runs a one-time gap-fill)
                 "distributor_supplier_part": dist_sp,
+                # DigiKey/Mouser supplier parts a FASTADD gap-fill would add
+                "missing_suppliers": missing,
+                "enrich_needed": enrich_needed,
                 "barcode_data": parsed.to_dict() if parsed else None,
             }
         )

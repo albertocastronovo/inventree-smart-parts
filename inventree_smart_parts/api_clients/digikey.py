@@ -7,6 +7,7 @@ Uses OAuth2 Client Credentials flow for server-to-server authentication.
 
 import time
 import logging
+import threading
 from typing import Optional, Dict, Any, List
 
 from .base import (
@@ -19,6 +20,18 @@ from .base import (
 )
 
 logger = logging.getLogger("inventree_smart_parts.api.digikey")
+
+# OAuth2 tokens shared by every client instance of the process, keyed by
+# client ID: views create a new DigiKeyClient per search, so a per-instance
+# cache meant one token request per scan.
+_TOKEN_CACHE: Dict[str, tuple] = {}
+_TOKEN_LOCK = threading.Lock()
+
+
+def clear_token_cache():
+    """Forget cached OAuth2 tokens (tests, credential changes)."""
+    with _TOKEN_LOCK:
+        _TOKEN_CACHE.clear()
 
 
 class DigiKeyClient(BaseApiClient):
@@ -50,6 +63,13 @@ class DigiKeyClient(BaseApiClient):
         if not self.client_id or not self.client_secret:
             raise ApiAuthError("DigiKey Client ID and/or Client Secret not configured")
 
+        cache_key = f"{self.client_id}:{hash(self.client_secret)}"
+        with _TOKEN_LOCK:
+            cached = _TOKEN_CACHE.get(cache_key)
+        if cached and time.time() < cached[1]:
+            self._access_token, self._token_expiry = cached
+            return
+
         logger.info("[DigiKey] Requesting OAuth2 access token...")
 
         try:
@@ -70,12 +90,16 @@ class DigiKeyClient(BaseApiClient):
             # Expire 60 seconds early to be safe
             expires_in = token_data.get("expires_in", 3600)
             self._token_expiry = time.time() + expires_in - 60
+            with _TOKEN_LOCK:
+                _TOKEN_CACHE[cache_key] = (self._access_token, self._token_expiry)
 
             logger.info("[DigiKey] OAuth2 token obtained successfully")
 
         except Exception as e:
             self._access_token = None
             self._token_expiry = 0
+            with _TOKEN_LOCK:
+                _TOKEN_CACHE.pop(cache_key, None)
             raise ApiAuthError(f"DigiKey authentication failed: {e}")
 
     def _get_auth_headers(self) -> Dict[str, str]:
@@ -120,7 +144,24 @@ class DigiKeyClient(BaseApiClient):
         if best is None:
             best = candidates[0]
 
-        return self._parse_part(best, mpn, self._response_currency(data))
+        part = self._parse_part(best, mpn, self._response_currency(data))
+        if part is not None and not part.category:
+            self._fill_category_from_details(part)
+        return part
+
+    def _fill_category_from_details(self, part: PartData) -> None:
+        """Safety net: take the category from ProductDetails when the keyword
+        hit carried none. Failures are logged; the search result stands."""
+        sku = (part.supplier_sku or "").strip()
+        if not sku or sku.lower() == (part.mpn or "").strip().lower():
+            return  # no real DigiKey part number to look up
+        try:
+            details = self.get_product_details(sku)
+        except Exception as e:
+            logger.info(f"[DigiKey] Category lookup for {sku} failed: {e}")
+            return
+        if details is not None and details.category:
+            part.category = details.category
 
     def get_product_details(self, dkpn: str) -> Optional[PartData]:
         """

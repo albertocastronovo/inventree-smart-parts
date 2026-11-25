@@ -116,6 +116,16 @@ class _WriteContext:
             provenance.entry(self.prov, key), current, source, self.priority
         )
 
+    def category_allowed(self, current, source: str) -> bool:
+        """Priority rule, or a hierarchical source upgrading a flat one."""
+        from . import provenance
+
+        return self.allowed("category", current, source) or (
+            provenance.category_upgrade_allowed(
+                provenance.entry(self.prov, "category"), current, source
+            )
+        )
+
     def wrote(self, key: str, source: str, value, label: str = "") -> None:
         from . import provenance
 
@@ -501,7 +511,7 @@ def _update_existing_part(
     if (
         category_id
         and str(category_id) != current_cat
-        and ctx.allowed("category", current_cat, src)
+        and ctx.category_allowed(current_cat, src)
     ):
         try:
             part.category = PartCategory.objects.get(pk=category_id)
@@ -514,6 +524,39 @@ def _update_existing_part(
         part.save()
     logger.info(f"Updated Part: {part.name} (ID: {part.pk}, changed={changed})")
     return part
+
+
+def set_default_supplier_if_empty(part_id: int, supplier_name: str) -> str:
+    """Make ``supplier_name``'s SupplierPart the part's default supplier.
+
+    Only when the part has no default supplier yet: a choice made in
+    InvenTree is never overwritten. Returns a "filled" label, or "".
+    """
+    if not part_id or not supplier_name:
+        return ""
+    try:
+        from company.models import SupplierPart
+        from part.models import Part
+
+        part = Part.objects.filter(pk=part_id).first()
+        if part is None or getattr(part, "default_supplier_id", None):
+            return ""
+        sup_part = (
+            SupplierPart.objects.filter(
+                part_id=part_id, supplier__name__iexact=supplier_name
+            )
+            .order_by("pk")
+            .first()
+        )
+        if sup_part is None:
+            return ""
+        part.default_supplier = sup_part
+        part.save(update_fields=["default_supplier"])
+        logger.info(f"Default supplier of '{part.name}' set to {supplier_name}")
+        return f"Default supplier: {supplier_name}"
+    except Exception as e:
+        logger.warning(f"Could not set default supplier for part {part_id}: {e}")
+        return ""
 
 
 def _create_manufacturer_part(

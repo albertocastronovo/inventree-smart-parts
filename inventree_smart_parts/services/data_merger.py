@@ -32,6 +32,16 @@ MERGEABLE_FIELDS = [
 
 DEFAULT_PRIORITY = "digikey,mouser,element14,tme,lcsc"
 
+# Distributors whose API returns only a flat leaf category (no path). A
+# hierarchical category (e.g. DigiKey's full chain) always wins the merge,
+# whatever API_PRIORITY says; a flat one is used only when no other source
+# has a category. Flat categories are never auto-created (category_mapper).
+FLAT_CATEGORY_SOURCES = frozenset({"mouser"})
+
+
+def is_flat_category_source(source: str) -> bool:
+    return (source or "").lower() in FLAT_CATEGORY_SOURCES
+
 
 def get_priority_order(plugin=None) -> List[str]:
     """Parse the API_PRIORITY setting (DigiKey first by default)."""
@@ -162,8 +172,14 @@ def merge_part_data(
 
     # Merge simple string fields: first non-empty wins (remember the winner)
     field_sources = {}
+    # Category: hierarchical sources first (priority order kept within each
+    # group), so a flat Mouser leaf never beats DigiKey's category chain.
+    category_order = [
+        r for r in sorted_results if not is_flat_category_source(r.source)
+    ] + [r for r in sorted_results if is_flat_category_source(r.source)]
     for field_name in MERGEABLE_FIELDS:
-        for result in sorted_results:
+        candidates = category_order if field_name == "category" else sorted_results
+        for result in candidates:
             if result.has_field(field_name):
                 setattr(merged, field_name, getattr(result, field_name))
                 field_sources[field_name] = result.source
@@ -184,6 +200,18 @@ def merge_part_data(
         "merged_sources": [r.source for r in sorted_results],
         # Which source won each merged field (provenance, see provenance.py)
         "field_sources": field_sources,
+        # Flat category to fall back to when the winning hierarchical one
+        # cannot be placed in the tree (see views._resolve_category)
+        "fallback_category": next(
+            (
+                {"source": r.source, "category": r.category}
+                for r in sorted_results
+                if is_flat_category_source(r.source)
+                and r.has_field("category")
+                and r.source != field_sources.get("category")
+            ),
+            None,
+        ),
         # Image candidates in priority order (fallback if a download fails)
         "source_image_urls": [
             {"source": r.source, "url": r.image_url}

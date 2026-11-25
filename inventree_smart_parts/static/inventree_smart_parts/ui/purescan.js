@@ -703,6 +703,87 @@
     return (messages || []).map(message => `\n⚠ ${message}`).join('');
   }
 
+  // ── v1.6: stock summary helpers (INFO, FASTADD, CREATEPART) ──
+  // Summary of a part: total stock and, for the SYS:LAST location, the stock
+  // and up to three linked STOCK_ labels (largest quantity first).
+
+  async function _fetchStockSummary(partId) {
+    const query = new URLSearchParams({ part_id: partId });
+    const last = _getLastLocation();
+    if (last) query.set('location_id', last.id);
+    const response = await fetch(`/plugin/smartparts/api/purescan/stock-summary/?${query}`);
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    return data;
+  }
+
+  function _hasLocalStock(s) {
+    return !!s && s.location_stock != null && parseFloat(s.location_stock) > 0;
+  }
+
+  function _labelList(s) {
+    const labels = (s && s.stock_labels) || [];
+    return labels.length ? `[${labels.join(', ')}${s.more_labels ? ', ...' : ''}]` : '';
+  }
+
+  // "Total stock: 420 (180 in default location: [STOCK_1A2B, ...])"
+  function _totalStockLine(s) {
+    let line = `Total stock: ${s.total_stock}`;
+    if (_hasLocalStock(s)) {
+      const labels = _labelList(s);
+      line += ` (${s.location_stock} in default location${labels ? ': ' + labels : ''})`;
+    }
+    return line;
+  }
+
+  // "📦 Already in default location: 180 [STOCK_1A2B, ...]" ('' if none there)
+  function _localStockLine(s) {
+    if (!_hasLocalStock(s)) return '';
+    const labels = _labelList(s);
+    return `📦 Already in default location: ${s.location_stock}${labels ? ' ' + labels : ''}`;
+  }
+
+  // Scanned label details, as [key, value] pairs (only present fields)
+  function _labelDetailPairs(lk) {
+    const d = (lk && lk.barcode_data) || {};
+    const dist = d.distributor || (lk && lk.distributor);
+    return [
+      ['Label', dist ? (DISTRIBUTOR_LABELS[dist] || dist) : ''],
+      ['Mfr', d.manufacturer],
+      ['SKU', d.supplier_sku],
+      ['Qty', d.quantity != null ? String(d.quantity) : ''],
+      ['Batch', d.batch],
+    ].filter(([, v]) => v);
+  }
+
+  // "Label: Mouser · Mfr: Murata" / "SKU: … · Qty: 20 · Batch: 2241"
+  function _labelDetailLines(pairs) {
+    const fmt = group => group.map(([k, v]) => `${k}: ${v}`).join(' · ');
+    const first = pairs.filter(([k]) => k === 'Label' || k === 'Mfr');
+    const second = pairs.filter(([k]) => k !== 'Label' && k !== 'Mfr');
+    return [fmt(first), fmt(second)].filter(Boolean);
+  }
+
+  // Structured payload for the terminal's stock card (purescan.html);
+  // `detail` stays the plain-text version of the same content.
+  function _stockCard(mode, s, extra) {
+    const last = _getLastLocation();
+    return {
+      mode,
+      mpn: (s && s.mpn) || '',
+      description: (s && s.description) || '',
+      totalStock: s ? s.total_stock : null,
+      localStock: _hasLocalStock(s) ? s.location_stock : null,
+      locationName: last ? last.name : '',
+      labels: (s && s.stock_label_items) ||
+        ((s && s.stock_labels) || []).map(label => ({ label, quantity: '' })),
+      moreLabels: !!(s && s.more_labels),
+      details: [],
+      notes: [],
+      ...extra,
+    };
+  }
+
   function _formatDistributorInfo(lk) {
     const d = lk.barcode_data || {};
     const lines = [];
@@ -728,24 +809,23 @@
     _resultTimer = setTimeout(() => _resetToIdle(), 12000);
   }
 
+  // MPN, description, stock (total + default location) and label details
   async function _execDistributorStockInfo(lk, flow) {
-    const query = new URLSearchParams({ part_id: lk.part_id });
-    const last = _getLastLocation();
-    if (last) query.set('location_id', last.id);
     _setState(STATES.PROCESSING, 'Looking up stock…');
     try {
-      const response = await fetch(`/plugin/smartparts/api/purescan/stock-summary/?${query}`);
-      const data = await response.json();
-      if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
+      const data = await _fetchStockSummary(lk.part_id);
       // A cancel or new command can arrive while the request is in flight.
       if (flow !== _flowId) return;
-      let detail = `Total stock: ${data.total_stock}`;
-      if (data.location_stock != null) {
-        detail += `\nIn location: ${data.location_stock}`;
-        const labels = data.stock_labels || [];
-        if (labels.length) detail += ` [${labels.join(', ')}${data.more_labels ? ', ...' : ''}]`;
-      }
-      _showResult(STATES.SUCCESS, detail, 12000);
+      const mpn = data.mpn || lk.mpn || lk.part_name || '';
+      const pairs = _labelDetailPairs(lk);
+      const lines = [mpn, data.description, _totalStockLine(data)].filter(Boolean);
+      const details = _labelDetailLines(pairs);
+      const detail = lines.join('\n') + (details.length ? '\n\n' + details.join('\n') : '');
+      _setState(STATES.SUCCESS, detail, {
+        stockCard: _stockCard('info', { ...data, mpn }, { details: pairs }),
+      });
+      clearTimeout(_resultTimer);
+      _resultTimer = setTimeout(() => _resetToIdle(), 12000);
     } catch (e) {
       if (flow === _flowId) {
         _showResult(STATES.ERROR, `Stock lookup failed: ${e.message}`);
@@ -775,15 +855,35 @@
   // ── v3: CREATEPART ──
 
   async function _execCreatePart(raw) {
+    const flow = _flowId;
     _setState(STATES.PROCESSING, 'Searching distributors… (this can take a few seconds)');
     try {
       const resp = await _apiPost('/plugin/smartparts/api/purescan/createpart/', { barcode: raw });
+      // A cancel or new command can arrive during the distributor search.
+      if (flow !== _flowId) return;
       if (resp.already_exists) {
         const note = _filledNote(resp);
         const warnings = _warningLines(resp.enrich_errors);
-        _showResult(STATES.SUCCESS,
-          `⚠ Part already exists: ${resp.part_name || ''}${resp.part_ipn ? ' (' + resp.part_ipn + ')' : ''}${note ? '\n' + note : ''}${warnings}`,
-          warnings ? 12000 : 8000);
+        let summary = null;
+        if (resp.part_id && _getLastLocation()) {
+          try {
+            summary = await _fetchStockSummary(resp.part_id);
+          } catch (e) {
+            console.warn('[PureScan] Stock summary failed:', e);
+          }
+          if (flow !== _flowId) return;
+        }
+        const local = _localStockLine(summary);
+        const name = `${resp.part_name || ''}${resp.part_ipn ? ' (' + resp.part_ipn + ')' : ''}`;
+        const detail = `⚠ Part already exists: ${name}${note ? '\n' + note : ''}` +
+          `${local ? '\n' + local : ''}${warnings}`;
+        const card = summary ? _stockCard('exists', summary, {
+          title: 'Part already exists',
+          notes: [note, ...(resp.enrich_errors || []).map(w => `⚠ ${w}`)].filter(Boolean),
+        }) : null;
+        _setState(STATES.SUCCESS, detail, card ? { stockCard: card } : undefined);
+        clearTimeout(_resultTimer);
+        _resultTimer = setTimeout(() => _resetToIdle(), warnings || local ? 12000 : 8000);
         return;
       }
       if (resp.success) {
@@ -797,6 +897,7 @@
         _showResult(STATES.ERROR, `✗ ${resp.message || resp.error || 'Part creation failed'}`, 8000);
       }
     } catch (e) {
+      if (flow !== _flowId) return;
       _showResult(STATES.ERROR, `Create part failed: ${e.message}`, 6000);
     }
   }
@@ -934,6 +1035,7 @@
     if (!bc.type) {
       _setState(STATES.PROCESSING, 'Looking up part… (this can take a few seconds)');
       const lk = await _lookupDistributorBarcode(raw);
+      let existed = true;   // false → just created: no stock to look up
       if (flow !== _flowId) return;
       if (lk.error) {
         _showResult(STATES.ERROR, `Part lookup failed: ${lk.error}`);
@@ -949,6 +1051,7 @@
           const resp = await _apiPost('/plugin/smartparts/api/purescan/createpart/', { barcode: raw });
           if (flow !== _flowId) return;
           if (resp.success) {
+            existed = false;
             _pendingPartId = resp.part_id;
             _pendingPartName = resp.part_name || '';
             _pendingCategoryNote = resp.category_path
@@ -973,12 +1076,20 @@
       } else {
         _pendingPartId = lk.part_id;
         _pendingPartName = lk.part_name || '';
-        // One-time gap-fill: the label's distributor (e.g. Mouser) has no
-        // supplier part on this part yet → add it and fill empty fields.
-        // Later scans of the same part skip this (no API call).
-        if (lk.distributor && lk.distributor_supplier_part === false) {
+        // Gap-fill: a DigiKey/Mouser supplier part is still missing (and
+        // that distributor did not recently report "not carried"), or the
+        // part has no default supplier yet. Later scans skip the API call.
+        const missing = lk.missing_suppliers || [];
+        const needsFill = lk.enrich_needed != null
+          ? lk.enrich_needed
+          : (lk.distributor && lk.distributor_supplier_part === false);
+        if (needsFill) {
+          const names = (missing.length ? missing : [lk.distributor])
+            .filter(Boolean).map(d => DISTRIBUTOR_LABELS[d] || d).join(' + ');
           _setState(STATES.PROCESSING,
-            `Adding ${DISTRIBUTOR_LABELS[lk.distributor] || lk.distributor} data to "${_pendingPartName}"…`);
+            missing.length
+              ? `Adding ${names} data to "${_pendingPartName}"…`
+              : `Updating "${_pendingPartName}"…`);
           try {
             const er = await _apiPost('/plugin/smartparts/api/purescan/createpart/',
               { barcode: raw, enrich_scope: 'label' });
@@ -998,13 +1109,60 @@
       _pendingQty = d.quantity != null ? parseFloat(d.quantity) : 1;
       _pendingBatch = d.batch || '';
       _pendingBarcodeData = d;
-      _setState(STATES.AWAITING_LOCATION,
-        _locationPrompt(`Create stock for "${_pendingPartName}"${_pendingCategoryNote ? ' — ' + _pendingCategoryNote : ''}${_pendingQty ? ' (reel qty ' + _pendingQty + ')' : ''}${_pendingPricingNote}`));
+
+      // Existing part: is there already stock of it in the SYS:LAST location?
+      let summary = null;
+      if (existed && _getLastLocation()) {
+        _setState(STATES.PROCESSING, 'Checking stock in the default location…');
+        try {
+          summary = await _fetchStockSummary(_pendingPartId);
+        } catch (e) {
+          console.warn('[PureScan] Stock summary failed:', e);
+        }
+        if (flow !== _flowId) return;
+      }
+      _showFastAddPrompt(summary, lk);
       return;
     }
 
     _setState(STATES.AWAITING_ITEM,
       '⚠ Scan a distributor DataMatrix or an instance (STOCK_) label.\nAction: FASTADD');
+  }
+
+  // FASTADD location step: what the reel is, whether this part already has
+  // stock in the default location (→ merge) and what to scan next.
+  function _showFastAddPrompt(summary, lk) {
+    const last = _getLastLocation();
+    const head = `Create stock for "${_pendingPartName}"` +
+      `${_pendingCategoryNote ? ' — ' + _pendingCategoryNote : ''}` +
+      `${_pendingQty ? ' (reel qty ' + _pendingQty + ')' : ''}`;
+    if (!last || !last.id) {
+      _setState(STATES.AWAITING_LOCATION, _locationPrompt(head) + _pendingPricingNote);
+      return;
+    }
+    const local = _localStockLine(summary);
+    const lines = [head];
+    if (local) {
+      lines.push(local);
+      lines.push('→ Scan one of those labels to MERGE, or a FREE STOCK_ label for a new instance');
+    } else {
+      lines.push('→ Scan a FREE STOCK_ label to receive here');
+    }
+    lines.push(`📍 Location: ${last.name} (SYS:LAST) — scan a Location label to override`);
+    const card = _stockCard('receive', summary || { mpn: _pendingPartName }, {
+      mpn: (summary && summary.mpn) || _pendingPartName,
+      title: _pendingQty ? `Receive a reel of ${_pendingQty}` : 'Receive stock',
+      details: _labelDetailPairs(lk).filter(([k]) => k !== 'Qty'),
+      notes: [
+        _pendingCategoryNote,
+        ...(_pendingPricingNote || '').split('\n').map(l => l.trim()).filter(Boolean),
+      ].filter(Boolean),
+      hint: local
+        ? 'Scan one of these labels to merge the reel into it, or a free STOCK_ label for a new instance.'
+        : 'Scan a free STOCK_ label to receive the reel here.',
+      showStock: !!summary,
+    });
+    _setState(STATES.AWAITING_LOCATION, lines.join('\n') + _pendingPricingNote, { stockCard: card });
   }
 
   async function _execFastAddMerge(bc) {
@@ -1361,8 +1519,14 @@
       // Quick-scan shortcut: distributor DataMatrix in IDLE → part lookup
       if (!bc.type) {
         const lk = await _lookupDistributorBarcode(raw);
+        if (scanFlow !== _flowId) return;
         if (lk.error) {
           _showResult(STATES.ERROR, `Part lookup failed: ${lk.error}`);
+          return;
+        }
+        if (lk.found && lk.part_id) {
+          _action = ACTIONS.INFO;
+          await _execDistributorStockInfo(lk, _flowId);
           return;
         }
         if (lk && (lk.found || (lk.barcode_data && lk.barcode_data.mpn))) {

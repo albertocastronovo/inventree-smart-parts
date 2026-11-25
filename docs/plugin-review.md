@@ -29,3 +29,22 @@ Scope: warehouse state machine and input listeners; barcode/part resolution, sto
 - Set `SYS:LAST` on a parent location with stock both directly inside it and in child bins. Check the total, the exact-location subtotal and the label list with `SYS:INFO`. Check one part with no local stock and one fresh browser session with no default saved.
 - Create a part by typing an MPN in the dashboard. Scan the stock token into **Receive Stock**, confirm scanner Enter does not change the MPN or submit the editor, then save. Verify barcode lookup in both native Quick Scan and PureScan, and check the stock item history and any selected printer output.
 - Refresh exchange rates, inspect a part with several supplier tiers in different currencies, and preview/apply/re-run the conversion on a test database. Check a sub-cent tier and confirm part pricing is recalculated.
+
+## 1.6.0 review (whole repository)
+
+Overall: MPN identity, per-MPN advisory locks, provenance-aware gap filling, in-place price refresh and PureScan output escaping are solid. Most risk sits in older peripheral code.
+
+| Priority | Area | Finding | Status |
+| --- | --- | --- | --- |
+| High | `core.py` `_serve_media` | An auth-exempt `/media/` route serves all of `MEDIA_ROOT` (attachments, reports, images) without login whenever Django is reached without the Caddy/nginx front. | Open — remove the route or require login. |
+| High | `views.py` | `@csrf_exempt` session writes: `api_synonyms`, `api_learned`, `api_parameter_mappings`, `api_unknown_parameters` rewrite plugin settings with part-level permissions only; `api_logs_clear` clears the log. A cross-site POST can trigger them. | Open — drop `csrf_exempt` for session callers (as API v1 does) and require staff for settings. |
+| High | `views.py` `api_search`, `api_search_details` | Dashboard searches auto-create categories with no permission check (also CSRF-exempt). PureScan create/gap-fill ignores `part.add_partcategory` too; API v1 enforces it. | Open |
+| Medium | `api_clients/digikey.py` | OAuth token cached per client instance; a new client per search meant a token request on every scan. | **Fixed in 1.6.0** (process-wide cache). |
+| Medium | `batch/importer.py` | Own copy of the search loop (element14/TME ignored), in-memory jobs on a thread (lost on restart, invisible across gunicorn workers, DB connection never closed), no identity lock, category creation without permission check. | Open — reuse `_run_all_api_searches` and the host worker. |
+| Medium | `core.py` | Import-time side effects: appends a script tag to InvenTree's own `favicon.html` on disk (survives an uninstall), silently sets the global download User-Agent, injects URL patterns. | Open |
+| Medium | `purescan.js` | Missing flow guards: a `SYS:CANCEL` during a slow call was overwritten by the late result. | **CREATEPART fixed in 1.6.0**; DELETEPART start/commit and IDLE stock-item/location quick-scans still open. |
+| Low | `core.py` settings | `AUTO_CREATE_SUPPLIERS` and `LOG_RETENTION_DAYS` are never read; suppliers follow `AUTO_CREATE_MANUFACTURERS`. | Open |
+| Low | `purescan.js` FASTADD merge | Merging a reel into an existing item ignores the reel's batch. | Open |
+| Low | `views.py` | 3.5k-line module; `api_barcode_lookup` re-implements native barcode routing (~500 lines). | Open |
+| Low | comments | "DigiKey KeywordSearch has no Category" (`views.py` `api_search_details`, `editor_main.js`) is stale since 1.4.0. | Open |
+| Low | CI | Only flake8/black ran; no tests. | **Fixed in 1.6.0** (`.github/workflows/tests.yml`). |

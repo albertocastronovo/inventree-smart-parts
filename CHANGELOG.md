@@ -2,6 +2,31 @@
 
 All notable changes to SmartParts are documented in this file.
 
+## [1.6.0] - 2026-11-25
+
+### Added
+- **DigiKey and Mouser supplier parts from either label.** PureScan CREATEPART and FASTADD already queried every enabled distributor for new parts. Now FASTADD also adds a missing DigiKey or Mouser supplier part to an *existing* part (not only the label's own distributor). A distributor that answers "not carried" is remembered on the part (`Part.metadata["smartparts"]["lookups"]`) and not asked again for 30 days. API errors are never remembered, so an outage is retried on the next scan.
+- **Default supplier.** The scanned label's distributor becomes `Part.default_supplier` on creation, and on existing parts when none is set. A default chosen in InvenTree is never overwritten.
+- **FASTADD / CREATEPART: stock already in the default location.** After the DataMatrix, the terminal shows how much of the part is already in the `SYS:LAST` location and up to three `STOCK_` labels (largest first), so the reel can be merged instead of becoming a new instance.
+- PureScan stock card: part number, description, counts and the `STOCK_` labels drawn as printed stickers, for INFO, FASTADD and CREATEPART.
+
+### Changed
+- **Category always from DigiKey when DigiKey has the part**, whatever `API_PRIORITY` says (a stored Mouser-first priority no longer leaves Mouser scans uncategorized). Order: DigiKey's category chain → if it cannot be placed, Mouser's flat leaf, fuzzy-matched only → `DEFAULT_CATEGORY`. Other fields still follow `API_PRIORITY`.
+- A category that came from Mouser (fuzzy or default) is replaced by DigiKey's on a later scan, unless it was edited since.
+- **SYS:INFO on a DataMatrix** shows the MPN, description and `Total stock: N (M in default location: [STOCK_…, …])`, followed by the label details (distributor, manufacturer, SKU, reel quantity, batch). It replaces the 1.4.1 two-line output. The parenthesis is shown only when the default location holds stock. An idle DataMatrix scan of a known part shows the same view.
+- Stock labels are ordered by quantity (largest first) instead of alphabetically. The stock-summary endpoint also returns `mpn`, `description` and per-label quantities.
+- `api/barcode/lookup/` returns `missing_suppliers` and `enrich_needed`; FASTADD gap-fills on `enrich_needed`.
+
+### Fixed
+- DigiKey requested a new OAuth token on every search (the token was cached per client instance, and a new client is built per search). Tokens are now shared by the process.
+- DigiKey keyword hits without a category fall back to the product-details endpoint.
+- A `SYS:CANCEL` during the CREATEPART distributor search was overwritten by the late result.
+
+### Housekeeping
+- Cache-buster `purescan.js?v=13`.
+- Tests: offline (merge category source, DigiKey fallback and token cache, category upgrade, lookup memory), Django/SQLite integration scenarios for CREATEPART / FASTADD with both distributors, and PureScan JS tests for the new displays. New CI workflow `tests.yml` runs all suites.
+- Code review findings recorded in `docs/plugin-review.md`.
+
 ## [1.5.1] - 2026-11-23
 
 Repairs the merge of the 1.4.1 warehouse changes onto 1.5.0. Both feature sets now work together.

@@ -372,6 +372,94 @@
   text-align: center; padding: 2rem 1rem;
   opacity: .4; font-size: .9rem;
 }
+
+/* ── Stock card (v1.6: SYS:INFO DataMatrix, FASTADD receive, CREATEPART) ──
+   Read from a metre away with a reel in hand: the part number first, then
+   the counts, then the labels to look for. Existing STOCK_ labels are drawn
+   as the white printed stickers they are on the containers. */
+.ps-stock-card {
+  width: 100%; max-width: 820px; text-align: left;
+  background: rgba(0,0,0,.22);
+  border: 1px solid rgba(255,255,255,.14);
+  border-radius: 18px; padding: 1.6rem 2rem 1.4rem;
+}
+.ps-sc-title {
+  font-size: 1.05rem; font-weight: 600; opacity: .75; margin-bottom: .35rem;
+}
+.ps-sc-mpn {
+  font-size: clamp(2rem, 4.6vw, 3.1rem); font-weight: 900;
+  line-height: 1.05; letter-spacing: -.01em; overflow-wrap: anywhere;
+}
+.ps-sc-desc {
+  font-size: 1.2rem; line-height: 1.4; opacity: .78; margin-top: .45rem;
+  max-width: 62ch;
+}
+.ps-sc-figures {
+  display: flex; flex-wrap: wrap; gap: .5rem 2.75rem;
+  margin-top: 1.35rem; padding-top: 1.1rem;
+  border-top: 1px solid rgba(255,255,255,.14);
+}
+.ps-sc-figure { display: flex; flex-direction: column; }
+.ps-sc-num {
+  font-size: 2.6rem; font-weight: 800; line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+.ps-sc-num.is-zero { opacity: .45; }
+.ps-sc-cap { font-size: 1rem; opacity: .72; margin-top: .3rem; }
+.ps-sc-stickers {
+  display: flex; flex-wrap: wrap; gap: .7rem; margin-top: 1.2rem;
+  list-style: none; padding: 0;
+}
+.ps-sticker {
+  display: inline-flex; align-items: baseline; gap: .8rem;
+  background: #f8fafc; color: #0f172a;
+  border-radius: 6px; padding: .55rem .85rem .5rem;
+  box-shadow: 0 1px 0 rgba(0,0,0,.25), 0 6px 18px rgba(0,0,0,.28);
+}
+.ps-sticker-code {
+  font-family: var(--ps-mono); font-weight: 700; font-size: 1.3rem;
+  letter-spacing: .02em;
+}
+.ps-sticker-qty {
+  font-weight: 700; font-size: 1.05rem; color: #334155;
+  font-variant-numeric: tabular-nums;
+}
+.ps-sticker-more {
+  display: inline-flex; align-items: center;
+  border: 2px dashed rgba(255,255,255,.45); border-radius: 6px;
+  padding: .45rem .8rem; font-weight: 700; font-size: 1rem; opacity: .85;
+}
+.ps-sc-hint {
+  margin-top: 1.2rem; font-size: 1.3rem; font-weight: 700; line-height: 1.35;
+}
+.ps-sc-details {
+  display: flex; flex-wrap: wrap; gap: .35rem 1.6rem;
+  margin: 1.2rem 0 0; padding-top: .9rem;
+  border-top: 1px solid rgba(255,255,255,.1);
+  font-size: .95rem;
+}
+.ps-sc-details div { display: flex; gap: .4rem; }
+.ps-sc-details dt { opacity: .6; }
+.ps-sc-details dd { margin: 0; font-weight: 600; }
+.ps-sc-notes {
+  list-style: none; padding: 0; margin: .9rem 0 0;
+  font-size: .95rem; line-height: 1.45;
+}
+.ps-sc-notes li + li { margin-top: .2rem; }
+.ps-sc-notes li.is-warning { color: #fde68a; }
+@media (prefers-reduced-motion: no-preference) {
+  .ps-sticker { animation: ps-sticker-in .28s ease-out both; }
+  .ps-sticker:nth-child(2) { animation-delay: .05s; }
+  .ps-sticker:nth-child(3) { animation-delay: .1s; }
+}
+@keyframes ps-sticker-in {
+  from { transform: translateY(6px) rotate(-1.5deg); opacity: 0; }
+  to   { transform: none; opacity: 1; }
+}
+@media (max-width: 700px) {
+  .ps-stock-card { padding: 1.2rem 1.1rem 1rem; }
+  .ps-sc-num { font-size: 2rem; }
+}
 </style>
 
 <!-- ═══ Terminal UI ═══════════════════════════════════════════════════════ -->
@@ -425,7 +513,7 @@
 </div>
 
 <!-- ═══ Scripts ══════════════════════════════════════════════════════════ -->
-<script src="/static/plugins/smartparts/inventree_smart_parts/ui/purescan.js?v=12"></script>
+<script src="/static/plugins/smartparts/inventree_smart_parts/ui/purescan.js?v=13"></script>
 <script>
 (function() {
   'use strict';
@@ -635,6 +723,54 @@
       </div>`;
   }
 
+  // Stock card: part, counts, the STOCK_ labels to look for, label details
+  function renderStockCard(c) {
+    const where = c.locationName ? `in ${escHtml(c.locationName)}` : 'in the default location';
+    const figures = [];
+    if (c.mode !== 'receive' || c.showStock) {
+      if (c.totalStock != null) {
+        figures.push(`<div class="ps-sc-figure"><span class="ps-sc-num">${escHtml(c.totalStock)}</span>
+          <span class="ps-sc-cap">in stock</span></div>`);
+      }
+      if (c.localStock != null) {
+        figures.push(`<div class="ps-sc-figure"><span class="ps-sc-num">${escHtml(c.localStock)}</span>
+          <span class="ps-sc-cap">${where}</span></div>`);
+      } else if (c.locationName && c.mode !== 'info') {
+        figures.push(`<div class="ps-sc-figure"><span class="ps-sc-num is-zero">0</span>
+          <span class="ps-sc-cap">${where}</span></div>`);
+      }
+    }
+    const stickers = c.localStock != null && (c.labels || []).length
+      ? `<ul class="ps-sc-stickers" aria-label="Stock labels ${where}">${c.labels.map(l => `
+          <li class="ps-sticker"><span class="ps-sticker-code">${escHtml(l.label)}</span>${
+            l.quantity ? `<span class="ps-sticker-qty">${escHtml(l.quantity)}</span>` : ''}</li>`).join('')}${
+          c.moreLabels ? '<li class="ps-sticker-more">more</li>' : ''}</ul>`
+      : '';
+    const details = (c.details || []).length
+      ? `<dl class="ps-sc-details">${c.details.map(([k, v]) =>
+          `<div><dt>${escHtml(k === 'Mfr' ? 'Manufacturer' : k === 'Qty' ? 'Reel qty' : k)}</dt><dd>${escHtml(v)}</dd></div>`).join('')}</dl>`
+      : '';
+    const notes = (c.notes || []).length
+      ? `<ul class="ps-sc-notes">${c.notes.map(n =>
+          `<li class="${/^\s*⚠/.test(n) ? 'is-warning' : ''}">${escHtml(n)}</li>`).join('')}</ul>`
+      : '';
+    const footer = c.mode === 'receive' && c.locationName
+      ? `<div class="ps-detail-sub">Receiving into ${escHtml(c.locationName)} (SYS:LAST). Scan a location label to change it.</div>`
+      : '';
+    return `
+      <div class="ps-stock-card">
+        ${c.title ? `<div class="ps-sc-title">${escHtml(c.title)}</div>` : ''}
+        <div class="ps-sc-mpn">${escHtml(c.mpn)}</div>
+        ${c.description ? `<div class="ps-sc-desc">${escHtml(c.description)}</div>` : ''}
+        ${figures.length ? `<div class="ps-sc-figures">${figures.join('')}</div>` : ''}
+        ${stickers}
+        ${c.hint ? `<div class="ps-sc-hint">${escHtml(c.hint)}</div>` : ''}
+        ${notes}
+        ${details}
+        ${footer}
+      </div>`;
+  }
+
   function renderState(evt) {
     terminal.dataset.state = evt.state;
     stateEl.textContent = evt.action
@@ -649,6 +785,8 @@
       mainEl.innerHTML = `
         <div class="ps-spinner"></div>
         <div class="ps-detail">${escHtml(evt.detail)}</div>`;
+    } else if (evt.stockCard) {
+      mainEl.innerHTML = renderStockCard(evt.stockCard);
     } else if (evt.state === 'SUCCESS' && evt.locationInfo) {
       mainEl.innerHTML = renderLocationInfo(evt.locationInfo);
     } else if (evt.state === 'SUCCESS' && evt.richInfo) {

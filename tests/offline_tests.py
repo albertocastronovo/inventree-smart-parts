@@ -577,5 +577,257 @@ class ProvenanceTests(unittest.TestCase):
         self.assertIsNone(self.p.entry(prov, "description"))
 
 
+# ── v1.6.0: DigiKey category for Mouser scans, lookups memory ────────────
+
+
+def _dk(**over):
+    base = dict(
+        mpn="X1",
+        name="X1",
+        source="digikey",
+        supplier_name="DigiKey",
+        supplier_sku="X1-ND",
+        description="DK desc",
+        category="Capacitors > Ceramic Capacitors",
+    )
+    base.update(over)
+    return PartData(**base)
+
+
+def _mo(**over):
+    base = dict(
+        mpn="X1",
+        name="X1",
+        source="mouser",
+        supplier_name="Mouser",
+        supplier_sku="81-X1",
+        description="Mouser desc",
+        category="MLCC - SMD/SMT",
+    )
+    base.update(over)
+    return PartData(**base)
+
+
+class CategorySourceMergeTests(unittest.TestCase):
+    """Mouser scans take DigiKey's category whatever API_PRIORITY says."""
+
+    def test_hierarchical_category_beats_flat_under_mouser_first_priority(self):
+        merged = merge_part_data(
+            [_mo(), _dk()], ["mouser", "digikey"], search_term="X1", strict=True
+        )
+        fs = merged.raw_data["field_sources"]
+        self.assertEqual(merged.category, "Capacitors > Ceramic Capacitors")
+        self.assertEqual(fs["category"], "digikey")
+        # Other fields still follow the configured priority
+        self.assertEqual(merged.description, "Mouser desc")
+        self.assertEqual(fs["description"], "mouser")
+        # Mouser's leaf is kept as the fallback category
+        self.assertEqual(
+            merged.raw_data["fallback_category"],
+            {"source": "mouser", "category": "MLCC - SMD/SMT"},
+        )
+        # Both supplier parts are created
+        self.assertEqual(
+            sorted(sd["source"] for sd in merged.raw_data["supplier_data"]),
+            ["digikey", "mouser"],
+        )
+
+    def test_flat_category_used_when_digikey_has_none(self):
+        merged = merge_part_data(
+            [_mo(), _dk(category="")], None, search_term="X1", strict=True
+        )
+        self.assertEqual(merged.category, "MLCC - SMD/SMT")
+        self.assertEqual(merged.raw_data["field_sources"]["category"], "mouser")
+        self.assertIsNone(merged.raw_data["fallback_category"])
+
+    def test_mouser_only(self):
+        merged = merge_part_data([_mo()], None, search_term="X1", strict=True)
+        self.assertEqual(merged.raw_data["field_sources"]["category"], "mouser")
+        self.assertIsNone(merged.raw_data["fallback_category"])
+
+    def test_digikey_with_other_mpn_is_dropped(self):
+        merged = merge_part_data(
+            [_mo(), _dk(mpn="X1-OTHER")], None, search_term="X1", strict=True
+        )
+        self.assertEqual(merged.category, "MLCC - SMD/SMT")
+        self.assertEqual(merged.raw_data["merged_sources"], ["mouser"])
+
+
+class DigiKeyCategoryFallbackTests(unittest.TestCase):
+    def setUp(self):
+        self.client = DigiKeyClient("id", "secret")
+        self.client._get_auth_headers = lambda: {}
+        self.calls = []
+
+    def _product(self, with_category):
+        product = v4_product()
+        if not with_category:
+            product.pop("Category", None)
+        return product
+
+    def _respond(self, details):
+        def request(method, url, **kwargs):
+            self.calls.append(url)
+            if "keyword" in url:
+                return {"Products": [self._product(False)]}
+            if isinstance(details, Exception):
+                raise details
+            return {"Product": details}
+
+        self.client._request = request
+
+    def test_category_taken_from_product_details(self):
+        self._respond(self._product(True))
+        pd = self.client.search_by_mpn("SN74HC00N")
+        self.assertTrue(pd.category)
+        self.assertEqual(
+            pd.category,
+            DigiKeyClient("a", "b")
+            ._parse_part(self._product(True), "SN74HC00N")
+            .category,
+        )
+        self.assertTrue(any("product-details" in u for u in self.calls))
+
+    def test_details_failure_keeps_search_result(self):
+        self._respond(RuntimeError("HTTP 500"))
+        pd = self.client.search_by_mpn("SN74HC00N")
+        self.assertEqual(pd.mpn, "SN74HC00N")
+        self.assertEqual(pd.category, "")
+
+    def test_no_details_call_when_keyword_hit_has_category(self):
+        self.client._request = lambda method, url, **k: (
+            self.calls.append(url) or {"Products": [self._product(True)]}
+        )
+        pd = self.client.search_by_mpn("SN74HC00N")
+        self.assertTrue(pd.category)
+        self.assertEqual(len(self.calls), 1)
+
+
+class DigiKeyTokenCacheTests(unittest.TestCase):
+    def setUp(self):
+        from inventree_smart_parts.api_clients import digikey
+
+        digikey.clear_token_cache()
+        self.addCleanup(digikey.clear_token_cache)
+        self.posts = 0
+
+        test = self
+
+        class Response:
+            def raise_for_status(self):
+                pass
+
+            def json(self):
+                return {"access_token": f"tok{test.posts}", "expires_in": 3600}
+
+        class Session:
+            def post(self, *args, **kwargs):
+                test.posts += 1
+                return Response()
+
+        self.session = Session()
+
+    def client(self, client_id="id", secret="secret"):
+        c = DigiKeyClient(client_id, secret)
+        c._session = self.session
+        return c
+
+    def test_token_shared_across_instances(self):
+        first = self.client()
+        first._authenticate()
+        second = self.client()
+        second._authenticate()
+        self.assertEqual(self.posts, 1)
+        self.assertEqual(second._access_token, "tok1")
+
+    def test_other_credentials_get_their_own_token(self):
+        self.client()._authenticate()
+        self.client("other-id")._authenticate()
+        self.assertEqual(self.posts, 2)
+
+    def test_expired_token_is_renewed(self):
+        import time
+        from inventree_smart_parts.api_clients import digikey
+
+        self.client()._authenticate()
+        for key, (token, _expiry) in list(digikey._TOKEN_CACHE.items()):
+            digikey._TOKEN_CACHE[key] = (token, time.time() - 1)
+        self.client()._authenticate()
+        self.assertEqual(self.posts, 2)
+
+
+class CategoryUpgradeTests(unittest.TestCase):
+    def setUp(self):
+        from inventree_smart_parts.services import provenance
+
+        self.p = provenance
+
+    def entry(self, src, value):
+        return {"src": src, "h": self.p.value_hash(value)}
+
+    def test_digikey_replaces_unedited_mouser_category(self):
+        self.assertTrue(
+            self.p.category_upgrade_allowed(self.entry("mouser", "12"), "12", "digikey")
+        )
+
+    def test_empty_category_is_always_written(self):
+        self.assertTrue(self.p.category_upgrade_allowed(None, "", "digikey"))
+
+    def test_edited_category_is_kept(self):
+        self.assertFalse(
+            self.p.category_upgrade_allowed(self.entry("mouser", "12"), "15", "digikey")
+        )
+
+    def test_flat_never_replaces_hierarchical(self):
+        self.assertFalse(
+            self.p.category_upgrade_allowed(self.entry("digikey", "12"), "12", "mouser")
+        )
+
+    def test_legacy_or_manual_category_is_kept(self):
+        self.assertFalse(self.p.category_upgrade_allowed(None, "12", "digikey"))
+        self.assertFalse(
+            self.p.category_upgrade_allowed(self.entry("mouser", "12"), "12", "")
+        )
+
+
+class LookupMemoryTests(unittest.TestCase):
+    def setUp(self):
+        from datetime import datetime, timezone
+
+        from inventree_smart_parts.services import provenance
+
+        self.p = provenance
+        self.now = datetime(2026, 11, 25, 12, 0, tzinfo=timezone.utc)
+
+    def test_miss_remembered_for_30_days(self):
+        from datetime import timedelta
+
+        prov = self.p.empty()
+        self.assertTrue(self.p.apply_lookups(prov, [], ["DigiKey"], self.now))
+        self.assertEqual(self.p.recent_misses(prov, self.now), {"digikey"})
+        later = self.now + timedelta(days=29, hours=23)
+        self.assertEqual(self.p.recent_misses(prov, later), {"digikey"})
+        expired = self.now + timedelta(days=30, minutes=1)
+        self.assertEqual(self.p.recent_misses(prov, expired), set())
+
+    def test_found_clears_a_miss(self):
+        prov = self.p.empty()
+        self.p.apply_lookups(prov, [], ["mouser"], self.now)
+        self.assertTrue(self.p.apply_lookups(prov, ["mouser"], [], self.now))
+        self.assertEqual(self.p.recent_misses(prov, self.now), set())
+        self.assertFalse(self.p.apply_lookups(prov, ["mouser"], [], self.now))
+
+    def test_corrupt_or_naive_dates(self):
+        prov = {
+            "fields": {},
+            "lookups": {
+                "digikey": {"miss": "not a date"},
+                "mouser": {"miss": "2026-11-20T10:00:00"},
+            },
+        }
+        self.assertEqual(self.p.recent_misses(prov, self.now), {"mouser"})
+        self.assertEqual(self.p.recent_misses(None, self.now), set())
+
+
 if __name__ == "__main__":
     unittest.main()

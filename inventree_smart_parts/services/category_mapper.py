@@ -1601,7 +1601,7 @@ def resolve_category_with_autocreate(
 # Distributors whose API returns only a flat leaf category (no path). Their
 # categories are fuzzy-matched into the existing tree or fall back to the
 # default category — never auto-created as new root categories.
-FLAT_CATEGORY_SOURCES = frozenset({"mouser"})
+from .data_merger import FLAT_CATEGORY_SOURCES  # noqa: E402
 
 
 def resolve_category_for_source(
@@ -1610,13 +1610,15 @@ def resolve_category_for_source(
     source: str = "",
     default_threshold: int = 45,
     allow_create: bool = True,
+    use_default: bool = True,
 ) -> Tuple[Optional[int], str, int, bool]:
     """resolve_category_with_autocreate() driven by the plugin settings.
 
     ``source`` is the distributor that supplied the category string; flat
     leaf categories (Mouser) never auto-create. ``allow_create=False``
     (dry runs, users without ``part.add_partcategory``) disables
-    auto-creation for every source.
+    auto-creation for every source. ``use_default=False`` returns
+    (None, "", 0, False) instead of the DEFAULT_CATEGORY fallback.
     """
 
     def _get(key, default=None):
@@ -1633,7 +1635,7 @@ def resolve_category_for_source(
     return resolve_category_with_autocreate(
         distributor_category,
         _get("FUZZY_THRESHOLD", default_threshold),
-        _get("DEFAULT_CATEGORY", ""),
+        _get("DEFAULT_CATEGORY", "") if use_default else "",
         user_synonyms_json=_get("CATEGORY_SYNONYMS", "{}"),
         learned_mappings_json=_get("LEARNED_CATEGORY_MAPPINGS", "{}"),
         plugin=plugin,

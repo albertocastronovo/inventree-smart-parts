@@ -34,23 +34,34 @@ def get_part_stock_summary(part_id: int, location_id: Optional[int] = None) -> d
         value = format(quantity or 0, "f")
         return value.rstrip("0").rstrip(".") if "." in value else value
 
-    labels = []
+    # Linked STOCK_ labels in the exact location, largest quantity first
+    # (ties by label, so the order is stable). One label = one stock item,
+    # but duplicates are dropped defensively.
+    items = []
     field = barcode_field_name(StockItem)
     if has_location and quantities["local"] and field:
-        labels = list(
+        seen = set()
+        rows = (
             entries.filter(
                 location_id=location_id,
                 **{f"{field}__regex": TOKEN_PATTERNS["STOCK"].pattern},
             )
-            .order_by(field)
-            .values_list(field, flat=True)
-            .distinct()[:4]
+            .order_by("-quantity", field, "pk")
+            .values_list(field, "quantity")
         )
+        for label, quantity in rows[:20]:
+            if label in seen:
+                continue
+            seen.add(label)
+            items.append({"label": label, "quantity": display(quantity)})
+            if len(items) > 3:
+                break
     return {
         "total_stock": display(quantities["total"]),
         "location_stock": display(quantities["local"]) if has_location else None,
-        "stock_labels": labels[:3],
-        "more_labels": len(labels) > 3,
+        "stock_labels": [item["label"] for item in items[:3]],
+        "stock_label_items": items[:3],
+        "more_labels": len(items) > 3,
     }
 
 

@@ -1,0 +1,39 @@
+name: Tests
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+
+    - name: Set up Node
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install requests openpyxl django django-money
+
+    - name: Offline unit tests
+      run: python -m unittest discover -s tests -p "*_tests.py"
+
+    - name: Database integration checks (Django + SQLite)
+      run: python -m tests.warehouse_db_checks
+
+    - name: PureScan / dashboard JS tests
+      run: node --test tests/purescan.test.cjs tests/dashboard-receipt.test.cjs

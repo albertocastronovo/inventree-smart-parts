@@ -5,10 +5,13 @@ deployment is still needed for InvenTree roles, signals, PostgreSQL and hardware
 Requires Django and django-money in addition to the package dependencies.
 """
 
+import copy
 import hashlib
+import json
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -44,6 +47,7 @@ from inventree_smart_parts.services import (
     stock_manager,
     token_manager,
 )
+from inventree_smart_parts.services import provenance
 from inventree_smart_parts.views import purescan_stock_summary
 
 
@@ -65,9 +69,51 @@ class BarcodeModel(models.Model):
             self.save()
 
 
+class PartCategory(models.Model):
+    class Meta:
+        app_label = "part"
+
+    name = models.CharField(max_length=100)
+    parent = models.ForeignKey(
+        "self", null=True, blank=True, related_name="children", on_delete=models.CASCADE
+    )
+    structural = models.BooleanField(default=False)
+
+    @property
+    def pathstring(self):
+        names, cat = [], self
+        while cat is not None:
+            names.insert(0, cat.name)
+            cat = cat.parent
+        return " > ".join(names)
+
+
 class Part(BarcodeModel):
     class Meta:
         app_label = "part"
+
+    name = models.CharField(max_length=100, blank=True)
+    description = models.CharField(max_length=250, blank=True)
+    IPN = models.CharField(max_length=100, blank=True)
+    link = models.CharField(max_length=500, blank=True)
+    category = models.ForeignKey(
+        PartCategory, null=True, blank=True, on_delete=models.SET_NULL
+    )
+    default_supplier = models.ForeignKey(
+        "company.SupplierPart",
+        null=True,
+        blank=True,
+        related_name="+",
+        on_delete=models.SET_NULL,
+    )
+    metadata = models.JSONField(default=dict, blank=True)
+    active = models.BooleanField(default=True)
+    virtual = models.BooleanField(default=False)
+    component = models.BooleanField(default=True)
+    purchaseable = models.BooleanField(default=True)
+
+    def __str__(self):
+        return self.name
 
 
 class StockLocation(BarcodeModel):
@@ -97,19 +143,28 @@ class StockItem(BarcodeModel):
         super().save(*args, **kwargs)
 
 
-class Supplier(models.Model):
+class Company(models.Model):
     class Meta:
         app_label = "company"
 
     name = models.CharField(max_length=100)
+    is_supplier = models.BooleanField(default=False)
+    is_manufacturer = models.BooleanField(default=False)
+
+
+Supplier = Company
 
 
 class ManufacturerPart(models.Model):
     class Meta:
         app_label = "company"
 
-    part = models.ForeignKey(Part, on_delete=models.CASCADE)
+    part = models.ForeignKey(
+        Part, related_name="manufacturer_parts", on_delete=models.CASCADE
+    )
+    manufacturer = models.ForeignKey(Company, null=True, on_delete=models.CASCADE)
     MPN = models.CharField(max_length=100)
+    link = models.CharField(max_length=500, blank=True)
 
 
 class SupplierPart(models.Model):
@@ -143,15 +198,23 @@ def module(name, **attrs):
     return result
 
 
-class WarehouseDatabaseChecks(unittest.TestCase):
+class _FixtureDatabase(unittest.TestCase):
+    """Creates the fixture schema once; stubs InvenTree modules per test."""
+
+    _schema_ready = False
+
     @classmethod
     def setUpClass(cls):
+        if _FixtureDatabase._schema_ready:
+            return
+        _FixtureDatabase._schema_ready = True
         with connection.schema_editor() as schema:
             for model in (
+                PartCategory,
                 Part,
                 StockLocation,
                 StockItem,
-                Supplier,
+                Company,
                 ManufacturerPart,
                 SupplierPart,
                 SupplierPriceBreak,
@@ -161,14 +224,34 @@ class WarehouseDatabaseChecks(unittest.TestCase):
                 schema.create_model(model)
 
     def setUp(self):
+        self.settings = {
+            "MOUSER_ENABLED": True,
+            "DIGIKEY_ENABLED": True,
+            "API_PRIORITY": "digikey,mouser",
+            "AUTO_CREATE_CATEGORIES": True,
+            "AUTO_CREATE_MANUFACTURERS": True,
+            "FUZZY_THRESHOLD": 45,
+            "DEFAULT_CATEGORY": "Uncategorized",
+            "CATEGORY_SYNONYMS": "{}",
+            "LEARNED_CATEGORY_MAPPINGS": "{}",
+        }
+        self.plugin = SimpleNamespace(
+            get_setting=self.settings.get, set_setting=self.settings.__setitem__
+        )
         stubs = patch.dict(
             sys.modules,
             {
+                "plugin": module("plugin"),
+                "plugin.registry": module(
+                    "plugin.registry",
+                    registry=SimpleNamespace(get_plugin=lambda slug: self.plugin),
+                ),
                 "InvenTree.helpers": module(
                     "InvenTree.helpers", hash_barcode=native_hash
                 ),
                 "company.models": module(
                     "company.models",
+                    Company=Company,
                     SupplierPriceBreak=SupplierPriceBreak,
                     ManufacturerPart=ManufacturerPart,
                     SupplierPart=SupplierPart,
@@ -181,7 +264,9 @@ class WarehouseDatabaseChecks(unittest.TestCase):
                         "part": Part,
                     },
                 ),
-                "part.models": module("part.models", Part=Part),
+                "part.models": module(
+                    "part.models", Part=Part, PartCategory=PartCategory
+                ),
                 "stock.models": module(
                     "stock.models", StockItem=StockItem, StockLocation=StockLocation
                 ),
@@ -192,14 +277,16 @@ class WarehouseDatabaseChecks(unittest.TestCase):
         self.part = Part.objects.create()
         self.location = StockLocation.objects.create()
 
+
+class WarehouseDatabaseChecks(_FixtureDatabase):
     def test_summary_exact_bin_labels_and_permissions(self):
         child = StockLocation.objects.create(parent_id=self.location.pk)
         other = Part.objects.create()
         for label, qty, loc, part, in_stock in (
-            ("STOCK_ZZZ9", "1", self.location, self.part, True),
+            ("STOCK_ZZZ9", "0.5", self.location, self.part, True),
             ("STOCK_1000", "1", self.location, self.part, True),
             ("STOCK_2000", "1", self.location, self.part, True),
-            ("STOCK_3000", "1", self.location, self.part, True),
+            ("STOCK_3000", "2", self.location, self.part, True),
             ("plain text", "0.125", self.location, self.part, True),
             ("STOCK_KID1", "7", child, self.part, True),
             ("STOCK_DONT", "5", self.location, self.part, False),
@@ -217,9 +304,14 @@ class WarehouseDatabaseChecks(unittest.TestCase):
         self.assertEqual(
             summary,
             {
-                "total_stock": "11.125",
-                "location_stock": "4.125",
-                "stock_labels": ["STOCK_1000", "STOCK_2000", "STOCK_3000"],
+                "total_stock": "11.625",
+                "location_stock": "4.625",
+                "stock_labels": ["STOCK_3000", "STOCK_1000", "STOCK_2000"],
+                "stock_label_items": [
+                    {"label": "STOCK_3000", "quantity": "2"},
+                    {"label": "STOCK_1000", "quantity": "1"},
+                    {"label": "STOCK_2000", "quantity": "1"},
+                ],
                 "more_labels": True,
             },
         )
@@ -502,6 +594,368 @@ class WarehouseDatabaseChecks(unittest.TestCase):
         Rate.objects.filter(backend=backend).delete()
         with self.assertRaises(pricing.PricingError):
             pricing.get_usd_to_eur_rate()
+
+
+# ── v1.6.0: dual DigiKey/Mouser supplier parts on PureScan scans ──────────
+
+GS, RS, EOT = "\x1d", "\x1e", "\x04"
+DK_CATEGORY = "Capacitors > Ceramic Capacitors"
+
+
+def mouser_label(mpn, qty=50):
+    return (
+        f"[)>{RS}06{GS}K606-45799789{GS}14K002{GS}1P{mpn}{GS}Q{qty}"
+        f"{GS}11K087041143{GS}4LJP{GS}1VMurata{RS}{EOT}"
+    )
+
+
+def digikey_label(mpn, dkpn):
+    return (
+        f"[)>{RS}06{GS}P{dkpn}{GS}1P{mpn}{GS}30P{dkpn}{GS}K{GS}1K12345678"
+        f"{GS}10K87654321{GS}9D2345{GS}1TLOT42{GS}4LMY{GS}Q25{GS}11ZPICK{RS}{EOT}"
+    )
+
+
+def digikey_hit(mpn, category=DK_CATEGORY):
+    return PartData(
+        mpn=mpn,
+        name=mpn,
+        manufacturer="Murata Electronics",
+        description="CAP CER 10UF 100V X7S 1210",
+        category=category,
+        supplier_name="DigiKey",
+        supplier_sku=f"490-{mpn}-1-ND",
+        source="digikey",
+    )
+
+
+def mouser_hit(mpn, category="Zzyzx Gadgets"):
+    return PartData(
+        mpn=mpn,
+        name=mpn,
+        manufacturer="Murata",
+        description="Multilayer Ceramic Capacitors MLCC - SMD/SMT 10uF",
+        category=category,
+        supplier_name="Mouser",
+        supplier_sku=f"81-{mpn}",
+        source="mouser",
+    )
+
+
+class DualSupplierScanChecks(_FixtureDatabase):
+    """PureScan CREATEPART / FASTADD end to end on the fixture database.
+
+    Only the distributor clients, media downloads and parameter writers are
+    replaced; part, supplier, category and provenance code is the real one.
+    """
+
+    _counter = 0
+
+    def setUp(self):
+        super().setUp()
+        from inventree_smart_parts import views
+        from inventree_smart_parts.services import category_mapper, part_creator
+
+        category_mapper.clear_cache()
+        self.addCleanup(category_mapper.clear_cache)
+        PartCategory.objects.get_or_create(name="Uncategorized", parent=None)
+        for target, name, value in (
+            (views, "log_activity", lambda *a, **k: None),
+            (part_creator, "_create_core_parameters", lambda *a, **k: None),
+            (part_creator, "_create_parameters", lambda *a, **k: []),
+            (part_creator, "_import_image", lambda *a, **k: None),
+        ):
+            patcher = patch.object(target, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.views = views
+        self.queried = []
+        self.answers = {}
+        self.user = SimpleNamespace(
+            is_authenticated=True, username="operator", has_perm=lambda perm: True
+        )
+        # Rows persist across tests (no per-test rollback, and the fixture
+        # apps are not installed so cascades cannot run): one MPN per test.
+        DualSupplierScanChecks._counter += 1
+        self.mpn = f"GRM32EC{DualSupplierScanChecks._counter:03d}ME05K"
+
+    # ── helpers ──
+    def distributors(self, **answers):
+        """Fake clients: source -> PartData | None | Exception."""
+        from inventree_smart_parts import api_clients
+
+        self.answers = answers
+        test = self
+
+        def client(source):
+            class Client:
+                def __init__(self, *args, **kwargs):
+                    pass
+
+                def search_by_mpn(self, mpn):
+                    test.queried.append(source)
+                    answer = test.answers.get(source)
+                    if isinstance(answer, Exception):
+                        raise answer
+                    return copy.deepcopy(answer)
+
+            return Client
+
+        return patch.multiple(
+            api_clients, MouserClient=client("mouser"), DigiKeyClient=client("digikey")
+        )
+
+    def post(self, view, body):
+        request = RequestFactory().post(
+            "/", data=json.dumps(body), content_type="application/json"
+        )
+        request.user = self.user
+        response = view(request)
+        return response.status_code, json.loads(response.content)
+
+    def createpart(self, barcode, **extra):
+        return self.post(self.views.purescan_createpart, {"barcode": barcode, **extra})
+
+    def lookup(self, barcode):
+        return self.post(self.views.api_barcode_lookup, {"barcode": barcode})[1]
+
+    def suppliers(self, part):
+        return sorted(
+            SupplierPart.objects.filter(part=part).values_list(
+                "supplier__name", flat=True
+            )
+        )
+
+    def scanned_part(self):
+        return Part.objects.get(name=self.mpn)
+
+    # ── scenarios ──
+    def test_mouser_label_creates_both_suppliers_with_digikey_category(self):
+        # Even with a Mouser-first API_PRIORITY the category is DigiKey's
+        self.settings["API_PRIORITY"] = "mouser,digikey"
+        with self.distributors(
+            mouser=mouser_hit(self.mpn), digikey=digikey_hit(self.mpn)
+        ):
+            status, body = self.createpart(mouser_label(self.mpn))
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["success"])
+        self.assertEqual(body["default_supplier"], "Mouser")
+        part = self.scanned_part()
+        self.assertEqual(self.suppliers(part), ["DigiKey", "Mouser"])
+        self.assertEqual(part.category.pathstring, DK_CATEGORY)
+        self.assertEqual(part.default_supplier.supplier.name, "Mouser")
+        # Other fields follow API_PRIORITY (Mouser first here)
+        self.assertTrue(part.description.startswith("Multilayer"))
+        self.assertEqual(provenance.load(part)["fields"]["category"]["src"], "digikey")
+
+    def test_digikey_label_also_fetches_mouser_and_keeps_digikey_default(self):
+        dkpn = f"490-{self.mpn}-1-ND"
+        with self.distributors(
+            mouser=mouser_hit(self.mpn), digikey=digikey_hit(self.mpn)
+        ):
+            status, body = self.createpart(digikey_label(self.mpn, dkpn))
+        self.assertEqual(status, 200, body)
+        part = self.scanned_part()
+        self.assertEqual(self.suppliers(part), ["DigiKey", "Mouser"])
+        self.assertEqual(part.default_supplier.supplier.name, "DigiKey")
+        self.assertEqual(part.category.pathstring, DK_CATEGORY)
+
+    def test_digikey_down_then_fastadd_adds_digikey_and_upgrades_category(self):
+        with self.distributors(
+            mouser=mouser_hit(self.mpn), digikey=RuntimeError("DigiKey offline")
+        ):
+            status, body = self.createpart(mouser_label(self.mpn))
+        self.assertEqual(status, 200, body)
+        part = self.scanned_part()
+        self.assertEqual(self.suppliers(part), ["Mouser"])
+        # Mouser leaf fuzzy-matched nothing -> DEFAULT_CATEGORY
+        self.assertEqual(part.category.name, "Uncategorized")
+        self.assertEqual(part.default_supplier.supplier.name, "Mouser")
+        # An outage is not a "not carried" answer: nothing remembered
+        self.assertEqual(provenance.recent_misses(provenance.load(part)), set())
+
+        found = self.lookup(mouser_label(self.mpn))
+        self.assertEqual(found["missing_suppliers"], ["digikey"])
+        self.assertTrue(found["enrich_needed"])
+
+        self.queried.clear()
+        with self.distributors(
+            mouser=mouser_hit(self.mpn), digikey=digikey_hit(self.mpn)
+        ):
+            status, body = self.createpart(mouser_label(self.mpn), enrich_scope="label")
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["already_exists"])
+        self.assertEqual(self.queried, ["digikey"])  # only the missing one
+        part = self.scanned_part()
+        self.assertEqual(self.suppliers(part), ["DigiKey", "Mouser"])
+        self.assertEqual(part.category.pathstring, DK_CATEGORY)
+        self.assertIn("Category", body["enriched"])
+        self.assertEqual(part.default_supplier.supplier.name, "Mouser")
+
+        self.queried.clear()
+        found = self.lookup(mouser_label(self.mpn))
+        self.assertEqual(found["missing_suppliers"], [])
+        self.assertFalse(found["enrich_needed"])
+
+    def test_not_carried_is_remembered_for_30_days(self):
+        with self.distributors(mouser=mouser_hit(self.mpn), digikey=None):
+            self.createpart(mouser_label(self.mpn))
+        part = self.scanned_part()
+        self.assertEqual(provenance.recent_misses(provenance.load(part)), {"digikey"})
+        found = self.lookup(mouser_label(self.mpn))
+        self.assertEqual(found["missing_suppliers"], [])
+        self.assertFalse(found["enrich_needed"])
+
+        # FASTADD makes no distributor call while the miss is remembered
+        self.queried.clear()
+        with self.distributors(mouser=mouser_hit(self.mpn), digikey=None):
+            status, body = self.createpart(mouser_label(self.mpn), enrich_scope="label")
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.queried, [])
+
+        # After 30 days DigiKey is asked again
+        meta = dict(part.metadata)
+        old = (datetime.now(timezone.utc) - timedelta(days=31)).isoformat()
+        meta["smartparts"]["lookups"]["digikey"]["miss"] = old
+        Part.objects.filter(pk=part.pk).update(metadata=meta)
+        self.assertEqual(
+            self.lookup(mouser_label(self.mpn))["missing_suppliers"], ["digikey"]
+        )
+
+    def test_scanned_distributor_down_sets_default_on_a_later_scan(self):
+        with self.distributors(
+            mouser=RuntimeError("Mouser offline"), digikey=digikey_hit(self.mpn)
+        ):
+            status, body = self.createpart(mouser_label(self.mpn))
+        self.assertEqual(status, 200, body)
+        part = self.scanned_part()
+        self.assertEqual(self.suppliers(part), ["DigiKey"])
+        self.assertIsNone(part.default_supplier)
+        self.assertEqual(body["default_supplier"], "")
+
+        with self.distributors(
+            mouser=mouser_hit(self.mpn), digikey=digikey_hit(self.mpn)
+        ):
+            self.createpart(mouser_label(self.mpn), enrich_scope="label")
+        part = self.scanned_part()
+        self.assertEqual(self.suppliers(part), ["DigiKey", "Mouser"])
+        self.assertEqual(part.default_supplier.supplier.name, "Mouser")
+
+    def test_manual_default_supplier_and_category_are_kept(self):
+        with self.distributors(
+            mouser=mouser_hit(self.mpn), digikey=RuntimeError("down")
+        ):
+            self.createpart(mouser_label(self.mpn))
+        part = self.scanned_part()
+        manual = PartCategory.objects.create(name=f"Hand picked {self.mpn}")
+        Part.objects.filter(pk=part.pk).update(category=manual)
+        dkpn = f"490-{self.mpn}-1-ND"
+        with self.distributors(
+            mouser=mouser_hit(self.mpn), digikey=digikey_hit(self.mpn)
+        ):
+            # DigiKey label: DigiKey gets added but Mouser stays the default
+            self.createpart(digikey_label(self.mpn, dkpn), enrich_scope="label")
+        part = self.scanned_part()
+        self.assertEqual(self.suppliers(part), ["DigiKey", "Mouser"])
+        self.assertEqual(part.default_supplier.supplier.name, "Mouser")
+        self.assertEqual(part.category_id, manual.pk)
+
+    def test_existing_part_without_default_gets_it_without_api_calls(self):
+        with self.distributors(
+            mouser=mouser_hit(self.mpn), digikey=digikey_hit(self.mpn)
+        ):
+            self.createpart(mouser_label(self.mpn))
+        part = self.scanned_part()
+        Part.objects.filter(pk=part.pk).update(default_supplier=None)
+        found = self.lookup(digikey_label(self.mpn, f"490-{self.mpn}-1-ND"))
+        self.assertEqual(found["missing_suppliers"], [])
+        self.assertTrue(found["enrich_needed"])
+        self.queried.clear()
+        with self.distributors(mouser=None, digikey=None):
+            status, body = self.createpart(
+                digikey_label(self.mpn, f"490-{self.mpn}-1-ND"), enrich_scope="label"
+            )
+        self.assertEqual(self.queried, [])
+        self.assertEqual(body["enriched"], ["Default supplier: DigiKey"])
+        self.assertEqual(self.scanned_part().default_supplier.supplier.name, "DigiKey")
+
+    def test_category_chain_falls_back_to_mouser_fuzzy_then_default(self):
+        from inventree_smart_parts.services.data_merger import merge_part_data
+
+        PartCategory.objects.get_or_create(name="Tantalum Capacitors", parent=None)
+        self.settings["AUTO_CREATE_CATEGORIES"] = False
+
+        def resolve(dk_category, mouser_category):
+            merged = merge_part_data(
+                [
+                    digikey_hit(self.mpn, category=dk_category),
+                    mouser_hit(self.mpn, category=mouser_category),
+                ],
+                ["digikey", "mouser"],
+                search_term=self.mpn,
+                strict=True,
+            )
+            cat_id, path, _score, _created = self.views._resolve_category(
+                self.plugin, merged, default_threshold=45
+            )
+            return path, merged.raw_data["field_sources"]["category"]
+
+        # 1. DigiKey's chain when it can be placed
+        PartCategory.objects.get_or_create(name="Qwerty Modules", parent=None)
+        self.assertEqual(
+            resolve("Qwerty Modules", "Tantalum Capacitors - Solid SMD"),
+            ("Qwerty Modules", "digikey"),
+        )
+        # 2. DigiKey's category cannot be placed -> Mouser leaf, fuzzy
+        self.assertEqual(
+            resolve("Plugh > Xyzzy Thingamajigs", "Tantalum Capacitors - Solid SMD"),
+            ("Tantalum Capacitors", "mouser"),
+        )
+        # 3. Neither matches -> default category
+        self.assertEqual(
+            resolve("Plugh > Xyzzy Thingamajigs", "Zzyzx Gadgets"),
+            ("Uncategorized", "mouser"),
+        )
+
+    def test_lookup_outcomes_ignore_errors(self):
+        from inventree_smart_parts.services.data_merger import merge_part_data
+
+        merged = merge_part_data(
+            [mouser_hit(self.mpn)], None, search_term=self.mpn, strict=True
+        )
+        self.assertEqual(
+            self.views._lookup_outcomes(
+                {"mouser": {"mpn": self.mpn}, "digikey": None}, merged
+            ),
+            (["mouser"], ["digikey"]),
+        )
+        self.assertEqual(
+            self.views._lookup_outcomes(
+                {"mouser": {"mpn": self.mpn}, "digikey": {"error": "timeout"}}, merged
+            ),
+            (["mouser"], []),
+        )
+        # A hit with another MPN is "not carried"
+        self.assertEqual(
+            self.views._lookup_outcomes({"mouser": {"mpn": "OTHER"}}, None),
+            ([], ["mouser"]),
+        )
+
+    def test_stock_summary_reports_mpn_and_description(self):
+        part = Part.objects.create(name="R-10K", description="RES 10K 1% 0603")
+        ManufacturerPart.objects.create(part=part, MPN="RC0603FR-0710KL")
+        StockItem.objects.create(
+            part=part, location=self.location, quantity=5, barcode_data="STOCK_SUM1"
+        )
+        request = RequestFactory().get(
+            "/", {"part_id": part.pk, "location_id": self.location.pk}
+        )
+        request.user = self.user
+        data = json.loads(purescan_stock_summary(request).content)
+        self.assertEqual(data["mpn"], "RC0603FR-0710KL")
+        self.assertEqual(data["description"], "RES 10K 1% 0603")
+        self.assertEqual(data["location_stock"], "5")
+        self.assertEqual(data["stock_labels"], ["STOCK_SUM1"])
 
 
 if __name__ == "__main__":
