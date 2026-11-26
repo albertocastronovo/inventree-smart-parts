@@ -2,6 +2,20 @@
 
 All notable changes to SmartParts are documented in this file.
 
+## [1.7.1] - 2026-11-26
+
+### Fixed
+- **Saving a part failed with "Creation failed: {'link': ['Enter a valid URL']}"** when the distributor's datasheet URL was not a valid URL. This happened for Taiyo Yuden parts from Mouser, for example `963-MCASH21GCC7684MT`, whose datasheet path contains a space: `.../specsheets/Taiyo Yuden_1102023_MC_mlcc_all_e.pdf`. `Part.full_clean()` rejected the link and rolled back the whole part. This affected the dashboard, PureScan CREATEPART/FASTADD, batch import and API v1.
+  - Datasheet, manufacturer-part and supplier-part links are now cleaned before saving:
+    - spaces and non-ASCII characters in the path, query and fragment are percent-encoded;
+    - protocol-relative `//host/...` links get `https:`;
+    - links that are already valid are stored unchanged.
+  - A link that still isn't a valid http(s) URL is left empty, and the part is created anyway. The response lists "Datasheet link dropped (not a valid URL): ...".
+  - Supplier and manufacturer part links were never validated by the server, so an invalid value could be stored silently. They are cleaned the same way.
+
+### Housekeeping
+- Tests: the fixture `Part.link` is now a validated URL field, as in InvenTree. Regression scenarios cover the Taiyo Yuden datasheet and an unrepairable link, plus unit tests for `clean_link()`.
+
 ## [1.7.0] - 2026-11-25
 
 Security hardening. Users who hold the matching InvenTree permissions see no change. The changes only affect users without those permissions, anonymous requests and forged requests.

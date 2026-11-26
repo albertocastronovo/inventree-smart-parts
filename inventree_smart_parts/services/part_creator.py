@@ -16,6 +16,68 @@ from ..api_clients.base import PartData, PriceBreak
 
 logger = logging.getLogger("inventree_smart_parts.services.creator")
 
+# InvenTree's link fields (Part / ManufacturerPart / SupplierPart.link)
+LINK_MAX_LENGTH = 2000
+# Characters left as-is when percent-encoding a URL's path/query/fragment:
+# the RFC 3986 reserved set, unreserved punctuation and "%" (so existing
+# %XX escapes survive and cleaning twice changes nothing).
+_URL_SAFE_CHARS = ":/?#[]@!$&'()*+,;=-._~%"
+
+
+def _url_validator():
+    try:
+        from InvenTree.validators import AllowedURLValidator
+
+        return AllowedURLValidator()
+    except Exception:
+        from django.core.validators import URLValidator
+
+        return URLValidator(schemes=["http", "https"])
+
+
+def clean_link(url) -> str:
+    """Return ``url`` as a valid http(s) link for an InvenTree link field.
+
+    Distributor URLs are not always valid as returned: Mouser's Taiyo
+    Yuden datasheets contain a space ("specsheets/Taiyo Yuden_….pdf"),
+    which Part.full_clean() rejects. Spaces and non-ASCII characters in
+    the path/query/fragment are percent-encoded, protocol-relative
+    "//host/…" gets https. Valid URLs come back unchanged; a URL that
+    still is not valid (or is too long) becomes "".
+    """
+    from urllib.parse import quote, urlsplit, urlunsplit
+
+    url = str(url or "").strip()
+    if not url:
+        return ""
+    if url.startswith("//"):
+        url = "https:" + url
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return ""
+    if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
+        return ""
+    url = urlunsplit(
+        (
+            parts.scheme,
+            parts.netloc,
+            quote(parts.path, safe=_URL_SAFE_CHARS),
+            quote(parts.query, safe=_URL_SAFE_CHARS),
+            quote(parts.fragment, safe=_URL_SAFE_CHARS),
+        )
+    )
+    if len(url) > LINK_MAX_LENGTH:
+        return ""
+    from django.core.exceptions import ValidationError
+
+    try:
+        _url_validator()(url)
+    except ValidationError:
+        return ""
+    return url
+
+
 # ── Shared sentinel values: empty/placeholder parameter values ────────────────
 # Used by both _create_parameters (DB writes) and the parameter_normalizer
 # (display filtering) to guarantee consistent sanitisation.
@@ -214,6 +276,19 @@ def create_part_from_data(
                     category_id,
                 )
                 category_id = None
+
+        # ── Links: an invalid datasheet URL must not fail the whole part ──
+        # (Part.full_clean() validates Part.link). Downstream code - Part.link,
+        # provenance, the datasheet attachment - all use the cleaned value.
+        raw_datasheet = part_data.datasheet_url
+        part_data.datasheet_url = clean_link(raw_datasheet)
+        if raw_datasheet and not part_data.datasheet_url:
+            logger.warning(
+                f"Datasheet link dropped for '{part_data.mpn}': {raw_datasheet!r}"
+            )
+            result.errors.append(
+                f"Datasheet link dropped (not a valid URL): {raw_datasheet}"
+            )
 
         with transaction.atomic():
             # ── Step 1: Get or create the Part ──
@@ -596,7 +671,7 @@ def _create_manufacturer_part(
         manufacturer=manufacturer,
         MPN=data.mpn,
         defaults={
-            "link": data.supplier_url or "",
+            "link": clean_link(data.supplier_url),
         },
     )
 
@@ -752,7 +827,7 @@ def _create_supplier_part(
             supplier=supplier,
             SKU=sku,
             defaults={
-                "link": supplier_entry.get("url", ""),
+                "link": clean_link(supplier_entry.get("url", "")),
                 "manufacturer_part": mfr_part,
             },
         )
@@ -767,7 +842,7 @@ def _create_supplier_part(
             logger.info(f"Backfilled manufacturer_part on SupplierPart {sup_part.pk}")
 
         # Fill URL if missing (never overwrite)
-        new_url = supplier_entry.get("url", "")
+        new_url = clean_link(supplier_entry.get("url", ""))
         if new_url and not sup_part.link:
             sup_part.link = new_url
             update_fields.append("link")

@@ -95,7 +95,7 @@ class Part(BarcodeModel):
     name = models.CharField(max_length=100, blank=True)
     description = models.CharField(max_length=250, blank=True)
     IPN = models.CharField(max_length=100, blank=True)
-    link = models.CharField(max_length=500, blank=True)
+    link = models.URLField(max_length=2000, blank=True)  # as InvenTree
     category = models.ForeignKey(
         PartCategory, null=True, blank=True, on_delete=models.SET_NULL
     )
@@ -1002,6 +1002,54 @@ class DualSupplierScanChecks(_FixtureDatabase):
         self.assertEqual(match["path"], "Uncategorized")
         self.assertFalse(PartCategory.objects.filter(name=root).exists())
 
+    # ── v1.7.1: invalid distributor links ──
+    TY_DATASHEET = (
+        "https://www.mouser.com/catalog/specsheets/"
+        "Taiyo Yuden_1102023_MC_mlcc_all_e.pdf"
+    )
+
+    def taiyo_yuden(self, datasheet):
+        return PartData(
+            mpn=self.mpn,
+            name=self.mpn,
+            manufacturer="Taiyo Yuden",
+            description="Multilayer Ceramic Capacitors MLCC - SMD/SMT 0.68uF",
+            datasheet_url=datasheet,
+            supplier_name="Mouser",
+            supplier_sku=f"963-{self.mpn}",
+            supplier_url=f"https://www.mouser.com/ProductDetail/{self.mpn}?qs=a%2Fb",
+            source="mouser",
+        )
+
+    def test_datasheet_link_with_a_space_no_longer_fails_creation(self):
+        result = part_creator.create_part_from_data(
+            self.taiyo_yuden(self.TY_DATASHEET), priority_order=["mouser"]
+        )
+        self.assertTrue(result.success, result.message)
+        part = self.scanned_part()
+        self.assertEqual(
+            part.link,
+            "https://www.mouser.com/catalog/specsheets/"
+            "Taiyo%20Yuden_1102023_MC_mlcc_all_e.pdf",
+        )
+        self.assertEqual(result.errors, [])
+        # The (already valid) supplier URL is stored unchanged
+        self.assertEqual(
+            SupplierPart.objects.get(part=part).link,
+            f"https://www.mouser.com/ProductDetail/{self.mpn}?qs=a%2Fb",
+        )
+
+    def test_unrepairable_datasheet_link_is_dropped_not_fatal(self):
+        result = part_creator.create_part_from_data(
+            self.taiyo_yuden("https://exa mple.com/ds.pdf"), priority_order=["mouser"]
+        )
+        self.assertTrue(result.success, result.message)
+        self.assertEqual(self.scanned_part().link, "")
+        self.assertEqual(
+            result.errors,
+            ["Datasheet link dropped (not a valid URL): https://exa mple.com/ds.pdf"],
+        )
+
     def test_stock_summary_reports_mpn_and_description(self):
         part = Part.objects.create(name="R-10K", description="RES 10K 1% 0603")
         ManufacturerPart.objects.create(part=part, MPN="RC0603FR-0710KL")
@@ -1017,6 +1065,54 @@ class DualSupplierScanChecks(_FixtureDatabase):
         self.assertEqual(data["description"], "RES 10K 1% 0603")
         self.assertEqual(data["location_stock"], "5")
         self.assertEqual(data["stock_labels"], ["STOCK_SUM1"])
+
+
+class CleanLinkChecks(unittest.TestCase):
+    def test_valid_links_are_unchanged(self):
+        for url in (
+            "https://www.digikey.com/en/products/detail/murata/GRM32EC72A106ME05L/4905545",
+            "https://www.mouser.com/ProductDetail/Murata/GRM32?qs=sGAEpiMZZMv%2FtR8%3D",
+            "https://datasheet.lcsc.com/lcsc/1811151432_Murata-GRM32.pdf",
+            "https://www.murata.com/en-global/products/productdata/8796836/GRM32.pdf#page=2",
+            "http://example.com/a(b)_c-d.~e;f=g,h!i*j'k",
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(part_creator.clean_link(url), url)
+
+    def test_spaces_and_non_ascii_are_encoded_once(self):
+        cleaned = part_creator.clean_link(
+            " https://www.mouser.com/catalog/specsheets/Taiyo Yuden_MC_mlcc.pdf "
+        )
+        self.assertEqual(
+            cleaned,
+            "https://www.mouser.com/catalog/specsheets/Taiyo%20Yuden_MC_mlcc.pdf",
+        )
+        self.assertEqual(part_creator.clean_link(cleaned), cleaned)  # idempotent
+        self.assertEqual(
+            part_creator.clean_link("https://ex.com/Größe ä.pdf?q=a b"),
+            "https://ex.com/Gr%C3%B6%C3%9Fe%20%C3%A4.pdf?q=a%20b",
+        )
+
+    def test_protocol_relative_links_get_https(self):
+        self.assertEqual(
+            part_creator.clean_link("//mm.digikey.com/Volume0/ds.pdf"),
+            "https://mm.digikey.com/Volume0/ds.pdf",
+        )
+
+    def test_unusable_links_become_empty(self):
+        for url in (
+            None,
+            "",
+            "   ",
+            "#",
+            "ftp://example.com/ds.pdf",
+            "javascript:alert(1)",
+            "/relative/path.pdf",
+            "https://exa mple.com/ds.pdf",
+            "https://example.com/" + "a" * 2000,
+        ):
+            with self.subTest(url=url):
+                self.assertEqual(part_creator.clean_link(url), "")
 
 
 def _user(*, authenticated=True, staff=False, missing=()):
