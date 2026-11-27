@@ -86,6 +86,11 @@ function terminal({
       if (endpoint.endsWith('/createstock/') || endpoint === '/api/stock/add/') {
         return response({ success: true });
       }
+      // Stock item detail (SYS:ADD looks up the scanned instance)
+      if (/^\/api\/stock\/\d+\/$/.test(endpoint)) return response({
+        pk: 12, part: 4, part_detail: { name: 'RES-10K' }, quantity: 100,
+        location: 9, location_detail: { name: 'Bin' },
+      });
       assert.fail(`Unexpected request: ${url}`);
     },
   };
@@ -535,4 +540,120 @@ test('a cancel during the FASTADD gap-fill is not overwritten by its late respon
   finish({ success: false, already_exists: true, part_id: 4, enriched: ['Mouser supplier part X'] });
   await pending;
   assert.equal(t.current().state, 'IDLE');
+});
+
+// ── v1.7.4: FASTADD quantity codes add up in a combo window ────────────────
+
+const BAG = { barcode_data: { mpn: 'RES-10K', quantity: 40 } };   // label says 40
+
+async function countBag(t, codes) {
+  await t.scan('SYS:FASTADD');
+  await t.scan(REEL);
+  for (const n of codes) await t.scan(`SYS:QTY:${n}`);
+}
+
+const commits = t => t.called('/createstock/').map(c => [c.body.quantity, c.body.location_id]);
+
+test('FASTADD adds up quantity codes in a 3 s window, then waits for the stock label', async () => {
+  const t = terminal({ lookup: BAG });
+  await countBag(t, [25, 5, 1, 1, 1, 1]);
+  assert.equal(t.current().state, 'COMBO');
+  assert.equal(t.current().comboQty, 34);
+  assert.match(t.current().detail,
+    /^FASTADD: "RES-10K"\nQuantity: 34 .*\n→ Or scan a location or stock label to finish now at 34$/);
+  t.advance(2999);
+  assert.equal(t.current().state, 'COMBO');
+  t.advance(1);
+  assert.equal(t.current().state, 'AWAITING_LOCATION');
+  assert.match(t.current().detail, /\(reel qty 34\)/);
+  assert.equal(t.current().stockCard.title, 'Receive a reel of 34');
+  await t.scan('STOCK_9Z9Z');
+  assert.deepEqual(commits(t), [[34, 9]]);
+});
+
+test('FASTADD: a location after the count overrides the default, also inside the window', async () => {
+  for (const wait of [3000, 0]) {
+    const t = terminal({ lookup: BAG });
+    await countBag(t, [25, 5, 1, 1, 1, 1]);
+    t.advance(wait);
+    await t.scan('{"stocklocation": 5}');
+    assert.equal(t.current().state, 'AWAITING_QTY', `wait ${wait}`);
+    assert.match(t.current().detail, /^Quantity: 34\n/);
+    t.advance(5000);   // a window ended early must not fire later
+    assert.equal(t.current().state, 'AWAITING_QTY', `wait ${wait}`);
+    await t.scan('STOCK_9Z9Z');
+    assert.deepEqual(commits(t), [[34, 5]], `wait ${wait}`);
+  }
+});
+
+test('FASTADD: a stock label inside the window commits the running total at once', async () => {
+  let t = terminal({ lookup: BAG });
+  await countBag(t, [25, 5]);
+  await t.scan('STOCK_9Z9Z');
+  assert.deepEqual(commits(t), [[30, 9]]);
+  t.advance(3000);
+  assert.match(t.current().detail, /Burst/);
+  // an existing instance of the part: merge the count into it
+  t = terminal({ lookup: BAG });
+  await countBag(t, [25, 5]);
+  await t.scan('STOCK_USED');
+  assert.match(t.current().detail, /Added 30× "RES-10K" to existing instance STOCK_USED/);
+  const add = t.calls.filter(c => c.target.pathname === '/api/stock/add/');
+  assert.equal(JSON.stringify(add.map(c => c.body.items)), JSON.stringify([[{ pk: 12, quantity: 30 }]]));
+});
+
+test('FASTADD: a quantity code after the window starts a new count', async () => {
+  const t = terminal({ lookup: BAG });
+  await countBag(t, [25]);
+  t.advance(3000);
+  await t.scan('SYS:QTY:10');
+  assert.equal(t.current().comboQty, 10);
+  t.advance(3000);
+  assert.match(t.current().detail, /\(reel qty 10\)/);
+  await t.scan('STOCK_9Z9Z');
+  assert.deepEqual(commits(t), [[10, 9]]);
+});
+
+test('FASTADD: an action code during the window abandons the reel', async () => {
+  const t = terminal({ lookup: BAG });
+  await countBag(t, [25, 5]);
+  await t.scan('SYS:INFO');
+  assert.equal(t.current().state, 'AWAITING_ITEM');
+  assert.equal(t.current().action, 'INFO');
+  t.advance(5000);
+  assert.equal(t.current().state, 'AWAITING_ITEM');
+  assert.equal(t.called('/createstock/').length, 0);
+});
+
+test('FASTADD without a quantity code still receives the label quantity', async () => {
+  const t = terminal({ lookup: BAG });
+  await countBag(t, []);
+  await t.scan('STOCK_9Z9Z');
+  assert.deepEqual(commits(t), [[40, 9]]);
+});
+
+test('CREATESTOCK keeps the single quantity code (no counting window)', async () => {
+  const t = terminal({ lookup: BAG });
+  await t.scan('SYS:CREATESTOCK');
+  await t.scan(REEL);
+  await t.scan('SYS:QTY:25');
+  assert.equal(t.current().state, 'AWAITING_TOKEN');
+  assert.match(t.current().detail, /^Quantity: 25\n/);
+  await t.scan('STOCK_9Z9Z');
+  assert.deepEqual(commits(t), [[25, 9]]);
+});
+
+test('SYS:ADD still adds up its quantity codes and commits after 3 s', async () => {
+  const t = terminal();
+  await t.scan('SYS:ADD');
+  await t.scan('STOCK_USED');
+  await t.scan('SYS:QTY:5');
+  await t.scan('SYS:QTY:1');
+  assert.equal(t.current().state, 'COMBO');
+  assert.equal(t.current().detail, 'ADD: "RES-10K"\nQuantity: 6   ⏳ Scan more QTY codes or wait 3s…');
+  t.advance(3000);
+  await until(() => t.current().state === 'SUCCESS');
+  assert.match(t.current().detail, /Added 6× "RES-10K" \(now 106\)/);
+  const add = t.calls.filter(c => c.target.pathname === '/api/stock/add/');
+  assert.equal(JSON.stringify(add.map(c => c.body.items)), JSON.stringify([[{ pk: 12, quantity: 6 }]]));
 });

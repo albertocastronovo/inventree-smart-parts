@@ -105,6 +105,7 @@
   let _pendingBarcodeData = null;   // parsed distributor label fields
   let _pendingLabelRaw    = null;   // DataMatrix waiting for its 1-D part number
   let _pendingLabelLookup = null;   // its lookup answer (label details)
+  let _pendingFastAddView = null;   // { summary, lk } of the FASTADD card (redrawn after a count)
 
   // DELETE pending state (v3)
   let _pendingDeleteKind  = null;   // 'part' | 'stock'
@@ -364,6 +365,7 @@
     _pendingBarcodeData = null;
     _pendingLabelRaw    = null;
     _pendingLabelLookup = null;
+    _pendingFastAddView = null;
   }
 
   function _clearPendingDelete() {
@@ -1214,6 +1216,7 @@
         }
         if (flow !== _flowId) return;
       }
+      _pendingFastAddView = { summary, lk };
       _showFastAddPrompt(summary, lk);
       return;
     }
@@ -1370,20 +1373,40 @@
 
   // ── Combo-timer execution ─────────────────────────────────────────────────
 
+  // FASTADD counts the reel being received (no stock item yet); it can end
+  // the window early with a location or stock label.
+  function _comboDetail() {
+    const name = _action === ACTIONS.FASTADD ? _pendingPartName : _itemInfo?.part_name;
+    let detail = `${_action}: "${name}"\nQuantity: ${_comboQty}   ⏳ Scan more QTY codes or wait 3s…`;
+    if (_action === ACTIONS.FASTADD) {
+      detail += `\n→ Or scan a location or stock label to finish now at ${_comboQty}`;
+    }
+    return detail;
+  }
+
   function _startCombo(qty) {
     clearTimeout(_comboTimer);
     _comboQty = qty;
-    _setState(STATES.COMBO,
-      `${_action}: "${_itemInfo?.part_name}"\nQuantity: ${_comboQty}   ⏳ Scan more QTY codes or wait 3s…`);
+    _setState(STATES.COMBO, _comboDetail());
     _comboTimer = setTimeout(() => _executeCombo(), COMBO_TIMEOUT_MS);
   }
 
   function _addCombo(qty) {
     clearTimeout(_comboTimer);
     _comboQty += qty;
-    _setState(STATES.COMBO,
-      `${_action}: "${_itemInfo?.part_name}"\nQuantity: ${_comboQty}   ⏳ Scan more QTY codes or wait 3s…`);
+    _setState(STATES.COMBO, _comboDetail());
     _comboTimer = setTimeout(() => _executeCombo(), COMBO_TIMEOUT_MS);
+  }
+
+  // FASTADD: back to the location / stock-label step with the counted quantity
+  function _resumeFastAddStep() {
+    if (_pendingLocationId == null) {
+      const view = _pendingFastAddView || {};
+      _showFastAddPrompt(view.summary || null, view.lk || null);
+      return;
+    }
+    _setState(STATES.AWAITING_TOKEN,
+      `Quantity: ${_pendingQty}\n→ Scan a FREE STOCK_XXXX token to bind the new instance`);
   }
 
   async function _executeCombo() {
@@ -1392,6 +1415,14 @@
     const action = _action;
     const itemId = _stockItemId;
     const info = _itemInfo;
+
+    if (action === ACTIONS.FASTADD) {
+      // The window closed: the count becomes the quantity being received
+      _pendingQty = qty;
+      _comboQty = 0;
+      _resumeFastAddStep();
+      return;
+    }
 
     if (action === ACTIONS.ADD) {
       _setState(STATES.PROCESSING, `Adding ${qty}× to "${info?.part_name}"…`);
@@ -1523,6 +1554,28 @@
 
     // ── STATE: COMBO — accumulating qty scans ────────────────────────────
     if (_state === STATES.COMBO) {
+      // FASTADD: counting the reel; any other scan ends the window now
+      if (_action === ACTIONS.FASTADD) {
+        if (ctrlCode && ctrlCode !== '__UNDO__') {
+          _armAction(ctrlCode);
+          return;
+        }
+        const qty = _parseQuantityCode(raw);
+        if (qty !== null && qty > 0) {
+          _addCombo(qty);
+          return;
+        }
+        // A location or stock label: finish with the running total, then
+        // let the location / stock-label step handle this same scan.
+        clearTimeout(_comboTimer);
+        _comboTimer = null;
+        _pendingQty = _comboQty;
+        _comboQty = 0;
+        _resumeFastAddStep();
+        await handleScan(raw);
+        return;
+      }
+
       // Action code switches abort combo and start new flow
       if (ctrlCode && ctrlCode !== '__UNDO__') {
         clearTimeout(_comboTimer);
@@ -1808,6 +1861,15 @@
         return;
       }
 
+      // FASTADD: quantity codes add up in a combo window, then back here
+      if (_action === ACTIONS.FASTADD) {
+        const qty = _parseQuantityCode(raw);
+        if (qty !== null && qty > 0) {
+          _startCombo(qty);
+          return;
+        }
+      }
+
       const bc = await _parseInvenTreeBarcode(raw);
       if (scanFlow !== _flowId || _state !== STATES.AWAITING_LOCATION) return;
 
@@ -1864,8 +1926,9 @@
         return;
       }
 
-      // CREATESTOCK/FASTADD: SYS:QTY:nnn = keep the SYS:LAST location and set qty
-      if (_action === ACTIONS.CREATESTOCK || _action === ACTIONS.FASTADD) {
+      // CREATESTOCK: SYS:QTY:nnn = keep the SYS:LAST location and set qty
+      // (FASTADD counts quantity codes in a combo window, see above)
+      if (_action === ACTIONS.CREATESTOCK) {
         const qty = _parseQuantityCode(raw);
         if (qty !== null && qty > 0) {
           const last = _getLastLocation();
@@ -1898,6 +1961,10 @@
 
       const qty = _parseQuantityCode(raw);
       if (qty !== null && qty > 0) {
+        if (_action === ACTIONS.FASTADD) {
+          _startCombo(qty);
+          return;
+        }
         _pendingQty = qty;
         _setState(STATES.AWAITING_TOKEN,
           `Quantity: ${_pendingQty}\n→ Scan a FREE STOCK_XXXX token to bind the new instance`);
@@ -1928,6 +1995,15 @@
       if (ctrlCode) {
         _armAction(ctrlCode);
         return;
+      }
+
+      // FASTADD: a quantity code starts a new count
+      if (_action === ACTIONS.FASTADD) {
+        const qty = _parseQuantityCode(raw);
+        if (qty !== null && qty > 0) {
+          _startCombo(qty);
+          return;
+        }
       }
 
       const bc = await _parseInvenTreeBarcode(raw);

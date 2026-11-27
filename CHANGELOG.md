@@ -2,6 +2,22 @@
 
 All notable changes to SmartParts are documented in this file.
 
+## [1.7.4] - 2026-11-27
+
+### Changed
+- **PureScan FASTADD: quantity codes now add up, like in SYS:ADD.** This is for opened bags with odd quantities. Before, one `SYS:QTY:nnn` scan set the quantity outright, and in the location step it also fixed the location to SYS:LAST, so a quantity like 34 could not be entered from the command-sheet codes.
+  - After the DataMatrix, the first quantity code replaces the label quantity. Each further code within 3 s adds to it. Example: label says 40, then `25`, `5`, `1`, `1`, `1`, `1` → 34.
+  - The terminal shows SYS:ADD's counting display, plus the line "Or scan a location or stock label to finish now at 34".
+  - When the window closes, the count becomes the quantity being received. The terminal returns to the location / stock-label step, with the card reading "Receive a reel of 34". A location label still overrides the default location; a free STOCK_ label commits; an existing STOCK_ label of the part merges.
+  - Scanning a location or stock label inside the window finishes it at once with the running total.
+  - A quantity code after the window starts a new count, which replaces the total: the way to fix a wrong count. An action code abandons the reel, and `SYS:CANCEL` resets as usual.
+  - A FASTADD without quantity codes still receives the label quantity.
+  - SYS:ADD / REMOVE / STOCKTAKE and CREATESTOCK are unchanged.
+
+### Housekeeping
+- Cache-buster `purescan.js?v=16`.
+- Tests (terminal JS): counting with the 3 s window, a location after or inside the window, a stock label or merge inside the window, a new count, abandoning, and regressions for CREATESTOCK and SYS:ADD.
+
 ## [1.7.3] - 2026-11-27
 
 ### Added
