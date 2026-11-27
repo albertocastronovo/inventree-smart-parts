@@ -37,6 +37,7 @@ function terminal({
   let now = 0;
   let timerId = 0;
   let current;
+  let keydown;
   const timers = new Map();
   const calls = [];
   const local = new Map();
@@ -47,7 +48,11 @@ function terminal({
   const window = { localStorage: { getItem: key => local.get(key), setItem: (k, v) => local.set(k, v) } };
   const context = {
     window, URLSearchParams, console: { ...console, warn() {} },
-    document: { addEventListener() {}, removeEventListener() {}, getElementById: () => ({ value: 'csrf' }) },
+    document: {
+      addEventListener(type, fn) { if (type === 'keydown') keydown = fn; },
+      removeEventListener() {},
+      getElementById: () => ({ value: 'csrf' }),
+    },
     Date: class extends Date { static now() { return now; } },
     setTimeout(fn, ms) { timers.set(++timerId, { fn, when: now + ms }); return timerId; },
     clearTimeout(id) { timers.delete(id); },
@@ -57,13 +62,19 @@ function terminal({
       calls.push({ target, body });
       const endpoint = target.pathname;
       if (endpoint.endsWith('/resolve/')) return response({}, 400);
+      // `lookup` may be extra response fields or a function of the request body
       if (endpoint.endsWith('/lookup/')) return response({
         found, part_id: found ? 4 : null, mpn: 'RES-10K', part_name: 'RES-10K',
         enrich_needed: false, missing_suppliers: [],
-        barcode_data: { mpn: 'RES-10K', quantity: 20 }, ...lookup,
+        barcode_data: { mpn: 'RES-10K', quantity: 20 },
+        ...(typeof lookup === 'function' ? lookup(body) : lookup),
       });
-      // `createpart` may be a response body or a promise of one (deferred)
-      if (endpoint.endsWith('/createpart/') && createpart) return response(await createpart);
+      // `createpart` may be a response body, a promise of one (deferred) or a
+      // function of the request body; { status, body } answers an HTTP error
+      if (endpoint.endsWith('/createpart/') && createpart) {
+        const answer = typeof createpart === 'function' ? createpart(body) : await createpart;
+        return answer && answer.status ? response(answer.body, answer.status) : response(answer);
+      }
       if (endpoint.endsWith('/stock-summary/')) {
         if (deferred) await deferred;
         if (summaryStatus !== 200) return response({ error: 'Boom' }, summaryStatus);
@@ -83,6 +94,13 @@ function terminal({
   window.PureScan.init(state => { current = state; });
   const t = {
     scan, calls, current: () => current,
+    // Scanner wedge: [key, repeat?] pairs typed 5 ms apart, then Enter
+    type(keys) {
+      for (const [key, repeat = false] of [...keys, ['Enter']]) {
+        now += 5;
+        keydown({ key, repeat, preventDefault() {}, stopPropagation() {} });
+      }
+    },
     called: suffix => calls.filter(c => c.target.pathname.endsWith(suffix)),
     advance(ms) {
       now += ms;
@@ -101,6 +119,144 @@ async function until(predicate, rounds = 200) {
 
 const REEL = '[)>\x1e06\x1d1PRES-10K\x1dQ20\x1e\x04';
 const MOUSER_REEL = '[)>\x1e06\x1dK606-1\x1d14K002\x1d1PRES-10K\x1dQ20\x1d11K0870\x1d4LJP\x1d1VYageo\x1e\x04';
+
+// ── Scanner wedge input ─────────────────────────────────────────────────────
+
+test('auto-repeat keystrokes are dropped from a scan', async () => {
+  const t = terminal();
+  await t.scan('SYS:INFO');
+  const label = '[)>{RS}06{GS}1PRES-10K{GS}Q20{RS}';
+  const keys = [...label].map(k => [k]);
+  // the OS repeats "{" while it waits for the key-up ([)>{{{{{RS}...)
+  keys.splice(4, 0, ['{', true], ['{', true], ['{', true]);
+  t.type(keys);
+  await until(() => t.called('/lookup/').length === 1);
+  assert.equal(t.called('/lookup/')[0].body.barcode, label);
+});
+
+const NO_PN_MESSAGE = "This DataMatrix has no part number (1P): scan the part number's " +
+  '1-D barcode, or rescan the label if it was a bad read.';
+const INCOMPLETE = {
+  found: false, part_id: null, mpn: '', incomplete: true, barcode_data: { mpn: '' },
+  error: NO_PN_MESSAGE,
+};
+const GARBLED = '[)>{{{{{RS}06{GS}K31K077548699{GS}4LUS{GS}1VKEMET{RS}<EOT>';
+
+test('an incomplete DataMatrix asks for the part-number barcode and creates nothing', async () => {
+  for (const action of ['SYS:INFO', 'SYS:FASTADD', 'SYS:CREATESTOCK', 'SYS:DELETEPART']) {
+    const t = terminal({ found: false, lookup: INCOMPLETE });
+    await t.scan(action);
+    await t.scan(GARBLED);
+    await until(() => t.current().state === 'AWAITING_PART_NUMBER');
+    assert.match(t.current().detail,
+      /This label has no part number.*Scan the part number's 1-D barcode/s, action);
+    assert.equal(t.called('/createpart/').length, 0, action);
+  }
+});
+
+// ── v1.7.3: DataMatrix without part number + 1-D part-number scan ──────────
+// Sample-warehouse label: K/14K/Q/11K/4L/1V only; the MPN is a 1-D barcode
+const SAMPLE = '[)>{RS}06{GS}KVY5570{GS}14K001{GS}Q25{GS}11K076270558{GS}4LCN{GS}1VVishay{RS}<EOT>';
+const SAMPLE_DATA = { mpn: '', quantity: 25, manufacturer: 'Vishay', distributor: 'mouser' };
+const MPN = 'CRCW060310K0FKEA';
+
+// The lookup as the server answers it: the 1-D scan completes the label
+function sampleLookup(body) {
+  if (body.barcode !== SAMPLE) return {};
+  const pn = (body.part_barcode || '').replace(/^1P/, '');
+  if (!pn || pn === 'Q25') {
+    return { ...INCOMPLETE, distributor: 'mouser', barcode_data: SAMPLE_DATA };
+  }
+  return {
+    found: true, part_id: 4, mpn: pn, part_name: pn, distributor: 'mouser',
+    barcode_data: { ...SAMPLE_DATA, mpn: pn },
+  };
+}
+
+test('CREATEPART asks for the 1-D part number, then creates the part from it', async () => {
+  const t = terminal({
+    createpart: body => body.part_barcode
+      ? { success: true, part_id: 7, part_name: MPN, category_path: 'Resistors' }
+      : { status: 400, body: { success: false, incomplete: true, message: NO_PN_MESSAGE } },
+  });
+  await t.scan('SYS:CREATEPART');
+  await t.scan(SAMPLE);
+  await until(() => t.current().state === 'AWAITING_PART_NUMBER');
+  assert.match(t.current().detail, /This label has no part number/);
+  await t.scan(MPN);
+  await until(() => t.current().state === 'SUCCESS');
+  assert.match(t.current().detail, /Part created: CRCW060310K0FKEA/);
+  assert.deepEqual(t.called('/createpart/').map(c => c.body),
+    [{ barcode: SAMPLE }, { barcode: SAMPLE, part_barcode: MPN }]);
+});
+
+test('FASTADD takes the reel quantity from the label and the MPN from the 1-D scan', async () => {
+  const t = terminal({ lookup: sampleLookup });
+  await t.scan('SYS:FASTADD');
+  await t.scan(SAMPLE);
+  await until(() => t.current().state === 'AWAITING_PART_NUMBER');
+  assert.match(t.current().detail, /Label: Mouser · Mfr: Vishay\nQty: 25/);
+  assert.match(t.current().detail, /Action: FASTADD/);
+  await t.scan(`1P${MPN}`);
+  await until(() => t.current().state === 'AWAITING_LOCATION');
+  assert.equal(t.called('/lookup/').at(-1).body.part_barcode, `1P${MPN}`);
+  assert.match(t.current().detail, /Create stock for "CRCW060310K0FKEA".*\(reel qty 25\)/);
+  assert.equal(t.called('/createpart/').length, 0);
+});
+
+test('a plain scan of such a label shows the part once the 1-D is scanned', async () => {
+  const t = terminal({ lookup: sampleLookup });
+  await t.scan(SAMPLE);
+  await until(() => t.current().state === 'AWAITING_PART_NUMBER');
+  assert.equal(t.current().action, 'INFO');
+  await t.scan(MPN);
+  await until(() => t.current().state === 'SUCCESS');
+  assert.equal(t.current().stockCard.mode, 'info');
+  assert.equal(JSON.stringify(t.current().stockCard.details),
+    JSON.stringify([['Label', 'Mouser'], ['Mfr', 'Vishay'], ['Qty', '25']]));
+});
+
+test('the part-number step asks again for a barcode without part number', async () => {
+  const t = terminal({ lookup: sampleLookup });
+  await t.scan('SYS:FASTADD');
+  await t.scan(SAMPLE);
+  await until(() => t.current().state === 'AWAITING_PART_NUMBER');
+  await t.scan('Q25');
+  await until(() => /That barcode has no part number: "Q25"/.test(t.current().detail));
+  assert.equal(t.current().state, 'AWAITING_PART_NUMBER');
+  assert.match(t.current().detail, /Mfr: Vishay/);
+  const lookups = t.called('/lookup/').length;
+  await t.scan('STOCK_1A2B');
+  assert.match(t.current().detail, /Not a part-number barcode.*Mfr: Vishay/s);
+  assert.equal(t.called('/lookup/').length, lookups);
+  assert.equal(t.called('/createpart/').length, 0);
+});
+
+test('a rescanned DataMatrix replaces the pending label', async () => {
+  const t = terminal({ lookup: sampleLookup });
+  await t.scan('SYS:FASTADD');
+  await t.scan(SAMPLE);
+  await until(() => t.current().state === 'AWAITING_PART_NUMBER');
+  await t.scan(MOUSER_REEL);
+  await until(() => t.current().state === 'AWAITING_LOCATION');
+  assert.deepEqual(t.called('/lookup/').at(-1).body, { barcode: MOUSER_REEL });
+  assert.match(t.current().detail, /Create stock for "RES-10K".*\(reel qty 20\)/);
+});
+
+test('an action code or SYS:CANCEL leaves the part-number step', async () => {
+  let t = terminal({ lookup: sampleLookup });
+  await t.scan('SYS:FASTADD');
+  await t.scan(SAMPLE);
+  await until(() => t.current().state === 'AWAITING_PART_NUMBER');
+  await t.scan('SYS:INFO');
+  assert.equal(t.current().state, 'AWAITING_ITEM');
+  assert.equal(t.current().action, 'INFO');
+  t = terminal({ lookup: sampleLookup });
+  await t.scan(SAMPLE);
+  await until(() => t.current().state === 'AWAITING_PART_NUMBER');
+  await t.scan('SYS:CANCEL');
+  assert.equal(t.current().state, 'IDLE');
+});
 
 // ── FASTADD burst ───────────────────────────────────────────────────────────
 

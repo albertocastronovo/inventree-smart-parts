@@ -32,7 +32,10 @@ sys.modules.setdefault("plugin.registry", _registry_mod)
 from inventree_smart_parts.api_clients.base import PartData  # noqa: E402
 from inventree_smart_parts.api_clients.digikey import DigiKeyClient  # noqa: E402
 from inventree_smart_parts.api_clients.mouser import MouserClient  # noqa: E402
-from inventree_smart_parts.services.barcode_decoder import parse_barcode  # noqa: E402
+from inventree_smart_parts.services.barcode_decoder import (  # noqa: E402
+    apply_part_barcode,
+    parse_barcode,
+)
 from inventree_smart_parts.services.data_merger import merge_part_data  # noqa: E402
 
 GS, RS, EOT = "\x1d", "\x1e", "\x04"
@@ -962,6 +965,103 @@ class ImageDownloadGuardTests(unittest.TestCase):
         data, _ext, _err = self.ih.download_image("https://cdn.example.com/a.svg")
         self.assertIsNone(data)
         self.assertNotIn("image/svg+xml", self.ih.ALLOWED_CONTENT_TYPES)
+
+
+# ── v1.7.2: DataMatrix scans that lost their part number ──────────────────
+# As received by the terminal for Mouser 80-CKC33C454KWGLAUTO: OS key
+# auto-repeat of "{" and the 14K/1P/Q fields dropped in transit.
+GARBLED_MOUSER_SCAN = (
+    "[)>{{{{{{{{{{{{{{RS}06{GS}K31K077548699{GS}4LUS{GS}1VKEMET{RS}<EOT>"
+)
+
+
+class IncompleteScanTests(unittest.TestCase):
+    def test_envelope_without_part_number_is_incomplete_not_an_mpn(self):
+        r = parse_barcode(GARBLED_MOUSER_SCAN)
+        self.assertEqual(r.source, "ansi_incomplete")
+        self.assertEqual(r.mpn, "")  # was the whole raw string
+        self.assertEqual(r.supplier_sku, "")
+        self.assertEqual(r.manufacturer, "KEMET")
+
+    def test_quantity_without_part_number_is_incomplete(self):
+        r = parse_barcode(f"[)>{RS}06{GS}Q10{GS}1VKEMET{RS}{EOT}")
+        self.assertEqual((r.source, r.mpn), ("ansi_incomplete", ""))
+
+    def test_complete_label_with_text_separators_still_parses(self):
+        raw = (
+            "[)>{RS}06{GS}K{GS}14K001{GS}1PCKC33C454KWGLAUTO{GS}Q10"
+            "{GS}11K077548699{GS}4LUS{GS}1VKEMET{RS}<EOT>"
+        )
+        r = parse_barcode(raw)
+        self.assertEqual(r.source, "ansi")
+        self.assertEqual(r.mpn, "CKC33C454KWGLAUTO")
+        self.assertEqual(r.quantity, 10)
+        self.assertEqual(r.distributor, "mouser")
+        self.assertEqual(r.manufacturer, "KEMET")
+
+    def test_eot_text_does_not_stick_to_the_last_field(self):
+        r = parse_barcode("[)>{RS}06{GS}1PABC123{GS}1VKEMET<EOT>")
+        self.assertEqual((r.mpn, r.manufacturer), ("ABC123", "KEMET"))
+
+    def test_sku_only_label_and_bare_mpn_unchanged(self):
+        r = parse_barcode(f"[)>{RS}06{GS}30P296-1234-1-ND{GS}Q5{RS}{EOT}")
+        self.assertEqual(r.supplier_sku, "296-1234-1-ND")
+        self.assertNotEqual(r.source, "ansi_incomplete")
+        r = parse_barcode("CKC33C454KWGLAUTO")
+        self.assertEqual((r.mpn, r.source), ("CKC33C454KWGLAUTO", "fallback"))
+
+
+# ── v1.7.3: DataMatrix labels without a part number + 1-D part number ──────
+# Sample-warehouse label: K/14K/Q/11K/4L/1V only, the MPN is a 1-D barcode
+SAMPLE_LABEL = (
+    "[)>{RS}06{GS}KVY5570{GS}14K001{GS}Q25{GS}11K076270558{GS}4LCN"
+    "{GS}1VVishay{RS}<EOT>"
+)
+
+
+class PartBarcodeTests(unittest.TestCase):
+    def label(self, part_barcode):
+        return apply_part_barcode(parse_barcode(SAMPLE_LABEL), part_barcode)
+
+    def test_sample_label_is_incomplete_but_keeps_its_fields(self):
+        r = parse_barcode(SAMPLE_LABEL)
+        self.assertEqual((r.source, r.mpn, r.supplier_sku), ("ansi_incomplete", "", ""))
+        self.assertEqual(r.quantity, 25)
+        self.assertEqual(r.manufacturer, "Vishay")
+        self.assertEqual(r.distributor, "mouser")
+        self.assertEqual(r.po_number, "VY5570")
+
+    def test_bare_1d_part_number_completes_the_label(self):
+        r = self.label("CRCW060310K0FKEA")
+        self.assertEqual((r.source, r.mpn), ("ansi", "CRCW060310K0FKEA"))
+        self.assertEqual((r.quantity, r.manufacturer), (25, "Vishay"))
+        self.assertEqual(r.distributor, "mouser")
+
+    def test_1p_prefix_is_removed(self):
+        self.assertEqual(self.label("1PCRCW060310K0FKEA").mpn, "CRCW060310K0FKEA")
+
+    def test_1d_without_part_number_leaves_the_label_incomplete(self):
+        r = self.label("Q25")
+        self.assertEqual((r.source, r.mpn), ("ansi_incomplete", ""))
+
+    def test_datamatrix_or_inventree_code_is_not_a_part_number(self):
+        for other in (
+            f"[)>{RS}06{GS}1PABC123{GS}Q1{RS}{EOT}",
+            "INV-PA5",
+            '{"part": 3}',
+        ):
+            r = self.label(other)
+            self.assertEqual((r.source, r.mpn), ("ansi_incomplete", ""), other)
+
+    def test_label_with_own_part_number_ignores_the_1d(self):
+        raw = f"[)>{RS}06{GS}1PABC123{GS}Q5{GS}1VVishay{RS}{EOT}"
+        r = apply_part_barcode(parse_barcode(raw), "CRCW060310K0FKEA")
+        self.assertEqual((r.source, r.mpn), ("ansi", "ABC123"))
+
+    def test_empty_part_barcode_changes_nothing(self):
+        for empty in ("", "   ", None):
+            r = self.label(empty)
+            self.assertEqual((r.source, r.mpn), ("ansi_incomplete", ""))
 
 
 if __name__ == "__main__":

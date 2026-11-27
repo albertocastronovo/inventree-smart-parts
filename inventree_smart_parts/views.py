@@ -2430,7 +2430,9 @@ def _token_lookup_response(request, token):
 def purescan_createpart(request):
     """
     POST: Create a part from a scanned distributor DataMatrix barcode.
-    Body: { barcode, enrich_scope?: "all" | "label" }
+    Body: { barcode, part_barcode?, enrich_scope?: "all" | "label" }
+    part_barcode: 1-D part-number scan, used only when the DataMatrix has
+    no part number of its own.
     Quantity information is discarded (parts carry no stock).
     Part identity is discriminated by MPN/SKU only — batch codes are ignored.
     An existing part is reported as "already exists" and gap-filled
@@ -2454,23 +2456,33 @@ def purescan_createpart(request):
     if not barcode:
         return JsonResponse({"error": "barcode is required"}, status=400)
 
-    from .services.barcode_decoder import parse_barcode
+    from .services.barcode_decoder import apply_part_barcode, parse_barcode
     from .services.part_identity import (
         AmbiguousPart,
         lock_part_identity,
         resolve_scanned_part,
     )
 
-    parsed = parse_barcode(barcode)
+    # part_barcode: 1-D part-number scan for a DataMatrix without part number
+    part_barcode = str(body.get("part_barcode", "") or "").strip()
+    parsed = apply_part_barcode(parse_barcode(barcode), part_barcode)
     mpn = (parsed.mpn or "").strip()
     sku = (parsed.supplier_sku or "").strip()
 
     if not mpn and not sku:
+        from .services.barcode_decoder import INCOMPLETE_SCAN_MESSAGE
+
+        incomplete = parsed.source == "ansi_incomplete"
         return JsonResponse(
             {
                 "success": False,
                 "already_exists": False,
-                "message": "Barcode does not contain an MPN or SKU",
+                "incomplete": incomplete,
+                "message": (
+                    INCOMPLETE_SCAN_MESSAGE
+                    if incomplete
+                    else "Barcode does not contain an MPN or SKU"
+                ),
             },
             status=400,
         )
@@ -3244,6 +3256,8 @@ def api_barcode_lookup(request):
         - barcode: raw barcode string (with control characters, DataMatrix, etc.)
         - mpn: optional extracted MPN string
         - sku: optional extracted supplier SKU string
+        - part_barcode: optional 1-D part-number scan, used only when the
+          DataMatrix has no part number of its own
 
     Returns:
         {
@@ -3266,6 +3280,8 @@ def api_barcode_lookup(request):
     raw_barcode = ""
     mpn = ""
     sku = ""
+    # 1-D part-number scan for a DataMatrix that carries no part number
+    part_barcode = ""
 
     if request.method == "POST":
         if request.content_type and "application/json" in request.content_type:
@@ -3278,22 +3294,25 @@ def api_barcode_lookup(request):
                 raw_barcode = str(body.get("barcode", "")).strip()
                 mpn = str(body.get("mpn", "")).strip()
                 sku = str(body.get("sku", "")).strip()
+                part_barcode = str(body.get("part_barcode", "")).strip()
             except Exception:
                 pass
         if not raw_barcode and not mpn and not sku:
             raw_barcode = str(request.POST.get("barcode", "")).strip()
             mpn = str(request.POST.get("mpn", "")).strip()
             sku = str(request.POST.get("sku", "")).strip()
+            part_barcode = str(request.POST.get("part_barcode", "")).strip()
     else:
         raw_barcode = str(request.GET.get("barcode", "")).strip()
         mpn = str(request.GET.get("mpn", "")).strip()
         sku = str(request.GET.get("sku", "")).strip()
+        part_barcode = str(request.GET.get("part_barcode", "")).strip()
 
-    from .services.barcode_decoder import parse_barcode
+    from .services.barcode_decoder import apply_part_barcode, parse_barcode
 
     parsed = None
     if raw_barcode:
-        parsed = parse_barcode(raw_barcode)
+        parsed = apply_part_barcode(parse_barcode(raw_barcode), part_barcode)
         if not mpn and parsed.mpn:
             mpn = parsed.mpn
         if not sku and parsed.supplier_sku:
@@ -3737,15 +3756,19 @@ def api_barcode_lookup(request):
     ):
         mpn = ""
 
-    return JsonResponse(
-        {
-            "found": False,
-            "part_id": None,
-            "part_name": "",
-            "part_ipn": "",
-            "part_url": None,
-            "mpn": mpn,
-            "distributor": parsed.distributor if parsed else None,
-            "barcode_data": parsed.to_dict() if parsed else None,
-        }
-    )
+    response = {
+        "found": False,
+        "part_id": None,
+        "part_name": "",
+        "part_ipn": "",
+        "part_url": None,
+        "mpn": mpn,
+        "distributor": parsed.distributor if parsed else None,
+        "barcode_data": parsed.to_dict() if parsed else None,
+    }
+    if parsed and parsed.source == "ansi_incomplete" and not mpn and not sku:
+        from .services.barcode_decoder import INCOMPLETE_SCAN_MESSAGE
+
+        response["incomplete"] = True
+        response["error"] = INCOMPLETE_SCAN_MESSAGE
+    return JsonResponse(response)

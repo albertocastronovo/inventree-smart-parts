@@ -2,6 +2,36 @@
 
 All notable changes to SmartParts are documented in this file.
 
+## [1.7.3] - 2026-11-27
+
+### Added
+- **PureScan: DataMatrix labels without a part number.** Some labels (for example from a sample warehouse) carry no `1P`, `P` or `30P` field at all. The part number is a separate 1-D barcode on the bag. Example: `[)>{RS}06{GS}KVY5570{GS}14K001{GS}Q25{GS}11K076270558{GS}4LCN{GS}1VVishay{RS}<EOT>`. Before, PureScan refused such a label ("Incomplete label scan ... Scan the label again"), so creating the part from the terminal was impossible.
+  - In INFO (and the idle quick scan), CREATEPART, FASTADD (including the receive burst), CREATESTOCK and DELETEPART, the terminal now asks for the part number. It shows "This label has no part number", the label's details (distributor, manufacturer, quantity) and "Scan the part number's 1-D barcode".
+  - The next scan supplies the MPN; a `1P` prefix is removed. The flow then continues as for a normal label: the reel quantity, manufacturer and distributor still come from the DataMatrix.
+  - A 1-D barcode without a part number (for example the `Q25` barcode) asks again. Scanning a DataMatrix replaces the pending label (a rescan after a bad read). An action code leaves the step, and `SYS:CANCEL` resets as usual.
+  - Server: `api/barcode/lookup/` and `api/purescan/createpart/` accept an optional `part_barcode`. It is used only when the DataMatrix has no part number of its own, so a label's `1P`/`P`/`30P` always wins.
+  - Labels with a part number behave exactly as before.
+
+### Changed
+- The incomplete-label message now reads "This DataMatrix has no part number (1P): scan the part number's 1-D barcode, or rescan the label if it was a bad read." It fits both labels that carry no part number and damaged scans.
+
+### Housekeeping
+- Cache-buster `purescan.js?v=15`.
+- Tests: decoder (`apply_part_barcode`), CREATEPART/lookup with a `part_barcode`, and terminal JS (the part-number step in INFO, CREATEPART, FASTADD and CREATESTOCK; retry, rescan and action-code exits).
+
+## [1.7.2] - 2026-11-26
+
+### Fixed
+- **PureScan: a damaged DataMatrix was searched as if it were an MPN.** Example: a Mouser label for `80-CKC33C454KWGLAUTO` arrived at the terminal as `[)>{{{{{{{{{{{{{{RS}06{GS}K31K077548699{GS}4LUS{GS}1VKEMET{RS}<EOT>`. It had repeated `{` characters, and its `14K`/`1P`/`Q` fields were missing. The decoder did not recognise the `[)>` envelope, so it fell back to using the whole raw string as the MPN. INFO then showed that string, and CREATEPART searched the distributors for it, with wrong or empty results.
+  - A `[)>` envelope with no part number (`1P`/`P`) and no supplier SKU (`30P`) is now reported as an incomplete scan, and nothing is searched or created. The terminal shows "Incomplete label scan: the DataMatrix arrived without its part number (1P). Scan the label again." in INFO, FASTADD, CREATEPART and the other label flows.
+  - The terminal ignores keyboard auto-repeat (`keydown` with `repeat`). The OS sends repeats when it misses a key-up during a scan; they are never scanner data.
+  - `<EOT>` is accepted as an end-of-transmission marker, like `{EOT}`.
+  - Labels with a part number decode as before.
+
+### Housekeeping
+- Cache-buster `purescan.js?v=14`.
+- Tests: decoder (the damaged scan, quantity-only and complete text-separator labels), CREATEPART/lookup on an incomplete scan (no distributor call), and terminal JS (auto-repeat filter; rescan message in INFO, FASTADD and CREATESTOCK).
+
 ## [1.7.1] - 2026-11-26
 
 ### Fixed

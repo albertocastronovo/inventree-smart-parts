@@ -24,6 +24,7 @@
     AWAITING_QTY:      'AWAITING_QTY',       // v3: CREATESTOCK quantity step
     AWAITING_TOKEN:    'AWAITING_TOKEN',     // v3: CREATESTOCK token binding step
     AWAITING_CONFIRM:  'AWAITING_CONFIRM',   // v3: DELETEPART/DELETESTOCK confirm
+    AWAITING_PART_NUMBER: 'AWAITING_PART_NUMBER',  // 1-D MPN for a DataMatrix without 1P
     COMBO:             'COMBO',              // accumulating qty scans
     PROCESSING:        'PROCESSING',
     SUCCESS:           'SUCCESS',
@@ -102,12 +103,15 @@
   let _pendingQty         = null;
   let _pendingBatch       = '';
   let _pendingBarcodeData = null;   // parsed distributor label fields
+  let _pendingLabelRaw    = null;   // DataMatrix waiting for its 1-D part number
+  let _pendingLabelLookup = null;   // its lookup answer (label details)
 
   // DELETE pending state (v3)
   let _pendingDeleteKind  = null;   // 'part' | 'stock'
   let _pendingDeleteId    = null;
   let _pendingDeleteDesc  = '';
   let _pendingDeleteRaw   = null;   // first-scan raw payload for re-scan compare
+  let _pendingDeletePartBarcode = '';  // 1-D part number of that label, if any
   let _pendingToken       = null;
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -358,6 +362,8 @@
     _pendingQty         = null;
     _pendingBatch       = '';
     _pendingBarcodeData = null;
+    _pendingLabelRaw    = null;
+    _pendingLabelLookup = null;
   }
 
   function _clearPendingDelete() {
@@ -365,6 +371,7 @@
     _pendingDeleteId   = null;
     _pendingDeleteDesc = '';
     _pendingDeleteRaw  = null;
+    _pendingDeletePartBarcode = '';
     _pendingToken      = null;
   }
 
@@ -452,7 +459,9 @@
     });
     if (!resp.ok) {
       const errData = await resp.json().catch(() => ({}));
-      throw new Error(errData.detail || errData.error || errData.message || `HTTP ${resp.status}`);
+      const err = new Error(errData.detail || errData.error || errData.message || `HTTP ${resp.status}`);
+      err.data = errData;   // e.g. createpart's { incomplete: true }
+      throw err;
     }
     return resp.json().catch(() => ({}));
   }
@@ -677,9 +686,15 @@
 
   // ── v3: distributor label lookup (used by INFO / CREATESTOCK / DELETEPART) ──
 
-  async function _lookupDistributorBarcode(raw) {
+  // Request body for a scanned label; part_barcode is the 1-D part number
+  // of a DataMatrix that carries none (sent only when there is one).
+  function _labelBody(raw, partBarcode, extra) {
+    return { barcode: raw, ...(partBarcode ? { part_barcode: partBarcode } : {}), ...extra };
+  }
+
+  async function _lookupDistributorBarcode(raw, partBarcode) {
     try {
-      return await _apiPost('/plugin/smartparts/api/barcode/lookup/', { barcode: raw });
+      return await _apiPost('/plugin/smartparts/api/barcode/lookup/', _labelBody(raw, partBarcode));
     } catch (e) {
       return { error: e.message };
     }
@@ -809,6 +824,70 @@
     _resultTimer = setTimeout(() => _resetToIdle(), 12000);
   }
 
+  // Distributor DataMatrix in INFO / the IDLE quick scan: stock card when the
+  // part is in the DB, the label details otherwise. false = not handled.
+  async function _execDistributorLabelInfo(raw, partBarcode, flow) {
+    const lk = await _lookupDistributorBarcode(raw, partBarcode);
+    if (flow !== _flowId) return true;
+    if (lk.incomplete) {
+      _action = ACTIONS.INFO;
+      _askPartNumber(raw, lk, partBarcode);
+      return true;
+    }
+    if (lk.error) {
+      _showResult(STATES.ERROR, `Part lookup failed: ${lk.error}`);
+      return true;
+    }
+    if (lk.found && lk.part_id) {
+      _action = ACTIONS.INFO;
+      await _execDistributorStockInfo(lk, flow);
+      return true;
+    }
+    if (lk.found || (lk.barcode_data && lk.barcode_data.mpn)) {
+      _showDistributorInfo(lk);
+      return true;
+    }
+    return false;
+  }
+
+  // ── 1.7.3: DataMatrix without a part number (sample-warehouse labels) ──
+  // The label still gives quantity, manufacturer and distributor; the part
+  // number comes from the 1-D barcode scanned next (AWAITING_PART_NUMBER).
+  // triedBarcode: the 1-D scan that had no part number either ('' = none yet)
+  function _askPartNumber(raw, lk, triedBarcode, warning) {
+    _pendingLabelRaw = raw;
+    if (lk) _pendingLabelLookup = lk;
+    const head = warning || (triedBarcode
+      ? `That barcode has no part number: "${String(triedBarcode).slice(0, 40)}"`
+      : 'This label has no part number');
+    const lines = [
+      `⚠ ${head}`,
+      ..._labelDetailLines(_labelDetailPairs(_pendingLabelLookup)),
+      "▶ Scan the part number's 1-D barcode (or rescan the label if it was a bad read)",
+      `Action: ${_action}`,
+    ];
+    _setState(STATES.AWAITING_PART_NUMBER, lines.join('\n'));
+  }
+
+  // Re-run the armed action's label step with a 1-D part number (or a rescan)
+  async function _runLabelAction(raw, partBarcode) {
+    switch (_action) {
+      case ACTIONS.CREATEPART:  return _execCreatePart(raw, partBarcode);
+      case ACTIONS.FASTADD:     return _execFastAddStart(raw, partBarcode);
+      case ACTIONS.CREATESTOCK: return _execCreateStockStart(raw, partBarcode);
+      case ACTIONS.DELETEPART:  return _execDeletePartStart(raw, partBarcode);
+      default: {
+        // INFO, including the IDLE quick scan
+        const flow = _flowId;
+        _setState(STATES.PROCESSING, 'Looking up distributor label…');
+        if (!(await _execDistributorLabelInfo(raw, partBarcode, flow)) && flow === _flowId) {
+          _showResult(STATES.ERROR,
+            `Unknown scan: "${raw.slice(0, 40)}"\nScan an Action Code to begin`, 3000);
+        }
+      }
+    }
+  }
+
   // MPN, description, stock (total + default location) and label details
   async function _execDistributorStockInfo(lk, flow) {
     _setState(STATES.PROCESSING, 'Looking up stock…');
@@ -854,11 +933,12 @@
 
   // ── v3: CREATEPART ──
 
-  async function _execCreatePart(raw) {
+  async function _execCreatePart(raw, partBarcode = '') {
     const flow = _flowId;
     _setState(STATES.PROCESSING, 'Searching distributors… (this can take a few seconds)');
     try {
-      const resp = await _apiPost('/plugin/smartparts/api/purescan/createpart/', { barcode: raw });
+      const resp = await _apiPost('/plugin/smartparts/api/purescan/createpart/',
+        _labelBody(raw, partBarcode));
       // A cancel or new command can arrive during the distributor search.
       if (flow !== _flowId) return;
       if (resp.already_exists) {
@@ -898,13 +978,17 @@
       }
     } catch (e) {
       if (flow !== _flowId) return;
+      if (e.data && e.data.incomplete) {
+        _askPartNumber(raw, null, partBarcode);
+        return;
+      }
       _showResult(STATES.ERROR, `Create part failed: ${e.message}`, 6000);
     }
   }
 
   // ── v3: CREATESTOCK ──
 
-  async function _execCreateStockStart(raw) {
+  async function _execCreateStockStart(raw, partBarcode = '') {
     const bc = await _parseInvenTreeBarcode(raw);
 
     // Mode B: existing stock item token → part inferred (token is read-only)
@@ -938,7 +1022,11 @@
     // Mode A: distributor DataMatrix
     if (!bc.type) {
       _setState(STATES.PROCESSING, 'Looking up part…');
-      const lk = await _lookupDistributorBarcode(raw);
+      const lk = await _lookupDistributorBarcode(raw, partBarcode);
+      if (lk.incomplete) {
+        _askPartNumber(raw, lk, partBarcode);
+        return;
+      }
       if (lk.error) {
         _showResult(STATES.ERROR, `Part lookup failed: ${lk.error}`);
         return;
@@ -1001,7 +1089,7 @@
 
   // ── v3: FASTADD ──
 
-  async function _execFastAddStart(raw) {
+  async function _execFastAddStart(raw, partBarcode = '') {
     const flow = _flowId;
     _setState(STATES.PROCESSING, 'Reading label…');
     const bc = await _parseInvenTreeBarcode(raw);
@@ -1034,9 +1122,13 @@
     // Distributor DataMatrix → resolve part (auto-create if not in DB)
     if (!bc.type) {
       _setState(STATES.PROCESSING, 'Looking up part… (this can take a few seconds)');
-      const lk = await _lookupDistributorBarcode(raw);
+      const lk = await _lookupDistributorBarcode(raw, partBarcode);
       let existed = true;   // false → just created: no stock to look up
       if (flow !== _flowId) return;
+      if (lk.incomplete) {
+        _askPartNumber(raw, lk, partBarcode);
+        return;
+      }
       if (lk.error) {
         _showResult(STATES.ERROR, `Part lookup failed: ${lk.error}`);
         return;
@@ -1048,7 +1140,8 @@
       if (!lk.found) {
         // Part not in DB → create it (like SYS:CREATEPART)
         try {
-          const resp = await _apiPost('/plugin/smartparts/api/purescan/createpart/', { barcode: raw });
+          const resp = await _apiPost('/plugin/smartparts/api/purescan/createpart/',
+            _labelBody(raw, partBarcode));
           if (flow !== _flowId) return;
           if (resp.success) {
             existed = false;
@@ -1092,7 +1185,7 @@
               : `Updating "${_pendingPartName}"…`);
           try {
             const er = await _apiPost('/plugin/smartparts/api/purescan/createpart/',
-              { barcode: raw, enrich_scope: 'label' });
+              _labelBody(raw, partBarcode, { enrich_scope: 'label' }));
             // A cancel or new command can arrive while the gap-fill runs.
             if (flow !== _flowId) return;
             if (er && er.already_exists && (er.enriched || []).length) {
@@ -1196,9 +1289,13 @@
 
   // ── v3: DELETEPART ──
 
-  async function _execDeletePartStart(raw) {
+  async function _execDeletePartStart(raw, partBarcode = '') {
     _setState(STATES.PROCESSING, 'Looking up part…');
-    const lk = await _lookupDistributorBarcode(raw);
+    const lk = await _lookupDistributorBarcode(raw, partBarcode);
+    if (lk.incomplete) {
+      _askPartNumber(raw, lk, partBarcode);
+      return;
+    }
     if (!lk || !lk.found || !lk.part_id) {
       _showResult(STATES.ERROR, 'Part not found in DB — nothing to delete', 5000);
       return;
@@ -1207,6 +1304,7 @@
     _pendingDeleteId = lk.part_id;
     _pendingDeleteDesc = `${lk.part_name}${lk.part_ipn ? ' (' + lk.part_ipn + ')' : ''}`;
     _pendingDeleteRaw = raw;
+    _pendingDeletePartBarcode = partBarcode;
     _setState(STATES.AWAITING_CONFIRM,
       `⛔ DELETE PART: "${_pendingDeleteDesc}"\nAll its data (params, supplier links) will be removed.\n→ Scan the SAME label again to confirm, or SYS:CANCEL`);
   }
@@ -1518,21 +1616,7 @@
 
       // Quick-scan shortcut: distributor DataMatrix in IDLE → part lookup
       if (!bc.type) {
-        const lk = await _lookupDistributorBarcode(raw);
-        if (scanFlow !== _flowId) return;
-        if (lk.error) {
-          _showResult(STATES.ERROR, `Part lookup failed: ${lk.error}`);
-          return;
-        }
-        if (lk.found && lk.part_id) {
-          _action = ACTIONS.INFO;
-          await _execDistributorStockInfo(lk, _flowId);
-          return;
-        }
-        if (lk && (lk.found || (lk.barcode_data && lk.barcode_data.mpn))) {
-          _showDistributorInfo(lk);
-          return;
-        }
+        if (await _execDistributorLabelInfo(raw, '', scanFlow)) return;
       }
 
       _showResult(STATES.ERROR,
@@ -1589,20 +1673,7 @@
       // INFO mode also accepts distributor DataMatrix labels
       if (_action === ACTIONS.INFO && !bc.type) {
         _setState(STATES.PROCESSING, 'Looking up distributor label…');
-        const lk = await _lookupDistributorBarcode(raw);
-        if (infoFlow !== _flowId) return;
-        if (lk.error) {
-          _showResult(STATES.ERROR, `Part lookup failed: ${lk.error}`);
-          return;
-        }
-        if (lk?.found && lk.part_id) {
-          await _execDistributorStockInfo(lk, infoFlow);
-          return;
-        }
-        if (lk && (lk.found || (lk.barcode_data && lk.barcode_data.mpn))) {
-          _showDistributorInfo(lk);
-          return;
-        }
+        if (await _execDistributorLabelInfo(raw, '', infoFlow)) return;
       }
 
       if (bc.type !== 'stockitem' || !bc.id) {
@@ -1640,6 +1711,28 @@
       }
 
       _showResult(STATES.ERROR, `Unknown action: ${_action}`);
+      return;
+    }
+
+    // ── STATE: AWAITING_PART_NUMBER (DataMatrix without 1P) ──────────────
+    if (_state === STATES.AWAITING_PART_NUMBER) {
+      if (ctrlCode) {
+        _armAction(ctrlCode);
+        return;
+      }
+      // Another DataMatrix: a rescan (or the next label) replaces this one
+      if (raw.includes('[)>')) {
+        _pendingLabelRaw = null;
+        _pendingLabelLookup = null;
+        await _runLabelAction(raw, '');
+        return;
+      }
+      if (/^SYS:/i.test(raw) || TOKEN_RE.test(raw) || /^INV-/i.test(raw) ||
+          (raw.startsWith('{') && raw.endsWith('}'))) {
+        _askPartNumber(_pendingLabelRaw, null, '', 'Not a part-number barcode');
+        return;
+      }
+      await _runLabelAction(_pendingLabelRaw, raw);
       return;
     }
 
@@ -1892,7 +1985,8 @@
       }
 
       if (_pendingDeleteKind === 'part') {
-        const lk = await _lookupDistributorBarcode(raw);
+        // The same DataMatrix (with its 1-D part number) or the 1-D itself
+        const lk = await _lookupDistributorBarcode(raw, _pendingDeletePartBarcode);
         if (lk && lk.found && lk.part_id === _pendingDeleteId) {
           await _execDeletePartCommit();
         } else {
@@ -1931,6 +2025,9 @@
   let _lastTime = 0;
 
   function _onKey(e) {
+    // Auto-repeat keydowns are never scanner data: when the computer misses
+    // a key-up mid-scan, the OS repeats that key ("[)>{{{{{{{{RS}06...").
+    if (e.repeat) return;
     const now   = Date.now();
     const delta = now - _lastTime;
     _lastTime   = now;

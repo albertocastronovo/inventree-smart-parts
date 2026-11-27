@@ -37,6 +37,16 @@ RS_SUBSTITUTES = [
     (re.compile(r"\u241e"), RS),
 ]
 
+EOT_SUBSTITUTE_RE = re.compile(r"\{EOT\}|<EOT>|␄", re.IGNORECASE)
+
+# Shown when a DataMatrix envelope has no part identifier: either the label
+# carries none (sample-warehouse labels: K/14K/Q/11K/4L/1V only) or the
+# scan lost it on the way in.
+INCOMPLETE_SCAN_MESSAGE = (
+    "This DataMatrix has no part number (1P): scan the part number's 1-D "
+    "barcode, or rescan the label if it was a bad read."
+)
+
 HAS_GS_RE = re.compile(
     r"[\x1d\u241d]|(?:\{GS\}|\[GS\]|~(?=[1-9A-Z])|\|(?=[1-9A-Z]))", re.IGNORECASE
 )
@@ -87,7 +97,9 @@ class BarcodeData:
     supplier_sku: str = ""
     po_number: str = ""
     raw: str = ""
-    source: str = ""  # 'ansi', 'heuristic', 'regex', 'fallback', ''
+    # 'ansi', 'ansi_incomplete' (envelope without 1P/SKU), 'heuristic',
+    # 'regex', 'fallback', 'native_internal', ''
+    source: str = ""
     distributor: Optional[str] = None  # 'digikey' | 'mouser' | None
     manufacturer: str = ""  # 1V (Mouser labels)
 
@@ -209,13 +221,19 @@ def _try_ansi_parse(raw: str, result: BarcodeData) -> bool:
         norm = pattern.sub(replacement, norm)
     for pattern, replacement in RS_SUBSTITUTES:
         norm = pattern.sub(replacement, norm)
-    norm = re.sub(r"\{EOT\}|\u2404", EOT, norm, flags=re.IGNORECASE)
+    norm = EOT_SUBSTITUTE_RE.sub(EOT, norm)
 
     fields = [f.strip() for f in re.split(r"[\x1d\x1e\x04]", norm) if f.strip()]
     if len(fields) < 2:
         return False
 
     _extract_fields(fields, result)
+    if has_header and not result.mpn and not result.supplier_sku:
+        # A "[)>" envelope is a distributor DataMatrix, but its part number
+        # did not arrive (keystrokes dropped by the scanner wedge). Stop
+        # here: the later stages would take the whole raw string as MPN.
+        result.source = "ansi_incomplete"
+        return True
     found = bool(result.mpn or result.quantity is not None or result.batch)
     if found:
         result.source = "ansi"
@@ -405,3 +423,25 @@ def parse_barcode(raw: str) -> BarcodeData:
     # Stage 3: Fallback
     _fallback_parse(raw, result)
     return result
+
+
+def apply_part_barcode(label: BarcodeData, part_barcode: str) -> BarcodeData:
+    """Give a DataMatrix without part number the MPN of a 1-D barcode.
+
+    Only a label parsed as 'ansi_incomplete' is changed, so a label's own
+    1P/P/30P always wins. The 1-D scan is read like any 1-D scan (bare MPN,
+    or a 1P/30P field); another DataMatrix or an InvenTree code is ignored,
+    and a 1-D without a part number (e.g. Q25) leaves the label incomplete.
+    """
+    if label.source != "ansi_incomplete" or not (part_barcode or "").strip():
+        return label
+    part = parse_barcode(part_barcode)
+    if part.source not in ("regex", "fallback"):
+        return label
+    if part.mpn:
+        label.mpn = part.mpn
+    if part.supplier_sku:
+        label.supplier_sku = part.supplier_sku
+    if label.mpn or label.supplier_sku:
+        label.source = "ansi"
+    return label

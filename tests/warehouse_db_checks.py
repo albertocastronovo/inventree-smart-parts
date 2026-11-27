@@ -670,6 +670,7 @@ class DualSupplierScanChecks(_FixtureDatabase):
             self.addCleanup(patcher.stop)
         self.views = views
         self.queried = []
+        self.searched = []
         self.answers = {}
         self.user = SimpleNamespace(
             is_authenticated=True, username="operator", has_perm=lambda perm: True
@@ -694,6 +695,7 @@ class DualSupplierScanChecks(_FixtureDatabase):
 
                 def search_by_mpn(self, mpn):
                     test.queried.append(source)
+                    test.searched.append(mpn)
                     answer = test.answers.get(source)
                     if isinstance(answer, Exception):
                         raise answer
@@ -716,8 +718,10 @@ class DualSupplierScanChecks(_FixtureDatabase):
     def createpart(self, barcode, **extra):
         return self.post(self.views.purescan_createpart, {"barcode": barcode, **extra})
 
-    def lookup(self, barcode):
-        return self.post(self.views.api_barcode_lookup, {"barcode": barcode})[1]
+    def lookup(self, barcode, **extra):
+        return self.post(self.views.api_barcode_lookup, {"barcode": barcode, **extra})[
+            1
+        ]
 
     def suppliers(self, part):
         return sorted(
@@ -1048,6 +1052,61 @@ class DualSupplierScanChecks(_FixtureDatabase):
         self.assertEqual(
             result.errors,
             ["Datasheet link dropped (not a valid URL): https://exa mple.com/ds.pdf"],
+        )
+
+    # ── v1.7.2: DataMatrix that lost its part number on the way in ──
+    GARBLED = "[)>{{{{{{{{{{{{{{RS}06{GS}K31K077548699{GS}4LUS{GS}1VKEMET{RS}<EOT>"
+
+    def test_incomplete_scan_is_refused_without_searching_distributors(self):
+        with self.distributors(mouser=mouser_hit(self.mpn), digikey=None):
+            status, body = self.createpart(self.GARBLED)
+        self.assertEqual(status, 400)
+        self.assertTrue(body["incomplete"])
+        self.assertIn("rescan the label", body["message"])
+        self.assertEqual(self.queried, [])
+
+    def test_incomplete_scan_lookup_asks_for_a_rescan(self):
+        found = self.lookup(self.GARBLED)
+        self.assertFalse(found["found"])
+        self.assertTrue(found["incomplete"])
+        self.assertEqual(found["mpn"], "")
+        self.assertIn("rescan the label", found["error"])
+
+    # ── v1.7.3: DataMatrix without part number + 1-D part-number scan ──
+    SAMPLE = (
+        "[)>{RS}06{GS}KVY5570{GS}14K001{GS}Q25{GS}11K076270558{GS}4LCN"
+        "{GS}1VVishay{RS}<EOT>"
+    )
+
+    def test_label_without_part_number_is_created_from_the_1d_scan(self):
+        with self.distributors(mouser=mouser_hit(self.mpn), digikey=None):
+            status, body = self.createpart(self.SAMPLE, part_barcode=self.mpn)
+        self.assertEqual(status, 200, body)
+        self.assertTrue(body["success"])
+        self.assertEqual(self.searched, [self.mpn, self.mpn])
+        part = self.scanned_part()
+        self.assertEqual(self.suppliers(part), ["Mouser"])
+        self.assertEqual(body["default_supplier"], "Mouser")
+
+    def test_label_without_part_number_still_refused_without_1d(self):
+        with self.distributors(mouser=mouser_hit(self.mpn), digikey=None):
+            status, body = self.createpart(self.SAMPLE)
+            status_q, body_q = self.createpart(self.SAMPLE, part_barcode="Q25")
+        self.assertEqual((status, status_q), (400, 400))
+        self.assertTrue(body["incomplete"] and body_q["incomplete"])
+        self.assertEqual(self.queried, [])
+
+    def test_lookup_finds_the_part_from_the_1d_scan(self):
+        part = Part.objects.create(name=self.mpn, description="CAP CER 10UF")
+        ManufacturerPart.objects.create(part=part, MPN=self.mpn)
+        found = self.lookup(self.SAMPLE, part_barcode=f"1P{self.mpn}")
+        self.assertTrue(found["found"])
+        self.assertEqual(found["part_id"], part.pk)
+        self.assertNotIn("incomplete", found)
+        data = found["barcode_data"]
+        self.assertEqual((data["mpn"], data["quantity"]), (self.mpn, 25))
+        self.assertEqual(
+            (data["manufacturer"], found["distributor"]), ("Vishay", "mouser")
         )
 
     def test_stock_summary_reports_mpn_and_description(self):

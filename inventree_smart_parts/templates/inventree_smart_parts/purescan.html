@@ -33,7 +33,8 @@
   color: #e2e8f0;
 }
 .ps-terminal[data-state="AWAITING_ITEM"],
-.ps-terminal[data-state="AWAITING_PARAM"] {
+.ps-terminal[data-state="AWAITING_PARAM"],
+.ps-terminal[data-state="AWAITING_PART_NUMBER"] {
   background: linear-gradient(160deg, #78350f 0%, #92400e 30%, #b45309 100%);
   color: #fffbeb;
 }
@@ -513,7 +514,7 @@
 </div>
 
 <!-- ═══ Scripts ══════════════════════════════════════════════════════════ -->
-<script src="/static/plugins/smartparts/inventree_smart_parts/ui/purescan.js?v=13"></script>
+<script src="/static/plugins/smartparts/inventree_smart_parts/ui/purescan.js?v=15"></script>
 <script>
 (function() {
   'use strict';
@@ -555,6 +556,7 @@
     AWAITING_QTY:      'fas fa-hashtag',
     AWAITING_TOKEN:    'fas fa-tags',
     AWAITING_CONFIRM:  'fas fa-exclamation-circle',
+    AWAITING_PART_NUMBER: 'fas fa-barcode',
     COMBO:             'fas fa-layer-group',
     PROCESSING:        '',
     SUCCESS:           'fas fa-check-circle',
